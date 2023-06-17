@@ -156,7 +156,7 @@ Author: Michael Paquier <michael@paquier.xyz>
 
 <listitem>
 <para>
-Remove pg_walinspect functions pg_get_wal_records_info_till_end_of_wal() and pg_get_wal_stats_till_end_of_wal().
+Remove pg_walinspect functions pg_get_wal_records_info_till_end_of_wal() and pg_get_wal_stats_till_end_of_wal() (Bharath Rupireddy)
 </para>
 </listitem>
 
@@ -2164,6 +2164,21 @@ Add "FOREIGN" designation to psql \d+ for foreign table children and partitions 
 </listitem>
 
 <!--
+Author: Tom Lane <tgl@sss.pgh.pa.us>
+2023-03-02 [3dfae91f7] Show "internal name" not "source code" in psql's \df+ co
+-->
+
+<listitem>
+<para>
+Prevent \df+ from showing function source code (Isaac Morland)
+</para>
+
+<para>
+Function bodies are more easily viewed with \ev and \ef.
+</para>
+</listitem>
+
+<!--
 Author: Peter Eisentraut <peter@eisentraut.org>
 2022-11-15 [5b66de343] psql: Add command to use extended query protocol
 -->
@@ -2853,7 +2868,7 @@ Allow auto_explain to log values passed to parameterized statements (Dagfinn Ilm
 </para>
 
 <para>
-This affects queries using server-side PRAPARE/EXECUTE and client-side parse/bind.  Logging is controlled by auto_explain.log_parameter_max_length;  by default query parameters will
+This affects queries using server-side PREPARE/EXECUTE and client-side parse/bind.  Logging is controlled by auto_explain.log_parameter_max_length;  by default query parameters will
 be logged with no length restriction.
 </para>
 </listitem>
