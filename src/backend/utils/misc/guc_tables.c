@@ -420,9 +420,9 @@ static const struct config_enum_entry ssl_protocol_versions_info[] = {
 	{NULL, 0, false}
 };
 
-static const struct config_enum_entry logical_replication_mode_options[] = {
-	{"buffered", LOGICAL_REP_MODE_BUFFERED, false},
-	{"immediate", LOGICAL_REP_MODE_IMMEDIATE, false},
+static const struct config_enum_entry debug_logical_replication_streaming_options[] = {
+	{"buffered", DEBUG_LOGICAL_REP_STREAMING_BUFFERED, false},
+	{"immediate", DEBUG_LOGICAL_REP_STREAMING_IMMEDIATE, false},
 	{NULL, 0, false}
 };
 
@@ -3283,17 +3283,6 @@ struct config_int ConfigureNamesInt[] =
 	},
 
 	{
-		{"old_snapshot_threshold", PGC_POSTMASTER, RESOURCES_ASYNCHRONOUS,
-			gettext_noop("Time before a snapshot is too old to read pages changed after the snapshot was taken."),
-			gettext_noop("A value of -1 disables this feature."),
-			GUC_UNIT_MIN
-		},
-		&old_snapshot_threshold,
-		-1, -1, MINS_PER_HOUR * HOURS_PER_DAY * 60,
-		NULL, NULL, NULL
-	},
-
-	{
 		{"tcp_keepalives_idle", PGC_USERSET, CONN_AUTH_TCP,
 			gettext_noop("Time between issuing TCP keepalives."),
 			gettext_noop("A value of 0 uses the system default."),
@@ -4969,15 +4958,15 @@ struct config_enum ConfigureNamesEnum[] =
 	},
 
 	{
-		{"logical_replication_mode", PGC_USERSET, DEVELOPER_OPTIONS,
-			gettext_noop("Controls when to replicate or apply each change."),
+		{"debug_logical_replication_streaming", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Forces immediate streaming or serialization of changes in large transactions."),
 			gettext_noop("On the publisher, it allows streaming or serializing each change in logical decoding. "
 						 "On the subscriber, it allows serialization of all changes to files and notifies the "
 						 "parallel apply workers to read and apply them at the end of the transaction."),
 			GUC_NOT_IN_SAMPLE
 		},
-		&logical_replication_mode,
-		LOGICAL_REP_MODE_BUFFERED, logical_replication_mode_options,
+		&debug_logical_replication_streaming,
+		DEBUG_LOGICAL_REP_STREAMING_BUFFERED, debug_logical_replication_streaming_options,
 		NULL, NULL, NULL
 	},
 
