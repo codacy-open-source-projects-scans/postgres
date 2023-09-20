@@ -545,6 +545,7 @@ DR_printtup
 DR_sqlfunction
 DR_transientrel
 DWORD
+DataDirSyncMethod
 DataDumperPtr
 DataPageDeleteStack
 DatabaseInfo
@@ -2250,6 +2251,7 @@ ReadLocalXLogPageNoWaitPrivate
 ReadReplicationSlotCmd
 ReassignOwnedStmt
 RecheckForeignScan_function
+RecordCacheArrayEntry
 RecordCacheEntry
 RecordCompareData
 RecordIOData
@@ -3196,6 +3198,7 @@ bbstreamer_tar_archiver
 bbstreamer_tar_parser
 bbstreamer_zstd_frame
 bgworker_main_type
+bh_node_type
 binaryheap
 binaryheap_comparator
 bitmapword
