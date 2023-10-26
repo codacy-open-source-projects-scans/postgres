@@ -95,7 +95,7 @@ typedef enum OidOptions
 {
 	zeroIsError = 1,
 	zeroAsStar = 2,
-	zeroAsNone = 4
+	zeroAsNone = 4,
 } OidOptions;
 
 /* global decls */
@@ -3262,6 +3262,11 @@ dumpDatabase(Archive *fout)
 		appendStringLiteralAH(delQry, datname, fout);
 		appendPQExpBufferStr(delQry, ";\n");
 	}
+
+	/*
+	 * We do not restore pg_database.dathasloginevt because it is set
+	 * automatically on login event trigger creation.
+	 */
 
 	/* Add database-specific SET options */
 	dumpDatabaseConfig(fout, creaQry, datname, dbCatId.oid);
