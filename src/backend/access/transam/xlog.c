@@ -1029,8 +1029,10 @@ XLogInsertRecord(XLogRecData *rdata,
 
 		if (!debug_reader)
 			debug_reader = XLogReaderAllocate(wal_segment_size, NULL,
-											  XL_ROUTINE(), NULL);
-
+											  XL_ROUTINE(.page_read = NULL,
+														 .segment_open = NULL,
+														 .segment_close = NULL),
+											  NULL);
 		if (!debug_reader)
 		{
 			appendStringInfoString(&buf, "error decoding record: out of memory while allocating a WAL reading processor");
@@ -4817,9 +4819,9 @@ BootStrapXLOG(void)
 	checkPoint.time = (pg_time_t) time(NULL);
 	checkPoint.oldestActiveXid = InvalidTransactionId;
 
-	ShmemVariableCache->nextXid = checkPoint.nextXid;
-	ShmemVariableCache->nextOid = checkPoint.nextOid;
-	ShmemVariableCache->oidCount = 0;
+	TransamVariables->nextXid = checkPoint.nextXid;
+	TransamVariables->nextOid = checkPoint.nextOid;
+	TransamVariables->oidCount = 0;
 	MultiXactSetNextMXact(checkPoint.nextMulti, checkPoint.nextMultiOffset);
 	AdvanceOldestClogXid(checkPoint.oldestXid);
 	SetTransactionIdLimit(checkPoint.oldestXid, checkPoint.oldestXidDB);
@@ -5283,9 +5285,9 @@ StartupXLOG(void)
 	checkPoint = ControlFile->checkPointCopy;
 
 	/* initialize shared memory variables from the checkpoint record */
-	ShmemVariableCache->nextXid = checkPoint.nextXid;
-	ShmemVariableCache->nextOid = checkPoint.nextOid;
-	ShmemVariableCache->oidCount = 0;
+	TransamVariables->nextXid = checkPoint.nextXid;
+	TransamVariables->nextOid = checkPoint.nextOid;
+	TransamVariables->oidCount = 0;
 	MultiXactSetNextMXact(checkPoint.nextMulti, checkPoint.nextMultiOffset);
 	AdvanceOldestClogXid(checkPoint.oldestXid);
 	SetTransactionIdLimit(checkPoint.oldestXid, checkPoint.oldestXidDB);
@@ -5321,7 +5323,7 @@ StartupXLOG(void)
 	StartupReorderBuffer();
 
 	/*
-	 * Startup CLOG. This must be done after ShmemVariableCache->nextXid has
+	 * Startup CLOG. This must be done after TransamVariables->nextXid has
 	 * been initialized and before we accept connections or begin WAL replay.
 	 */
 	StartupCLOG();
@@ -5510,7 +5512,7 @@ StartupXLOG(void)
 			Assert(TransactionIdIsValid(oldestActiveXID));
 
 			/* Tell procarray about the range of xids it has to deal with */
-			ProcArrayInitRecovery(XidFromFullTransactionId(ShmemVariableCache->nextXid));
+			ProcArrayInitRecovery(XidFromFullTransactionId(TransamVariables->nextXid));
 
 			/*
 			 * Startup subtrans only.  CLOG, MultiXact and commit timestamp
@@ -5784,8 +5786,8 @@ StartupXLOG(void)
 
 	/* also initialize latestCompletedXid, to nextXid - 1 */
 	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
-	ShmemVariableCache->latestCompletedXid = ShmemVariableCache->nextXid;
-	FullTransactionIdRetreat(&ShmemVariableCache->latestCompletedXid);
+	TransamVariables->latestCompletedXid = TransamVariables->nextXid;
+	FullTransactionIdRetreat(&TransamVariables->latestCompletedXid);
 	LWLockRelease(ProcArrayLock);
 
 	/*
@@ -6777,20 +6779,20 @@ CreateCheckPoint(int flags)
 	 * there.
 	 */
 	LWLockAcquire(XidGenLock, LW_SHARED);
-	checkPoint.nextXid = ShmemVariableCache->nextXid;
-	checkPoint.oldestXid = ShmemVariableCache->oldestXid;
-	checkPoint.oldestXidDB = ShmemVariableCache->oldestXidDB;
+	checkPoint.nextXid = TransamVariables->nextXid;
+	checkPoint.oldestXid = TransamVariables->oldestXid;
+	checkPoint.oldestXidDB = TransamVariables->oldestXidDB;
 	LWLockRelease(XidGenLock);
 
 	LWLockAcquire(CommitTsLock, LW_SHARED);
-	checkPoint.oldestCommitTsXid = ShmemVariableCache->oldestCommitTsXid;
-	checkPoint.newestCommitTsXid = ShmemVariableCache->newestCommitTsXid;
+	checkPoint.oldestCommitTsXid = TransamVariables->oldestCommitTsXid;
+	checkPoint.newestCommitTsXid = TransamVariables->newestCommitTsXid;
 	LWLockRelease(CommitTsLock);
 
 	LWLockAcquire(OidGenLock, LW_SHARED);
-	checkPoint.nextOid = ShmemVariableCache->nextOid;
+	checkPoint.nextOid = TransamVariables->nextOid;
 	if (!shutdown)
-		checkPoint.nextOid += ShmemVariableCache->oidCount;
+		checkPoint.nextOid += TransamVariables->oidCount;
 	LWLockRelease(OidGenLock);
 
 	MultiXactGetCheckptMulti(shutdown,
@@ -7211,7 +7213,7 @@ RecoveryRestartPoint(const CheckPoint *checkPoint, XLogReaderState *record)
 	 */
 	if (XLogHaveInvalidPages())
 	{
-		elog(trace_recovery(DEBUG2),
+		elog(DEBUG2,
 			 "could not record restart point at %X/%X because there "
 			 "are unresolved references to invalid pages",
 			 LSN_FORMAT_ARGS(checkPoint->redo));
@@ -7882,16 +7884,16 @@ xlog_redo(XLogReaderState *record)
 		Oid			nextOid;
 
 		/*
-		 * We used to try to take the maximum of ShmemVariableCache->nextOid
-		 * and the recorded nextOid, but that fails if the OID counter wraps
+		 * We used to try to take the maximum of TransamVariables->nextOid and
+		 * the recorded nextOid, but that fails if the OID counter wraps
 		 * around.  Since no OID allocation should be happening during replay
 		 * anyway, better to just believe the record exactly.  We still take
 		 * OidGenLock while setting the variable, just in case.
 		 */
 		memcpy(&nextOid, XLogRecGetData(record), sizeof(Oid));
 		LWLockAcquire(OidGenLock, LW_EXCLUSIVE);
-		ShmemVariableCache->nextOid = nextOid;
-		ShmemVariableCache->oidCount = 0;
+		TransamVariables->nextOid = nextOid;
+		TransamVariables->oidCount = 0;
 		LWLockRelease(OidGenLock);
 	}
 	else if (info == XLOG_CHECKPOINT_SHUTDOWN)
@@ -7902,11 +7904,11 @@ xlog_redo(XLogReaderState *record)
 		memcpy(&checkPoint, XLogRecGetData(record), sizeof(CheckPoint));
 		/* In a SHUTDOWN checkpoint, believe the counters exactly */
 		LWLockAcquire(XidGenLock, LW_EXCLUSIVE);
-		ShmemVariableCache->nextXid = checkPoint.nextXid;
+		TransamVariables->nextXid = checkPoint.nextXid;
 		LWLockRelease(XidGenLock);
 		LWLockAcquire(OidGenLock, LW_EXCLUSIVE);
-		ShmemVariableCache->nextOid = checkPoint.nextOid;
-		ShmemVariableCache->oidCount = 0;
+		TransamVariables->nextOid = checkPoint.nextOid;
+		TransamVariables->oidCount = 0;
 		LWLockRelease(OidGenLock);
 		MultiXactSetNextMXact(checkPoint.nextMulti,
 							  checkPoint.nextMultiOffset);
@@ -7999,9 +8001,9 @@ xlog_redo(XLogReaderState *record)
 		memcpy(&checkPoint, XLogRecGetData(record), sizeof(CheckPoint));
 		/* In an ONLINE checkpoint, treat the XID counter as a minimum */
 		LWLockAcquire(XidGenLock, LW_EXCLUSIVE);
-		if (FullTransactionIdPrecedes(ShmemVariableCache->nextXid,
+		if (FullTransactionIdPrecedes(TransamVariables->nextXid,
 									  checkPoint.nextXid))
-			ShmemVariableCache->nextXid = checkPoint.nextXid;
+			TransamVariables->nextXid = checkPoint.nextXid;
 		LWLockRelease(XidGenLock);
 
 		/*
@@ -8026,7 +8028,7 @@ xlog_redo(XLogReaderState *record)
 		 */
 		MultiXactAdvanceOldest(checkPoint.oldestMulti,
 							   checkPoint.oldestMultiDB);
-		if (TransactionIdPrecedes(ShmemVariableCache->oldestXid,
+		if (TransactionIdPrecedes(TransamVariables->oldestXid,
 								  checkPoint.oldestXid))
 			SetTransactionIdLimit(checkPoint.oldestXid,
 								  checkPoint.oldestXidDB);

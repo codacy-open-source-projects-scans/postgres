@@ -386,15 +386,6 @@ avlauncher_forkexec(void)
 
 	return postmaster_forkexec(ac, av);
 }
-
-/*
- * We need this set from the outside, before InitProcess is called
- */
-void
-AutovacuumLauncherIAm(void)
-{
-	am_autovacuum_launcher = true;
-}
 #endif
 
 /*
@@ -1452,15 +1443,6 @@ avworker_forkexec(void)
 	Assert(ac < lengthof(av));
 
 	return postmaster_forkexec(ac, av);
-}
-
-/*
- * We need this set from the outside, before InitProcess is called
- */
-void
-AutovacuumWorkerIAm(void)
-{
-	am_autovacuum_worker = true;
 }
 #endif
 
@@ -2658,8 +2640,8 @@ deleted:
 	 *
 	 * Even if we didn't vacuum anything, it may still be important to do
 	 * this, because one indirect effect of vac_update_datfrozenxid() is to
-	 * update ShmemVariableCache->xidVacLimit.  That might need to be done
-	 * even if we haven't vacuumed anything, because relations with older
+	 * update TransamVariables->xidVacLimit.  That might need to be done even
+	 * if we haven't vacuumed anything, because relations with older
 	 * relfrozenxid values or other databases with older datfrozenxid values
 	 * might have been dropped, allowing xidVacLimit to advance.
 	 *

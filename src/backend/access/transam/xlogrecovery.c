@@ -1704,9 +1704,7 @@ PerformWalRecovery(void)
 										 LSN_FORMAT_ARGS(xlogreader->ReadRecPtr));
 
 #ifdef WAL_DEBUG
-			if (XLOG_DEBUG ||
-				(record->xl_rmid == RM_XACT_ID && trace_recovery_messages <= DEBUG2) ||
-				(record->xl_rmid != RM_XACT_ID && trace_recovery_messages <= DEBUG3))
+			if (XLOG_DEBUG)
 			{
 				StringInfoData buf;
 
@@ -1869,7 +1867,7 @@ ApplyWalRecord(XLogReaderState *xlogreader, XLogRecord *record, TimeLineID *repl
 	error_context_stack = &errcallback;
 
 	/*
-	 * ShmemVariableCache->nextXid must be beyond record's xid.
+	 * TransamVariables->nextXid must be beyond record's xid.
 	 */
 	AdvanceNextFullTransactionIdPastXid(record->xl_xid);
 
