@@ -1,16 +1,16 @@
-# Copyright (c) 2023, PostgreSQL Global Development Group
+# Copyright (c) 2023-2024, PostgreSQL Global Development Group
 #
 # Consume a lot of XIDs, wrapping around a few times.
 #
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 use Time::HiRes qw(usleep);
 
-if ($ENV{PG_TEST_EXTRA} !~ /\bxid_wraparound\b/)
+if (!$ENV{PG_TEST_EXTRA} || $ENV{PG_TEST_EXTRA} !~ /\bxid_wraparound\b/)
 {
 	plan skip_all => "test xid_wraparound not enabled in PG_TEST_EXTRA";
 }

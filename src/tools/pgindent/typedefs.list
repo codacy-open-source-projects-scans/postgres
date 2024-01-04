@@ -97,6 +97,7 @@ AlterTSConfigurationStmt
 AlterTSDictionaryStmt
 AlterTableCmd
 AlterTableMoveAllStmt
+AlterTablePass
 AlterTableSpaceOptionsStmt
 AlterTableStmt
 AlterTableType
@@ -307,7 +308,6 @@ BrinRevmap
 BrinShared
 BrinSortTuple
 BrinSpecialSpace
-BrinSpool
 BrinStatsData
 BrinTuple
 BrinValues
@@ -2480,6 +2480,8 @@ ScanState
 ScanTypeControl
 ScannerCallbackState
 SchemaQuery
+SearchPathCacheEntry
+SearchPathCacheKey
 SearchPathMatcher
 SecBuffer
 SecBufferDesc
@@ -2634,10 +2636,10 @@ SpecialJoinInfo
 SpinDelayStatus
 SplitInterval
 SplitLR
+SplitPageLayout
 SplitPoint
 SplitTextOutputData
 SplitVar
-SplitedPageLayout
 StackElem
 StartDataPtrType
 StartLOPtrType
@@ -2669,6 +2671,7 @@ SubLinkType
 SubOpts
 SubPlan
 SubPlanState
+SubRelInfo
 SubRemoveRels
 SubTransactionId
 SubXactCallback
@@ -3514,6 +3517,7 @@ needs_fmgr_hook_type
 network_sortsupport_state
 nodeitem
 normal_rand_fctx
+nsphash_hash
 ntile_context
 numeric
 object_access_hook_type

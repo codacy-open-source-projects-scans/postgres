@@ -1,4 +1,4 @@
-# Copyright (c) 2021-2023, PostgreSQL Global Development Group
+# Copyright (c) 2021-2024, PostgreSQL Global Development Group
 #
 # This test aims to validate that pg_combinebackup works in the degenerate
 # case where it is invoked on a single full backup and that it can produce
@@ -6,7 +6,7 @@
 # pg_combinebackup does not produce a manifest when run with --no-manifest.
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use File::Compare;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;

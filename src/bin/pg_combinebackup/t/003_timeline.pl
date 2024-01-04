@@ -1,10 +1,10 @@
-# Copyright (c) 2021-2023, PostgreSQL Global Development Group
+# Copyright (c) 2021-2024, PostgreSQL Global Development Group
 #
 # This test aims to validate that restoring an incremental backup works
 # properly even when the reference backup is on a different timeline.
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use File::Compare;
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;

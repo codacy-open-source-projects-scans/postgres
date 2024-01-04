@@ -2616,6 +2616,12 @@ select * from emp1 t1
    inner join emp1 t2 on t1.id = t2.id
     left join emp1 t3 on t1.id > 1 and t1.id < 2;
 
+-- Check that SJE replaces target relation correctly
+explain (costs off)
+WITH t1 AS (SELECT * FROM emp1)
+UPDATE emp1 SET code = t1.code + 1 FROM t1
+WHERE t1.id = emp1.id RETURNING emp1.id, emp1.code;
+
 -- We can remove the join even if we find the join can't duplicate rows and
 -- the base quals of each side are different.  In the following case we end up
 -- moving quals over to s1 to make it so it can't match any rows.
@@ -2650,7 +2656,7 @@ SELECT * FROM
 WHERE q0.a = 1;
 
 --
----- Only one side is unqiue
+---- Only one side is unique
 --select * from sl t1, sl t2 where t1.a = t2.a and t1.b = 1;
 --select * from sl t1, sl t2 where t1.a = t2.a and t2.b = 1;
 --
