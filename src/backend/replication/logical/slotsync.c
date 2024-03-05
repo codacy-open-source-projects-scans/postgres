@@ -105,16 +105,13 @@ bool		sync_replication_slots = false;
  * (within a MIN/MAX range) according to slot activity. See
  * wait_for_slot_activity() for details.
  */
-#define MIN_WORKER_NAPTIME_MS  200
-#define MAX_WORKER_NAPTIME_MS  30000	/* 30s */
+#define MIN_SLOTSYNC_WORKER_NAPTIME_MS  200
+#define MAX_SLOTSYNC_WORKER_NAPTIME_MS  30000	/* 30s */
 
-static long sleep_ms = MIN_WORKER_NAPTIME_MS;
+static long sleep_ms = MIN_SLOTSYNC_WORKER_NAPTIME_MS;
 
 /* The restart interval for slot sync work used by postmaster */
 #define SLOTSYNC_RESTART_INTERVAL_SEC 10
-
-/* Flag to tell if we are in a slot sync worker process */
-static bool am_slotsync_worker = false;
 
 /*
  * Flag to tell if we are syncing replication slots. Unlike the 'syncing' flag
@@ -491,7 +488,7 @@ synchronize_one_slot(RemoteSlot *remote_slot, Oid remote_dbid)
 	latestFlushPtr = GetStandbyFlushRecPtr(NULL);
 	if (remote_slot->confirmed_lsn > latestFlushPtr)
 	{
-		ereport(am_slotsync_worker ? LOG : ERROR,
+		ereport(AmLogicalSlotSyncWorkerProcess() ? LOG : ERROR,
 				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				errmsg("skipping slot synchronization as the received slot sync"
 					   " LSN %X/%X for slot \"%s\" is ahead of the standby position %X/%X",
@@ -924,12 +921,9 @@ ValidateSlotSyncParams(int elevel)
 	 * in this case regardless of elevel provided by caller.
 	 */
 	if (wal_level < WAL_LEVEL_LOGICAL)
-	{
 		ereport(ERROR,
 				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				errmsg("slot synchronization requires wal_level >= \"logical\""));
-		return false;
-	}
 
 	/*
 	 * A physical replication slot(primary_slot_name) is required on the
@@ -1082,7 +1076,7 @@ wait_for_slot_activity(bool some_slot_updated)
 		 * No slots were updated, so double the sleep time, but not beyond the
 		 * maximum allowable value.
 		 */
-		sleep_ms = Min(sleep_ms * 2, MAX_WORKER_NAPTIME_MS);
+		sleep_ms = Min(sleep_ms * 2, MAX_SLOTSYNC_WORKER_NAPTIME_MS);
 	}
 	else
 	{
@@ -1090,7 +1084,7 @@ wait_for_slot_activity(bool some_slot_updated)
 		 * Some slots were updated since the last sleep, so reset the sleep
 		 * time.
 		 */
-		sleep_ms = MIN_WORKER_NAPTIME_MS;
+		sleep_ms = MIN_SLOTSYNC_WORKER_NAPTIME_MS;
 	}
 
 	rc = WaitLatch(MyLatch,
@@ -1116,8 +1110,6 @@ ReplSlotSyncWorkerMain(int argc, char *argv[])
 	char	   *err;
 	sigjmp_buf	local_sigjmp_buf;
 	StringInfoData app_name;
-
-	am_slotsync_worker = true;
 
 	MyBackendType = B_SLOTSYNC_WORKER;
 
@@ -1214,6 +1206,16 @@ ReplSlotSyncWorkerMain(int argc, char *argv[])
 	 * Unblock signals (they were blocked when the postmaster forked us)
 	 */
 	sigprocmask(SIG_SETMASK, &UnBlockSig, NULL);
+
+	/*
+	 * Set always-secure search path, so malicious users can't redirect user
+	 * code (e.g. operators).
+	 *
+	 * It's not strictly necessary since we won't be scanning or writing to
+	 * any user table locally, but it's good to retain it here for added
+	 * precaution.
+	 */
+	SetConfigOption("search_path", "", PGC_SUSET, PGC_S_OVERRIDE);
 
 	dbname = CheckAndGetDbnameFromConninfo();
 
@@ -1429,15 +1431,6 @@ bool
 IsSyncingReplicationSlots(void)
 {
 	return syncing_slots;
-}
-
-/*
- * Is current process a slot sync worker?
- */
-bool
-IsLogicalSlotSyncWorker(void)
-{
-	return am_slotsync_worker;
 }
 
 /*

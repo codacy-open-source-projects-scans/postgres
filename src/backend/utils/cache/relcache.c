@@ -32,7 +32,6 @@
 
 #include "access/htup_details.h"
 #include "access/multixact.h"
-#include "access/nbtree.h"
 #include "access/parallel.h"
 #include "access/reloptions.h"
 #include "access/sysattr.h"
@@ -40,7 +39,6 @@
 #include "access/tableam.h"
 #include "access/tupdesc_details.h"
 #include "access/xact.h"
-#include "access/xlog.h"
 #include "catalog/binary_upgrade.h"
 #include "catalog/catalog.h"
 #include "catalog/indexing.h"
@@ -1144,13 +1142,13 @@ retry:
 	{
 		case RELPERSISTENCE_UNLOGGED:
 		case RELPERSISTENCE_PERMANENT:
-			relation->rd_backend = InvalidBackendId;
+			relation->rd_backend = INVALID_PROC_NUMBER;
 			relation->rd_islocaltemp = false;
 			break;
 		case RELPERSISTENCE_TEMP:
 			if (isTempOrTempToastNamespace(relation->rd_rel->relnamespace))
 			{
-				relation->rd_backend = BackendIdForTempRelations();
+				relation->rd_backend = ProcNumberForTempRelations();
 				relation->rd_islocaltemp = true;
 			}
 			else
@@ -1159,18 +1157,18 @@ retry:
 				 * If it's a temp table, but not one of ours, we have to use
 				 * the slow, grotty method to figure out the owning backend.
 				 *
-				 * Note: it's possible that rd_backend gets set to MyBackendId
-				 * here, in case we are looking at a pg_class entry left over
-				 * from a crashed backend that coincidentally had the same
-				 * BackendId we're using.  We should *not* consider such a
-				 * table to be "ours"; this is why we need the separate
-				 * rd_islocaltemp flag.  The pg_class entry will get flushed
-				 * if/when we clean out the corresponding temp table namespace
-				 * in preparation for using it.
+				 * Note: it's possible that rd_backend gets set to
+				 * MyProcNumber here, in case we are looking at a pg_class
+				 * entry left over from a crashed backend that coincidentally
+				 * had the same ProcNumber we're using.  We should *not*
+				 * consider such a table to be "ours"; this is why we need the
+				 * separate rd_islocaltemp flag.  The pg_class entry will get
+				 * flushed if/when we clean out the corresponding temp table
+				 * namespace in preparation for using it.
 				 */
 				relation->rd_backend =
-					GetTempNamespaceBackendId(relation->rd_rel->relnamespace);
-				Assert(relation->rd_backend != InvalidBackendId);
+					GetTempNamespaceProcNumber(relation->rd_rel->relnamespace);
+				Assert(relation->rd_backend != INVALID_PROC_NUMBER);
 				relation->rd_islocaltemp = false;
 			}
 			break;
@@ -1896,7 +1894,7 @@ formrdesc(const char *relationName, Oid relationReltype,
 	relation->rd_newRelfilelocatorSubid = InvalidSubTransactionId;
 	relation->rd_firstRelfilelocatorSubid = InvalidSubTransactionId;
 	relation->rd_droppedSubid = InvalidSubTransactionId;
-	relation->rd_backend = InvalidBackendId;
+	relation->rd_backend = INVALID_PROC_NUMBER;
 	relation->rd_islocaltemp = false;
 
 	/*
@@ -3611,12 +3609,12 @@ RelationBuildLocalRelation(const char *relname,
 	{
 		case RELPERSISTENCE_UNLOGGED:
 		case RELPERSISTENCE_PERMANENT:
-			rel->rd_backend = InvalidBackendId;
+			rel->rd_backend = INVALID_PROC_NUMBER;
 			rel->rd_islocaltemp = false;
 			break;
 		case RELPERSISTENCE_TEMP:
 			Assert(isTempOrTempToastNamespace(relnamespace));
-			rel->rd_backend = BackendIdForTempRelations();
+			rel->rd_backend = ProcNumberForTempRelations();
 			rel->rd_islocaltemp = true;
 			break;
 		default:

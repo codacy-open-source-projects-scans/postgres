@@ -14,7 +14,11 @@ use Test::More;
 
 # Create publisher
 my $publisher = PostgreSQL::Test::Cluster->new('publisher');
-$publisher->init(allows_streaming => 'logical');
+# Make sure pg_hba.conf is set up to allow connections from repl_role.
+# This is only needed on Windows machines that don't use UNIX sockets.
+$publisher->init(
+	allows_streaming => 'logical',
+	auth_extra => [ '--create-role', 'repl_role' ]);
 # Disable autovacuum to avoid generating xid during stats update as otherwise
 # the new XID could then be replicated to standby at some random point making
 # slots at primary lag behind standby during slot sync.
@@ -360,6 +364,60 @@ ok( $stderr =~
 	"cannot sync slots to a cascading standby server");
 
 $cascading_standby->stop;
+
+##################################################
+# Test to confirm that the slot synchronization is protected from malicious
+# users.
+##################################################
+
+$primary->psql('postgres', "CREATE DATABASE slotsync_test_db");
+$primary->wait_for_replay_catchup($standby1);
+
+$standby1->stop;
+
+# On the primary server, create '=' operator in another schema mapped to
+# inequality function and redirect the queries to use new operator by setting
+# search_path. The new '=' operator is created with leftarg as 'bigint' and
+# right arg as 'int' to redirect 'count(*) = 1' in slot sync's query to use
+# new '=' operator.
+$primary->safe_psql(
+	'slotsync_test_db', q{
+
+CREATE ROLE repl_role REPLICATION LOGIN;
+CREATE SCHEMA myschema;
+
+CREATE FUNCTION myschema.myintne(bigint, int) RETURNS bool as $$
+		BEGIN
+		  RETURN $1 <> $2;
+		END;
+	  $$ LANGUAGE plpgsql immutable;
+
+CREATE OPERATOR myschema.= (
+	  leftarg    = bigint,
+	  rightarg   = int,
+	  procedure  = myschema.myintne);
+
+ALTER DATABASE slotsync_test_db SET SEARCH_PATH TO myschema,pg_catalog;
+GRANT USAGE on SCHEMA myschema TO repl_role;
+});
+
+# Start the standby with changed primary_conninfo.
+$standby1->append_conf('postgresql.conf', "primary_conninfo = '$connstr_1 dbname=slotsync_test_db user=repl_role'");
+$standby1->start;
+
+# Run the synchronization function. If the sync flow was not prepared
+# to handle such attacks, it would have failed during the validation
+# of the primary_slot_name itself resulting in
+# ERROR:  slot synchronization requires valid primary_slot_name
+$standby1->safe_psql('slotsync_test_db', "SELECT pg_sync_replication_slots();");
+
+# Reset the dbname and user in primary_conninfo to the earlier values.
+$standby1->append_conf('postgresql.conf', "primary_conninfo = '$connstr_1 dbname=postgres'");
+$standby1->reload;
+
+# Drop the newly created database.
+$primary->psql('postgres',
+	q{DROP DATABASE slotsync_test_db;});
 
 ##################################################
 # Test to confirm that the slot sync worker exits on invalid GUC(s) and

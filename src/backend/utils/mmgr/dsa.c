@@ -53,9 +53,7 @@
 #include "port/atomics.h"
 #include "port/pg_bitutils.h"
 #include "storage/dsm.h"
-#include "storage/ipc.h"
 #include "storage/lwlock.h"
-#include "storage/shmem.h"
 #include "utils/dsa.h"
 #include "utils/freepage.h"
 #include "utils/memutils.h"
@@ -1113,9 +1111,13 @@ dsa_dump(dsa_area *area)
 		{
 			dsa_segment_index segment_index;
 
-			fprintf(stderr,
-					"    segment bin %zu (at least %d contiguous pages free):\n",
-					i, 1 << (i - 1));
+			if (i == 0)
+				fprintf(stderr,
+						"    segment bin %zu (no contiguous free pages):\n", i);
+			else
+				fprintf(stderr,
+						"    segment bin %zu (at least %d contiguous pages free):\n",
+						i, 1 << (i - 1));
 			segment_index = area->control->segment_bins[i];
 			while (segment_index != DSA_SEGMENT_INDEX_NONE)
 			{

@@ -64,7 +64,6 @@
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
-#include "utils/guc.h"
 #include "utils/pg_locale.h"
 #include "utils/relmapper.h"
 #include "utils/snapmgr.h"
@@ -276,7 +275,7 @@ ScanSourceDatabasePgClass(Oid tbid, Oid dbid, char *srcpath)
 	rlocator.dbOid = dbid;
 	rlocator.relNumber = relfilenumber;
 
-	smgr = smgropen(rlocator, InvalidBackendId);
+	smgr = smgropen(rlocator, INVALID_PROC_NUMBER);
 	nblocks = smgrnblocks(smgr, MAIN_FORKNUM);
 	smgrclose(smgr);
 

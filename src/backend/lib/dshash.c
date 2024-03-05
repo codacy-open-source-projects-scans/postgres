@@ -33,10 +33,8 @@
 
 #include "common/hashfn.h"
 #include "lib/dshash.h"
-#include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "utils/dsa.h"
-#include "utils/memutils.h"
 
 /*
  * An item in the hash table.  This wraps the user's entry object in an
@@ -202,7 +200,7 @@ static inline void copy_key(dshash_table *hash_table, void *dest,
  * Create a new hash table backed by the given dynamic shared area, with the
  * given parameters.  The returned object is allocated in backend-local memory
  * using the current MemoryContext.  'arg' will be passed through to the
- * compare and hash functions.
+ * compare, hash, and copy functions.
  */
 dshash_table *
 dshash_create(dsa_area *area, const dshash_parameters *params, void *arg)
