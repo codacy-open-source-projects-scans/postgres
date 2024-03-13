@@ -4707,6 +4707,7 @@ inline_function(Oid funcid, Oid result_type, Oid result_collid,
 	querytree_list = list_make1(querytree);
 	if (check_sql_fn_retval(list_make1(querytree_list),
 							result_type, rettupdesc,
+							funcform->prokind,
 							false, NULL))
 		goto fail;				/* reject whole-tuple-result cases */
 
@@ -5216,16 +5217,20 @@ inline_set_returning_function(PlannerInfo *root, RangeTblEntry *rte)
 	}
 
 	/*
-	 * Also resolve the actual function result tupdesc, if composite.  If the
-	 * function is just declared to return RECORD, dig the info out of the AS
-	 * clause.
+	 * Also resolve the actual function result tupdesc, if composite.  If we
+	 * have a coldeflist, believe that; otherwise use get_expr_result_type.
+	 * (This logic should match ExecInitFunctionScan.)
 	 */
-	functypclass = get_expr_result_type((Node *) fexpr, NULL, &rettupdesc);
-	if (functypclass == TYPEFUNC_RECORD)
+	if (rtfunc->funccolnames != NIL)
+	{
+		functypclass = TYPEFUNC_RECORD;
 		rettupdesc = BuildDescFromLists(rtfunc->funccolnames,
 										rtfunc->funccoltypes,
 										rtfunc->funccoltypmods,
 										rtfunc->funccolcollations);
+	}
+	else
+		functypclass = get_expr_result_type((Node *) fexpr, NULL, &rettupdesc);
 
 	/*
 	 * The single command must be a plain SELECT.
@@ -5249,6 +5254,7 @@ inline_set_returning_function(PlannerInfo *root, RangeTblEntry *rte)
 	 */
 	if (!check_sql_fn_retval(list_make1(querytree_list),
 							 fexpr->funcresulttype, rettupdesc,
+							 funcform->prokind,
 							 true, NULL) &&
 		(functypclass == TYPEFUNC_COMPOSITE ||
 		 functypclass == TYPEFUNC_COMPOSITE_DOMAIN ||

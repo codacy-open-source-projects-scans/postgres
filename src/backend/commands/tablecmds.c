@@ -10378,7 +10378,7 @@ addFkRecurseReferenced(List **wqueue, Constraint *fkconstraint, Relation rel,
 									  conislocal,	/* islocal */
 									  coninhcount,	/* inhcount */
 									  connoinherit, /* conNoInherit */
-									  false,	/* conWithoutOverlaps */
+									  false,	/* conPeriod */
 									  false);	/* is_internal */
 
 	ObjectAddressSet(address, ConstraintRelationId, constrOid);
@@ -10677,7 +10677,7 @@ addFkRecurseReferencing(List **wqueue, Constraint *fkconstraint, Relation rel,
 									  false,
 									  1,
 									  false,
-									  false,	/* conWithoutOverlaps */
+									  false,	/* conPeriod */
 									  false);
 
 			/*
@@ -11183,7 +11183,7 @@ CloneFkReferencing(List **wqueue, Relation parentRel, Relation partRel)
 								  false,	/* islocal */
 								  1,	/* inhcount */
 								  false,	/* conNoInherit */
-								  false,	/* conWithoutOverlaps */
+								  false,	/* conPeriod */
 								  true);
 
 		/* Set up partition dependencies for the new constraint */
@@ -15202,6 +15202,7 @@ ATExecDropCluster(Relation rel, LOCKMODE lockmode)
  *
  * Check that access method exists.  If it is the same as the table's current
  * access method, it is a no-op.  Otherwise, a table rewrite is necessary.
+ * If amname is NULL, select default_table_access_method as access method.
  */
 static void
 ATPrepSetAccessMethod(AlteredTableInfo *tab, Relation rel, const char *amname)
@@ -15209,7 +15210,8 @@ ATPrepSetAccessMethod(AlteredTableInfo *tab, Relation rel, const char *amname)
 	Oid			amoid;
 
 	/* Check that the table access method exists */
-	amoid = get_table_am_oid(amname, false);
+	amoid = get_table_am_oid(amname ? amname : default_table_access_method,
+							 false);
 
 	if (rel->rd_rel->relam == amoid)
 		return;
