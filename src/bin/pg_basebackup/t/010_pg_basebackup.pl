@@ -77,7 +77,7 @@ $node->command_fails([ @pg_basebackup_defs, '-D', "$tempdir/backup", '-n' ],
 ok(-d "$tempdir/backup", 'backup directory was created and left behind');
 rmtree("$tempdir/backup");
 
-open my $conf, '>>', "$pgdata/postgresql.conf";
+open my $conf, '>>', "$pgdata/postgresql.conf" or die $!;
 print $conf "max_replication_slots = 10\n";
 print $conf "max_wal_senders = 10\n";
 print $conf "wal_level = replica\n";
@@ -175,7 +175,7 @@ foreach my $filename (
 	qw(backup_label tablespace_map postgresql.auto.conf.tmp
 	current_logfiles.tmp global/pg_internal.init.123))
 {
-	open my $file, '>>', "$pgdata/$filename";
+	open my $file, '>>', "$pgdata/$filename" or die $!;
 	print $file "DONOTCOPY";
 	close $file;
 }
@@ -185,7 +185,7 @@ foreach my $filename (
 # unintended side effects.
 if ($Config{osname} ne 'darwin')
 {
-	open my $file, '>>', "$pgdata/.DS_Store";
+	open my $file, '>>', "$pgdata/.DS_Store" or die $!;
 	print $file "DONOTCOPY";
 	close $file;
 }
@@ -423,7 +423,7 @@ SKIP:
 	my $tblspcoid = $1;
 	my $escapedRepTsDir = $realRepTsDir;
 	$escapedRepTsDir =~ s/\\/\\\\/g;
-	open my $mapfile, '>', $node2->data_dir . '/tablespace_map';
+	open my $mapfile, '>', $node2->data_dir . '/tablespace_map' or die $!;
 	print $mapfile "$tblspcoid $escapedRepTsDir\n";
 	close $mapfile;
 
@@ -964,5 +964,21 @@ $node->safe_psql('postgres', "DROP TABLESPACE tblspc2;");
 $backupdir = $node->backup_dir . '/backup3';
 my @dst_tblspc = glob "$backupdir/pg_tblspc/$tblspc_oid/PG_*";
 is(@dst_tblspc, 1, 'tblspc directory copied');
+
+# Can't take backup with referring manifest of different cluster
+#
+# Set up another new database instance with force initdb option. We don't want
+# to initializing database system by copying initdb template for this, because
+# we want it to be a separate cluster with a different system ID.
+my $node2 = PostgreSQL::Test::Cluster->new('node2');
+$node2->init(force_initdb => 1, has_archiving => 1, allows_streaming => 1);
+$node2->append_conf('postgresql.conf', 'summarize_wal = on');
+$node2->start;
+
+$node2->command_fails_like(
+	[ @pg_basebackup_defs, '-D', "$tempdir" . '/diff_sysid',
+		'--incremental', "$backupdir" . '/backup_manifest' ],
+	qr/manifest system identifier is .*, but database system identifier is/,
+	"pg_basebackup fails with different database system manifest");
 
 done_testing();

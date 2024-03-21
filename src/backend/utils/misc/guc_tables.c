@@ -82,11 +82,11 @@
 #include "utils/float.h"
 #include "utils/guc_hooks.h"
 #include "utils/guc_tables.h"
+#include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/pg_locale.h"
 #include "utils/plancache.h"
 #include "utils/ps_status.h"
-#include "utils/inval.h"
 #include "utils/xml.h"
 
 /* This value is normally passed in from the Makefile */
@@ -3293,9 +3293,9 @@ struct config_int ConfigureNamesInt[] =
 			GUC_UNIT_MIN,
 		},
 		&wal_summary_keep_time,
-		10 * 24 * 60,			/* 10 days */
+		10 * HOURS_PER_DAY * MINS_PER_HOUR, /* 10 days */
 		0,
-		INT_MAX,
+		INT_MAX / SECS_PER_MINUTE,
 		NULL, NULL, NULL
 	},
 

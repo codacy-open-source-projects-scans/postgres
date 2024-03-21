@@ -807,10 +807,6 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	}
 	else if (stmt->partbound)
 	{
-		/*
-		 * For partitions, when no other tablespace is specified, we default
-		 * the tablespace to the parent partitioned table's.
-		 */
 		Assert(list_length(inheritOids) == 1);
 		tablespaceId = get_rel_tablespace(linitial_oid(inheritOids));
 	}
@@ -8711,7 +8707,8 @@ ATExecDropExpression(Relation rel, const char *colName, bool missing_ok, LOCKMOD
 static ObjectAddress
 ATExecSetStatistics(Relation rel, const char *colName, int16 colNum, Node *newValue, LOCKMODE lockmode)
 {
-	int			newtarget;
+	int			newtarget = 0;
+	bool		newtarget_default;
 	Relation	attrelation;
 	HeapTuple	tuple,
 				newtuple;
@@ -8733,35 +8730,35 @@ ATExecSetStatistics(Relation rel, const char *colName, int16 colNum, Node *newVa
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot refer to non-index column by number")));
 
-	if (newValue)
+	/* -1 was used in previous versions for the default setting */
+	if (newValue && intVal(newValue) != -1)
 	{
 		newtarget = intVal(newValue);
+		newtarget_default = false;
 	}
 	else
+		newtarget_default = true;
+
+	if (!newtarget_default)
 	{
 		/*
-		 * -1 was used in previous versions to represent the default setting
+		 * Limit target to a sane range
 		 */
-		newtarget = -1;
-	}
-
-	/*
-	 * Limit target to a sane range
-	 */
-	if (newtarget < -1)
-	{
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("statistics target %d is too low",
-						newtarget)));
-	}
-	else if (newtarget > MAX_STATISTICS_TARGET)
-	{
-		newtarget = MAX_STATISTICS_TARGET;
-		ereport(WARNING,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("lowering statistics target to %d",
-						newtarget)));
+		if (newtarget < 0)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("statistics target %d is too low",
+							newtarget)));
+		}
+		else if (newtarget > MAX_STATISTICS_TARGET)
+		{
+			newtarget = MAX_STATISTICS_TARGET;
+			ereport(WARNING,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("lowering statistics target to %d",
+							newtarget)));
+		}
 	}
 
 	attrelation = table_open(AttributeRelationId, RowExclusiveLock);
@@ -8815,7 +8812,7 @@ ATExecSetStatistics(Relation rel, const char *colName, int16 colNum, Node *newVa
 	/* Build new tuple. */
 	memset(repl_null, false, sizeof(repl_null));
 	memset(repl_repl, false, sizeof(repl_repl));
-	if (newtarget != -1)
+	if (!newtarget_default)
 		repl_val[Anum_pg_attribute_attstattarget - 1] = newtarget;
 	else
 		repl_null[Anum_pg_attribute_attstattarget - 1] = true;
@@ -18096,15 +18093,16 @@ AtEOSubXact_on_commit_actions(bool isCommit, SubTransactionId mySubid,
  * This is intended as a callback for RangeVarGetRelidExtended().  It allows
  * the relation to be locked only if (1) it's a plain or partitioned table,
  * materialized view, or TOAST table and (2) the current user is the owner (or
- * the superuser).  This meets the permission-checking needs of CLUSTER,
- * REINDEX TABLE, and REFRESH MATERIALIZED VIEW; we expose it here so that it
- * can be used by all.
+ * the superuser) or has been granted MAINTAIN.  This meets the
+ * permission-checking needs of CLUSTER, REINDEX TABLE, and REFRESH
+ * MATERIALIZED VIEW; we expose it here so that it can be used by all.
  */
 void
-RangeVarCallbackOwnsTable(const RangeVar *relation,
-						  Oid relId, Oid oldRelId, void *arg)
+RangeVarCallbackMaintainsTable(const RangeVar *relation,
+							   Oid relId, Oid oldRelId, void *arg)
 {
 	char		relkind;
+	AclResult	aclresult;
 
 	/* Nothing to do if the relation was not found. */
 	if (!OidIsValid(relId))
@@ -18125,8 +18123,11 @@ RangeVarCallbackOwnsTable(const RangeVar *relation,
 				 errmsg("\"%s\" is not a table or materialized view", relation->relname)));
 
 	/* Check permissions */
-	if (!object_ownercheck(RelationRelationId, relId, GetUserId()))
-		aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(get_rel_relkind(relId)), relation->relname);
+	aclresult = pg_class_aclcheck(relId, GetUserId(), ACL_MAINTAIN);
+	if (aclresult != ACLCHECK_OK)
+		aclcheck_error(aclresult,
+					   get_relkind_objtype(get_rel_relkind(relId)),
+					   relation->relname);
 }
 
 /*

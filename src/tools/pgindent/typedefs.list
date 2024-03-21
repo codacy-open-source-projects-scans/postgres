@@ -231,6 +231,7 @@ BY_HANDLE_FILE_INFORMATION
 Backend
 BackendId
 BackendParameters
+BackendStartupData
 BackendState
 BackendType
 BackgroundWorker
@@ -850,6 +851,7 @@ FormData_pg_ts_parser
 FormData_pg_ts_template
 FormData_pg_type
 FormData_pg_user_mapping
+FormExtraData_pg_attribute
 Form_pg_aggregate
 Form_pg_am
 Form_pg_amop
@@ -1577,6 +1579,7 @@ MergeJoinState
 MergePath
 MergeScanSelCache
 MergeStmt
+MergeSupportFunc
 MergeWhenClause
 MetaCommand
 MinMaxAggInfo
@@ -1960,6 +1963,7 @@ ParamsErrorCbData
 ParentMapEntry
 ParseCallbackState
 ParseExprKind
+ParseLoc
 ParseNamespaceColumn
 ParseNamespaceItem
 ParseParamRefHook
@@ -2134,6 +2138,7 @@ PortalStrategy
 PostParseColumnRefHook
 PostgresPollingStatusType
 PostingItem
+PostmasterChildType
 PreParseColumnRefHook
 PredClass
 PredIterInfo
@@ -3257,6 +3262,7 @@ check_network_data
 check_object_relabel_type
 check_password_hook_type
 check_ungrouped_columns_context
+child_process_kind
 chr
 cmpEntriesArg
 codes_t
@@ -4040,6 +4046,7 @@ BlockRefTableReader
 BlockRefTableSerializedEntry
 BlockRefTableWriter
 SummarizerReadLocalXLogPrivate
+SysloggerStartupData
 WalSummarizerData
 WalSummaryFile
 WalSummaryIO
@@ -4058,3 +4065,8 @@ rfile
 ws_options
 ws_file_info
 PathKeyInfo
+TidStore
+TidStoreIter
+TidStoreIterResult
+BlocktableEntry
+ItemArray
