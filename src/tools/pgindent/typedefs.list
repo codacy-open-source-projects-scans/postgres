@@ -208,8 +208,10 @@ BTPageStat
 BTPageState
 BTParallelScanDesc
 BTPendingFSM
+BTReadPageState
 BTScanInsert
 BTScanInsertData
+BTScanKeyPreproc
 BTScanOpaque
 BTScanOpaqueData
 BTScanPos
@@ -335,6 +337,8 @@ BulkInsertState
 BulkInsertStateData
 BulkWriteBuffer
 BulkWriteState
+BumpBlock
+BumpContext
 CACHESIGN
 CAC_state
 CCFastEqualFN
@@ -438,6 +442,7 @@ CommentStmt
 CommitTimestampEntry
 CommitTimestampShared
 CommonEntry
+CommonRdOptions
 CommonTableExpr
 CompareScalarsContext
 CompiledExprState
@@ -480,6 +485,8 @@ CopyFromState
 CopyFromStateData
 CopyHeaderChoice
 CopyInsertMethod
+CopyMethod
+CopyLogVerbosityChoice
 CopyMultiInsertBuffer
 CopyMultiInsertInfo
 CopyOnErrorChoice
@@ -599,6 +606,7 @@ DiscardMode
 DiscardStmt
 DistanceValue
 DistinctExpr
+DoState
 DoStmt
 DocRepresentation
 DomainConstraintCache
@@ -712,6 +720,7 @@ ExplainForeignModify_function
 ExplainForeignScan_function
 ExplainFormat
 ExplainOneQuery_hook_type
+ExplainSerializeOption
 ExplainState
 ExplainStmt
 ExplainWorkersState
@@ -1121,8 +1130,10 @@ HbaLine
 HeadlineJsonState
 HeadlineParsedText
 HeadlineWordEntry
+HeapAlterRdOptions
 HeapCheckContext
 HeapPageFreeze
+HeapRdOptions
 HeapScanDesc
 HeapTuple
 HeapTupleData
@@ -1211,9 +1222,11 @@ InitSampleScan_function
 InitializeDSMForeignScan_function
 InitializeWorkerForeignScan_function
 InjectionPointCacheEntry
+InjectionPointCondition
 InjectionPointEntry
 InjectionPointSharedState
 InlineCodeBlock
+InProgressIO
 InsertStmt
 Instrumentation
 Int128AggState
@@ -1290,6 +1303,7 @@ JsonExprState
 JsonFormat
 JsonFormatType
 JsonHashEntry
+JsonIncrementalState
 JsonIsPredicate
 JsonIterateStringValuesAction
 JsonKeyValue
@@ -1297,15 +1311,19 @@ JsonLexContext
 JsonLikeRegexContext
 JsonManifestFileField
 JsonManifestParseContext
+JsonManifestParseIncrementalState
 JsonManifestParseState
 JsonManifestSemanticState
 JsonManifestWALRangeField
+JsonNonTerminal
 JsonObjectAgg
 JsonObjectConstructor
 JsonOutput
 JsonParseExpr
 JsonParseContext
 JsonParseErrorType
+JsonParserSem
+JsonParserStack
 JsonPath
 JsonPathBool
 JsonPathDatatypeStatus
@@ -1332,6 +1350,18 @@ JsonReturning
 JsonScalarExpr
 JsonSemAction
 JsonSerializeExpr
+JsonTable
+JsonTableColumn
+JsonTableColumnType
+JsonTableExecContext
+JsonTableParseContext
+JsonTablePath
+JsonTablePathScan
+JsonTablePathSpec
+JsonTablePlan
+JsonTablePlanRowSource
+JsonTablePlanState
+JsonTableSiblingJoin
 JsonTokenType
 JsonTransformStringValuesAction
 JsonTypeCategory
@@ -1588,6 +1618,7 @@ MergeAppendState
 MergeJoin
 MergeJoinClause
 MergeJoinState
+MergeMatchKind
 MergePath
 MergeScanSelCache
 MergeStmt
@@ -2192,7 +2223,7 @@ PromptInterruptContext
 ProtocolVersion
 PrsStorage
 PruneReason
-PruneResult
+PruneFreezeResult
 PruneState
 PruneStepResult
 PsqlScanCallbacks
@@ -2286,11 +2317,14 @@ ReInitializeDSMForeignScan_function
 ReScanForeignScan_function
 ReadBufPtrType
 ReadBufferMode
+ReadBuffersFlags
+ReadBuffersOperation
 ReadBytePtrType
 ReadExtraTocPtrType
 ReadFunc
 ReadLocalXLogPageNoWaitPrivate
 ReadReplicationSlotCmd
+ReadStream
 ReassignOwnedStmt
 RecheckForeignScan_function
 RecordCacheArrayEntry
@@ -2499,6 +2533,8 @@ ScalarIOData
 ScalarItem
 ScalarMCVItem
 Scan
+ScanAnalyzeNextBlockFunc
+ScanAnalyzeNextTupleFunc
 ScanDirection
 ScanKey
 ScanKeyData
@@ -2530,6 +2566,8 @@ SerCommitSeqNo
 SerialControl
 SerialIOData
 SerializableXactHandle
+SerializeDestReceiver
+SerializeMetrics
 SerializedActiveRelMaps
 SerializedClientConnectionInfo
 SerializedRanges
@@ -2602,6 +2640,7 @@ SimpleStats
 SimpleStringList
 SimpleStringListCell
 SingleBoundSortItem
+SinglePartitionSpec
 Size
 SkipPages
 SlabBlock
@@ -2665,6 +2704,7 @@ SpecialJoinInfo
 SpinDelayStatus
 SplitInterval
 SplitLR
+SplitPartitionContext
 SplitPageLayout
 SplitPoint
 SplitTextOutputData
@@ -2686,7 +2726,6 @@ StatsElem
 StatsExtInfo
 StdAnalyzeData
 StdRdOptIndexCleanup
-StdRdOptions
 Step
 StopList
 StrategyNumber
@@ -2806,6 +2845,7 @@ TableFunc
 TableFuncRoutine
 TableFuncScan
 TableFuncScanState
+TableFuncType
 TableInfo
 TableLikeClause
 TableSampleClause
@@ -2983,7 +3023,7 @@ UserMapping
 UserOpts
 VacAttrStats
 VacAttrStatsP
-VacDeadItems
+VacDeadItemsInfo
 VacErrPhase
 VacObjFilter
 VacOptValue
@@ -3053,6 +3093,8 @@ WaitEventIO
 WaitEventIPC
 WaitEventSet
 WaitEventTimeout
+WaitLSNProcInfo
+WaitLSNState
 WaitPMResult
 WalCloseMethod
 WalCompression
@@ -4083,3 +4125,4 @@ TidStoreIter
 TidStoreIterResult
 BlocktableEntry
 ItemArray
+bh_nodeidx_entry

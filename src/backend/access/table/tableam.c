@@ -273,9 +273,11 @@ table_tuple_get_latest_tid(TableScanDesc scan, ItemPointer tid)
  * default command ID and not allowing access to the speedup options.
  */
 void
-simple_table_tuple_insert(Relation rel, TupleTableSlot *slot)
+simple_table_tuple_insert(Relation rel, TupleTableSlot *slot,
+						  bool *insert_indexes)
 {
-	table_tuple_insert(rel, slot, GetCurrentCommandId(true), 0, NULL);
+	table_tuple_insert(rel, slot, GetCurrentCommandId(true), 0, NULL,
+					   insert_indexes);
 }
 
 /*
@@ -748,7 +750,7 @@ table_block_relation_estimate_size(Relation rel, int32 *attr_widths,
 		 * The other branch considers it implicitly by calculating density
 		 * from actual relpages/reltuples statistics.
 		 */
-		fillfactor = RelationGetFillFactor(rel, HEAP_DEFAULT_FILLFACTOR);
+		fillfactor = HeapGetFillFactor(rel, HEAP_DEFAULT_FILLFACTOR);
 
 		tuple_width = get_rel_data_width(rel, attr_widths);
 		tuple_width += overhead_bytes_per_tuple;

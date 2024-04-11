@@ -116,7 +116,8 @@ test_create(PG_FUNCTION_ARGS)
 		dsa_pin_mapping(TidStoreGetDSA(tidstore));
 	}
 	else
-		tidstore = TidStoreCreateLocal(tidstore_max_size);
+		/* VACUUM uses insert only, so we test the other option. */
+		tidstore = TidStoreCreateLocal(tidstore_max_size, false);
 
 	tidstore_empty_size = TidStoreMemoryUsage(tidstore);
 
@@ -199,7 +200,7 @@ check_set_block_offsets(PG_FUNCTION_ARGS)
 	TidStoreIterResult *iter_result;
 	int			num_iter_tids = 0;
 	int			num_lookup_tids = 0;
-	BlockNumber prevblkno = 0;;
+	BlockNumber prevblkno = 0;
 
 	/* lookup each member in the verification array */
 	for (int i = 0; i < items.num_tids; i++)

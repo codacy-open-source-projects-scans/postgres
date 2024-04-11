@@ -23,10 +23,12 @@
 #include "access/heapam.h"
 #include "access/heaptoast.h"
 #include "access/multixact.h"
+#include "access/reloptions.h"
 #include "access/rewriteheap.h"
 #include "access/syncscan.h"
 #include "access/tableam.h"
 #include "access/tsmapi.h"
+#include "access/visibilitymap.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/index.h"
@@ -50,7 +52,6 @@ static TM_Result heapam_tuple_lock(Relation relation, ItemPointer tid,
 								   CommandId cid, LockTupleMode mode,
 								   LockWaitPolicy wait_policy, uint8 flags,
 								   TM_FailureData *tmfd);
-
 static void reform_and_rewrite_tuple(HeapTuple tuple,
 									 Relation OldHeap, Relation NewHeap,
 									 Datum *values, bool *isnull, RewriteState rwstate);
@@ -245,7 +246,7 @@ heapam_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot,
 
 static TupleTableSlot *
 heapam_tuple_insert(Relation relation, TupleTableSlot *slot, CommandId cid,
-					int options, BulkInsertState bistate)
+					int options, BulkInsertState bistate, bool *insert_indexes)
 {
 	bool		shouldFree = true;
 	HeapTuple	tuple = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
@@ -260,6 +261,8 @@ heapam_tuple_insert(Relation relation, TupleTableSlot *slot, CommandId cid,
 
 	if (shouldFree)
 		pfree(tuple);
+
+	*insert_indexes = true;
 
 	return slot;
 }
@@ -1052,32 +1055,50 @@ heapam_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 	pfree(isnull);
 }
 
-static bool
-heapam_scan_analyze_next_block(TableScanDesc scan, BlockNumber blockno,
-							   BufferAccessStrategy bstrategy)
+/*
+ * Prepare to analyze the next block in the read stream.  Returns false if
+ * the stream is exhausted and true otherwise. The scan must have been started
+ * with SO_TYPE_ANALYZE option.
+ *
+ * This routine holds a buffer pin and lock on the heap page.  They are held
+ * until heapam_scan_analyze_next_tuple() returns false.  That is until all the
+ * items of the heap page are analyzed.
+ */
+bool
+heapam_scan_analyze_next_block(TableScanDesc scan, ReadStream *stream)
 {
 	HeapScanDesc hscan = (HeapScanDesc) scan;
 
 	/*
 	 * We must maintain a pin on the target page's buffer to ensure that
 	 * concurrent activity - e.g. HOT pruning - doesn't delete tuples out from
-	 * under us.  Hence, pin the page until we are done looking at it.  We
-	 * also choose to hold sharelock on the buffer throughout --- we could
-	 * release and re-acquire sharelock for each tuple, but since we aren't
-	 * doing much work per tuple, the extra lock traffic is probably better
-	 * avoided.
+	 * under us.  It comes from the stream already pinned.   We also choose to
+	 * hold sharelock on the buffer throughout --- we could release and
+	 * re-acquire sharelock for each tuple, but since we aren't doing much
+	 * work per tuple, the extra lock traffic is probably better avoided.
 	 */
-	hscan->rs_cblock = blockno;
-	hscan->rs_cindex = FirstOffsetNumber;
-	hscan->rs_cbuf = ReadBufferExtended(scan->rs_rd, MAIN_FORKNUM,
-										blockno, RBM_NORMAL, bstrategy);
+	hscan->rs_cbuf = read_stream_next_buffer(stream, NULL);
+	if (!BufferIsValid(hscan->rs_cbuf))
+		return false;
+
 	LockBuffer(hscan->rs_cbuf, BUFFER_LOCK_SHARE);
 
-	/* in heap all blocks can contain tuples, so always return true */
+	hscan->rs_cblock = BufferGetBlockNumber(hscan->rs_cbuf);
+	hscan->rs_cindex = FirstOffsetNumber;
 	return true;
 }
 
-static bool
+/*
+ * Iterate over tuples in the block selected with
+ * heapam_scan_analyze_next_block().  If a tuple that's suitable for sampling
+ * is found, true is returned and a tuple is stored in `slot`.  When no more
+ * tuples for sampling, false is returned and the pin and lock acquired by
+ * heapam_scan_analyze_next_block() are released.
+ *
+ * *liverows and *deadrows are incremented according to the encountered
+ * tuples.
+ */
+bool
 heapam_scan_analyze_next_tuple(TableScanDesc scan, TransactionId OldestXmin,
 							   double *liverows, double *deadrows,
 							   TupleTableSlot *slot)
@@ -1106,7 +1127,7 @@ heapam_scan_analyze_next_tuple(TableScanDesc scan, TransactionId OldestXmin,
 		 * We ignore unused and redirect line pointers.  DEAD line pointers
 		 * should be counted as dead, because we need vacuum to run to get rid
 		 * of them.  Note that this rule agrees with the way that
-		 * heap_page_prune() counts things.
+		 * heap_page_prune_and_freeze() counts things.
 		 */
 		if (!ItemIdIsNormal(itemid))
 		{
@@ -2141,6 +2162,17 @@ heapam_relation_toast_am(Relation rel)
 	return rel->rd_rel->relam;
 }
 
+static bytea *
+heapam_reloptions(char relkind, Datum reloptions,
+				  CommonRdOptions *common, bool validate)
+{
+	Assert(relkind == RELKIND_RELATION ||
+		   relkind == RELKIND_TOASTVALUE ||
+		   relkind == RELKIND_MATVIEW);
+
+	return heap_reloptions(relkind, reloptions, common, validate);
+}
+
 
 /* ------------------------------------------------------------------------
  * Planner related callbacks for the heap AM
@@ -2181,6 +2213,24 @@ heapam_scan_bitmap_next_block(TableScanDesc scan,
 
 	hscan->rs_cindex = 0;
 	hscan->rs_ntuples = 0;
+
+	/*
+	 * We can skip fetching the heap page if we don't need any fields from the
+	 * heap, the bitmap entries don't need rechecking, and all tuples on the
+	 * page are visible to our transaction.
+	 */
+	if (!(scan->rs_flags & SO_NEED_TUPLES) &&
+		!tbmres->recheck &&
+		VM_ALL_VISIBLE(scan->rs_rd, tbmres->blockno, &hscan->rs_vmbuffer))
+	{
+		/* can't be lossy in the skip_fetch case */
+		Assert(tbmres->ntuples >= 0);
+		Assert(hscan->rs_empty_tuples_pending >= 0);
+
+		hscan->rs_empty_tuples_pending += tbmres->ntuples;
+
+		return true;
+	}
 
 	/*
 	 * Ignore any claimed entries past what we think is the end of the
@@ -2294,6 +2344,16 @@ heapam_scan_bitmap_next_tuple(TableScanDesc scan,
 	Page		page;
 	ItemId		lp;
 
+	if (hscan->rs_empty_tuples_pending > 0)
+	{
+		/*
+		 * If we don't have to fetch the tuple, just return nulls.
+		 */
+		ExecStoreAllNullTuple(slot);
+		hscan->rs_empty_tuples_pending--;
+		return true;
+	}
+
 	/*
 	 * Out of range?  If so, nothing more to look at on this page
 	 */
@@ -2336,11 +2396,15 @@ heapam_scan_sample_next_block(TableScanDesc scan, SampleScanState *scanstate)
 	if (hscan->rs_nblocks == 0)
 		return false;
 
-	if (tsm->NextSampleBlock)
+	/* release previous scan buffer, if any */
+	if (BufferIsValid(hscan->rs_cbuf))
 	{
-		blockno = tsm->NextSampleBlock(scanstate, hscan->rs_nblocks);
-		hscan->rs_cblock = blockno;
+		ReleaseBuffer(hscan->rs_cbuf);
+		hscan->rs_cbuf = InvalidBuffer;
 	}
+
+	if (tsm->NextSampleBlock)
+		blockno = tsm->NextSampleBlock(scanstate, hscan->rs_nblocks);
 	else
 	{
 		/* scanning table sequentially */
@@ -2382,20 +2446,32 @@ heapam_scan_sample_next_block(TableScanDesc scan, SampleScanState *scanstate)
 		}
 	}
 
+	hscan->rs_cblock = blockno;
+
 	if (!BlockNumberIsValid(blockno))
 	{
-		if (BufferIsValid(hscan->rs_cbuf))
-			ReleaseBuffer(hscan->rs_cbuf);
-		hscan->rs_cbuf = InvalidBuffer;
-		hscan->rs_cblock = InvalidBlockNumber;
 		hscan->rs_inited = false;
-
 		return false;
 	}
 
-	heapgetpage(scan, blockno);
-	hscan->rs_inited = true;
+	Assert(hscan->rs_cblock < hscan->rs_nblocks);
 
+	/*
+	 * Be sure to check for interrupts at least once per page.  Checks at
+	 * higher code levels won't be able to stop a sample scan that encounters
+	 * many pages' worth of consecutive dead tuples.
+	 */
+	CHECK_FOR_INTERRUPTS();
+
+	/* Read page using selected strategy */
+	hscan->rs_cbuf = ReadBufferExtended(hscan->rs_base.rs_rd, MAIN_FORKNUM,
+										blockno, RBM_NORMAL, hscan->rs_strategy);
+
+	/* in pagemode, prune the page and determine visible tuple offsets */
+	if (hscan->rs_base.rs_flags & SO_ALLOW_PAGEMODE)
+		heap_prepare_pagescan(scan);
+
+	hscan->rs_inited = true;
 	return true;
 }
 
@@ -2457,7 +2533,7 @@ heapam_scan_sample_next_tuple(TableScanDesc scan, SampleScanState *scanstate,
 				visible = SampleHeapTupleVisible(scan, hscan->rs_cbuf,
 												 tuple, tupoffset);
 
-			/* in pagemode, heapgetpage did this for us */
+			/* in pagemode, heap_prepare_pagescan did this for us */
 			if (!pagemode)
 				HeapCheckForSerializableConflictOut(visible, scan->rs_rd, tuple,
 													hscan->rs_cbuf, scan->rs_snapshot);
@@ -2556,8 +2632,8 @@ SampleHeapTupleVisible(TableScanDesc scan, Buffer buffer,
 	if (scan->rs_flags & SO_ALLOW_PAGEMODE)
 	{
 		/*
-		 * In pageatatime mode, heapgetpage() already did visibility checks,
-		 * so just look at the info it left in rs_vistuples[].
+		 * In pageatatime mode, heap_prepare_pagescan() already did visibility
+		 * checks, so just look at the info it left in rs_vistuples[].
 		 *
 		 * We use a binary search over the known-sorted array.  Note: we could
 		 * save some effort if we insisted that NextSampleTuple select tuples
@@ -2590,6 +2666,18 @@ SampleHeapTupleVisible(TableScanDesc scan, Buffer buffer,
 	}
 }
 
+/*
+ * heapap_analyze -- implementation of relation_analyze() for heap
+ *					 table access method
+ */
+static void
+heapam_analyze(Relation relation, AcquireSampleRowsFunc *func,
+			   BlockNumber *totalpages, BufferAccessStrategy bstrategy)
+{
+	block_level_table_analyze(relation, func, totalpages, bstrategy,
+							  heapam_scan_analyze_next_block,
+							  heapam_scan_analyze_next_tuple);
+}
 
 /* ------------------------------------------------------------------------
  * Definition of the heap table access method.
@@ -2637,16 +2725,16 @@ static const TableAmRoutine heapam_methods = {
 	.relation_copy_data = heapam_relation_copy_data,
 	.relation_copy_for_cluster = heapam_relation_copy_for_cluster,
 	.relation_vacuum = heap_vacuum_rel,
-	.scan_analyze_next_block = heapam_scan_analyze_next_block,
-	.scan_analyze_next_tuple = heapam_scan_analyze_next_tuple,
 	.index_build_range_scan = heapam_index_build_range_scan,
 	.index_validate_scan = heapam_index_validate_scan,
+	.relation_analyze = heapam_analyze,
 
 	.free_rd_amcache = NULL,
 	.relation_size = table_block_relation_size,
 	.relation_needs_toast_table = heapam_relation_needs_toast_table,
 	.relation_toast_am = heapam_relation_toast_am,
 	.relation_fetch_toast_slice = heap_fetch_toast_slice,
+	.reloptions = heapam_reloptions,
 
 	.relation_estimate_size = heapam_estimate_rel_size,
 
