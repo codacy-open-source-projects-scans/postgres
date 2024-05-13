@@ -379,7 +379,6 @@ CatalogId
 CatalogIdMapEntry
 CatalogIndexState
 ChangeVarNodes_context
-ReplaceVarnoContext
 CheckPoint
 CheckPointStmt
 CheckpointStatsData
@@ -1220,6 +1219,7 @@ InitializeDSMForeignScan_function
 InitializeWorkerForeignScan_function
 InjectionPointCacheEntry
 InjectionPointCondition
+InjectionPointConditionType
 InjectionPointEntry
 InjectionPointSharedState
 InlineCodeBlock
@@ -2548,7 +2548,6 @@ SeenRelsEntry
 SelectLimit
 SelectStmt
 Selectivity
-SelfJoinCandidate
 SemTPadded
 SemiAntiJoinFactors
 SeqScan
@@ -3120,6 +3119,7 @@ WindowDef
 WindowFunc
 WindowFuncExprState
 WindowFuncLists
+WindowFuncRunCondition
 WindowObject
 WindowObjectData
 WindowStatePerAgg
@@ -3926,7 +3926,6 @@ unicodeStyleColumnFormat
 unicodeStyleFormat
 unicodeStyleRowFormat
 unicode_linestyle
-UniqueRelInfo
 unit_conversion
 unlogged_relation_entry
 utf_local_conversion_func

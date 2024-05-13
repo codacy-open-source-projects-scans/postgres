@@ -2949,7 +2949,7 @@ const char *PQsslAttribute(const PGconn *conn, const char *attribute_name);
            <para>
             Application protocol selected by the TLS Application-Layer
             Protocol Negotiation (ALPN) extension.  The only protocol
-            supported by libpq is <literal>TBD-pgsql</literal>, so this is
+            supported by libpq is <literal>postgresql</literal>, so this is
             mainly useful for checking whether the server supported ALPN or
             not. Empty string if ALPN was not used.
            </para>
@@ -6517,7 +6517,7 @@ int PQcancelSocket(const PGcancelConn *cancelConn);
        A valid descriptor will be greater than or equal to 0;
        a result of -1 indicates that no server connection is currently open.
        This might change as a result of calling any of the functions
-       in this section on the <structname>PQcancelConn</structname>
+       in this section on the <structname>PGcancelConn</structname>
        (except for <xref linkend="libpq-PQcancelErrorMessage"/> and
        <function>PQcancelSocket</function> itself).
       </para>
