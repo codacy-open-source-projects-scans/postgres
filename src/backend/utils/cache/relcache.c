@@ -536,8 +536,6 @@ RelationBuildTupleDesc(Relation relation)
 
 	constr = (TupleConstr *) MemoryContextAllocZero(CacheMemoryContext,
 													sizeof(TupleConstr));
-	constr->has_not_null = false;
-	constr->has_generated_stored = false;
 
 	/*
 	 * Form a scan key that selects only user attributes (attnum > 0).
@@ -3060,7 +3058,10 @@ RelationCacheInvalidate(bool debug_discard)
 			 * map doesn't involve any access to relcache entries.
 			 */
 			if (RelationIsMapped(relation))
+			{
+				RelationCloseSmgr(relation);
 				RelationInitPhysicalAddr(relation);
+			}
 
 			/*
 			 * Add this entry to list of stuff to rebuild in second pass.

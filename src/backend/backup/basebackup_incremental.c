@@ -132,7 +132,7 @@ static void manifest_process_version(JsonManifestParseContext *context,
 static void manifest_process_system_identifier(JsonManifestParseContext *context,
 											   uint64 manifest_system_identifier);
 static void manifest_process_file(JsonManifestParseContext *context,
-								  char *pathname,
+								  const char *pathname,
 								  size_t size,
 								  pg_checksum_type checksum_type,
 								  int checksum_length,
@@ -944,7 +944,7 @@ GetFileBackupMethod(IncrementalBackupInfo *ib, const char *path,
  * number of blocks. The header is rounded to a multiple of BLCKSZ, but
  * only if the file will store some block data.
  */
-extern size_t
+size_t
 GetIncrementalHeaderSize(unsigned num_blocks_required)
 {
 	size_t		result;
@@ -972,7 +972,7 @@ GetIncrementalHeaderSize(unsigned num_blocks_required)
 /*
  * Compute the size for an incremental file containing a given number of blocks.
  */
-extern size_t
+size_t
 GetIncrementalFileSize(unsigned num_blocks_required)
 {
 	size_t		result;
@@ -1043,7 +1043,7 @@ manifest_process_system_identifier(JsonManifestParseContext *context,
  */
 static void
 manifest_process_file(JsonManifestParseContext *context,
-					  char *pathname, size_t size,
+					  const char *pathname, size_t size,
 					  pg_checksum_type checksum_type,
 					  int checksum_length,
 					  uint8 *checksum_payload)

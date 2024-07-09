@@ -4161,7 +4161,7 @@ PostgresMain(const char *dbname, const char *username)
 	Assert(dbname != NULL);
 	Assert(username != NULL);
 
-	SetProcessingMode(InitProcessing);
+	Assert(GetProcessingMode() == InitProcessing);
 
 	/*
 	 * Set up signal handlers.  (InitPostmasterChild or InitStandaloneProcess
@@ -4418,7 +4418,7 @@ PostgresMain(const char *dbname, const char *username)
 		 * Now return to normal top-level context and clear ErrorContext for
 		 * next time.
 		 */
-		MemoryContextSwitchTo(TopMemoryContext);
+		MemoryContextSwitchTo(MessageContext);
 		FlushErrorState();
 
 		/*

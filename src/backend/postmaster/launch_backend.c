@@ -176,7 +176,7 @@ typedef struct
 	bool		shmem_attach;
 } child_process_kind;
 
-child_process_kind child_process_kinds[] = {
+static child_process_kind child_process_kinds[] = {
 	[B_INVALID] = {"invalid", NULL, false},
 
 	[B_BACKEND] = {"backend", BackendMain, true},
@@ -672,13 +672,11 @@ SubPostmasterMain(int argc, char *argv[])
  * The following need to be available to the save/restore_backend_variables
  * functions.  They are marked NON_EXEC_STATIC in their home modules.
  */
-extern slock_t *ShmemLock;
 extern slock_t *ProcStructLock;
 extern PGPROC *AuxiliaryProcs;
 extern PMSignalData *PMSignalState;
 extern pg_time_t first_syslogger_file_time;
 extern struct bkend *ShmemBackendArray;
-extern bool redirection_done;
 
 #ifndef WIN32
 #define write_inheritable_socket(dest, src, childpid) ((*(dest) = (src)), true)
@@ -764,7 +762,8 @@ save_backend_variables(BackendParameters *param, ClientSocket *client_sock,
 	strlcpy(param->pkglib_path, pkglib_path, MAXPGPATH);
 
 	param->startup_data_len = startup_data_len;
-	memcpy(param->startup_data, startup_data, startup_data_len);
+	if (startup_data_len > 0)
+		memcpy(param->startup_data, startup_data, startup_data_len);
 
 	return true;
 }

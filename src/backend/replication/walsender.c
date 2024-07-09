@@ -440,12 +440,10 @@ IdentifySystem(void)
 
 		/* syscache access needs a transaction env. */
 		StartTransactionCommand();
-		/* make dbname live outside TX context */
-		MemoryContextSwitchTo(cur);
 		dbname = get_database_name(MyDatabaseId);
+		/* copy dbname out of TX context */
+		dbname = MemoryContextStrdup(cur, dbname);
 		CommitTransactionCommand();
-		/* CommitTransactionCommand switches to TopMemoryContext */
-		MemoryContextSwitchTo(cur);
 	}
 
 	dest = CreateDestReceiver(DestRemoteSimple);
@@ -1059,16 +1057,21 @@ logical_read_xlog_page(XLogReaderState *state, XLogRecPtr targetPagePtr, int req
 
 	/*
 	 * Make sure we have enough WAL available before retrieving the current
-	 * timeline. This is needed to determine am_cascading_walsender accurately
-	 * which is needed to determine the current timeline.
+	 * timeline.
 	 */
 	flushptr = WalSndWaitForWal(targetPagePtr + reqLen);
+
+	/* Fail if not enough (implies we are going to shut down) */
+	if (flushptr < targetPagePtr + reqLen)
+		return -1;
 
 	/*
 	 * Since logical decoding is also permitted on a standby server, we need
 	 * to check if the server is in recovery to decide how to get the current
-	 * timeline ID (so that it also cover the promotion or timeline change
-	 * cases).
+	 * timeline ID (so that it also covers the promotion or timeline change
+	 * cases). We must determine am_cascading_walsender after waiting for the
+	 * required WAL so that it is correct when the walsender wakes up after a
+	 * promotion.
 	 */
 	am_cascading_walsender = RecoveryInProgress();
 
@@ -1082,10 +1085,6 @@ logical_read_xlog_page(XLogReaderState *state, XLogRecPtr targetPagePtr, int req
 	sendTimeLine = state->currTLI;
 	sendTimeLineValidUpto = state->currTLIValidUntil;
 	sendTimeLineNextTLI = state->nextTLI;
-
-	/* fail if not (implies we are going to shut down) */
-	if (flushptr < targetPagePtr + reqLen)
-		return -1;
 
 	if (targetPagePtr + XLOG_BLCKSZ <= flushptr)
 		count = XLOG_BLCKSZ;	/* more than one block available */
@@ -1727,7 +1726,7 @@ WalSndUpdateProgress(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId 
 
 /*
  * Wake up the logical walsender processes with logical failover slots if the
- * currently acquired physical slot is specified in standby_slot_names GUC.
+ * currently acquired physical slot is specified in synchronized_standby_slots GUC.
  */
 void
 PhysicalWakeupLogicalWalSnd(void)
@@ -1742,7 +1741,7 @@ PhysicalWakeupLogicalWalSnd(void)
 	if (RecoveryInProgress())
 		return;
 
-	if (SlotExistsInStandbySlotNames(NameStr(MyReplicationSlot->data.name)))
+	if (SlotExistsInSyncStandbySlots(NameStr(MyReplicationSlot->data.name)))
 		ConditionVariableBroadcast(&WalSndCtl->wal_confirm_rcv_cv);
 }
 
