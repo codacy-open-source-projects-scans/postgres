@@ -1239,6 +1239,7 @@ InjectionPointCallback
 InjectionPointCondition
 InjectionPointConditionType
 InjectionPointEntry
+InjectionPointsCtl
 InjectionPointSharedState
 InlineCodeBlock
 InsertStmt
@@ -3355,6 +3356,7 @@ chr
 cmpEntriesArg
 codes_t
 collation_cache_entry
+collation_cache_hash
 color
 colormaprange
 compare_context

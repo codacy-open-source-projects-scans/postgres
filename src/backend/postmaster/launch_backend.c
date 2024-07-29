@@ -58,11 +58,13 @@
 #include "storage/pg_shmem.h"
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
+#include "storage/procsignal.h"
 #include "tcop/backend_startup.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
 #include "utils/datetime.h"
 #include "utils/guc.h"
+#include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
 
@@ -93,7 +95,6 @@ typedef int InheritableSocket;
 typedef struct
 {
 	char		DataDir[MAXPGPATH];
-	int32		MyCancelKey;
 	int			MyPMChildSlot;
 #ifndef WIN32
 	unsigned long UsedShmemSegID;
@@ -103,7 +104,9 @@ typedef struct
 #endif
 	void	   *UsedShmemSegAddr;
 	slock_t    *ShmemLock;
-	struct bkend *ShmemBackendArray;
+#ifdef USE_INJECTION_POINTS
+	struct InjectionPointsCtl *ActiveInjectionPoints;
+#endif
 #ifndef HAVE_SPINLOCKS
 	PGSemaphore *SpinlockSemaArray;
 #endif
@@ -114,7 +117,8 @@ typedef struct
 	PROC_HDR   *ProcGlobal;
 	PGPROC	   *AuxiliaryProcs;
 	PGPROC	   *PreparedXactProcs;
-	PMSignalData *PMSignalState;
+	volatile PMSignalData *PMSignalState;
+	ProcSignalHeader *ProcSignal;
 	pid_t		PostmasterPid;
 	TimestampTz PgStartTime;
 	TimestampTz PgReloadTime;
@@ -668,16 +672,6 @@ SubPostmasterMain(int argc, char *argv[])
 	pg_unreachable();			/* main_fn never returns */
 }
 
-/*
- * The following need to be available to the save/restore_backend_variables
- * functions.  They are marked NON_EXEC_STATIC in their home modules.
- */
-extern slock_t *ProcStructLock;
-extern PGPROC *AuxiliaryProcs;
-extern PMSignalData *PMSignalState;
-extern pg_time_t first_syslogger_file_time;
-extern struct bkend *ShmemBackendArray;
-
 #ifndef WIN32
 #define write_inheritable_socket(dest, src, childpid) ((*(dest) = (src)), true)
 #define read_inheritable_socket(dest, src) (*(dest) = *(src))
@@ -708,7 +702,6 @@ save_backend_variables(BackendParameters *param, ClientSocket *client_sock,
 
 	strlcpy(param->DataDir, DataDir, MAXPGPATH);
 
-	param->MyCancelKey = MyCancelKey;
 	param->MyPMChildSlot = MyPMChildSlot;
 
 #ifdef WIN32
@@ -718,7 +711,10 @@ save_backend_variables(BackendParameters *param, ClientSocket *client_sock,
 	param->UsedShmemSegAddr = UsedShmemSegAddr;
 
 	param->ShmemLock = ShmemLock;
-	param->ShmemBackendArray = ShmemBackendArray;
+
+#ifdef USE_INJECTION_POINTS
+	param->ActiveInjectionPoints = ActiveInjectionPoints;
+#endif
 
 #ifndef HAVE_SPINLOCKS
 	param->SpinlockSemaArray = SpinlockSemaArray;
@@ -731,6 +727,7 @@ save_backend_variables(BackendParameters *param, ClientSocket *client_sock,
 	param->AuxiliaryProcs = AuxiliaryProcs;
 	param->PreparedXactProcs = PreparedXactProcs;
 	param->PMSignalState = PMSignalState;
+	param->ProcSignal = ProcSignal;
 
 	param->PostmasterPid = PostmasterPid;
 	param->PgStartTime = PgStartTime;
@@ -967,7 +964,6 @@ restore_backend_variables(BackendParameters *param)
 
 	SetDataDir(param->DataDir);
 
-	MyCancelKey = param->MyCancelKey;
 	MyPMChildSlot = param->MyPMChildSlot;
 
 #ifdef WIN32
@@ -977,7 +973,10 @@ restore_backend_variables(BackendParameters *param)
 	UsedShmemSegAddr = param->UsedShmemSegAddr;
 
 	ShmemLock = param->ShmemLock;
-	ShmemBackendArray = param->ShmemBackendArray;
+
+#ifdef USE_INJECTION_POINTS
+	ActiveInjectionPoints = param->ActiveInjectionPoints;
+#endif
 
 #ifndef HAVE_SPINLOCKS
 	SpinlockSemaArray = param->SpinlockSemaArray;
@@ -990,6 +989,7 @@ restore_backend_variables(BackendParameters *param)
 	AuxiliaryProcs = param->AuxiliaryProcs;
 	PreparedXactProcs = param->PreparedXactProcs;
 	PMSignalState = param->PMSignalState;
+	ProcSignal = param->ProcSignal;
 
 	PostmasterPid = param->PostmasterPid;
 	PgStartTime = param->PgStartTime;

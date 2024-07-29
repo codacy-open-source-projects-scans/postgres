@@ -29,10 +29,12 @@
 #include "replication/walsender.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
+#include "storage/procsignal.h"
 #include "storage/proc.h"
 #include "tcop/backend_startup.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
+#include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
 #include "utils/timeout.h"
@@ -212,6 +214,21 @@ BackendInitialize(ClientSocket *client_sock, CAC_state cac)
 					(errmsg("connection received: host=%s",
 							remote_host)));
 	}
+
+	/* For testing client error handling */
+#ifdef USE_INJECTION_POINTS
+	INJECTION_POINT("backend-initialize");
+	if (IS_INJECTION_POINT_ATTACHED("backend-initialize-v2-error"))
+	{
+		/*
+		 * This simulates an early error from a pre-v14 server, which used the
+		 * version 2 protocol for any errors that occurred before processing
+		 * the startup packet.
+		 */
+		FrontendProtocol = PG_PROTOCOL(2, 0);
+		elog(FATAL, "protocol version 2 error triggered");
+	}
+#endif
 
 	/*
 	 * If we did a reverse lookup to name, we might as well save the results
@@ -525,6 +542,11 @@ ProcessStartupPacket(Port *port, bool ssl_done, bool gss_done)
 
 	if (proto == CANCEL_REQUEST_CODE)
 	{
+		/*
+		 * The client has sent a cancel request packet, not a normal
+		 * start-a-new-connection packet.  Perform the necessary processing.
+		 * Nothing is sent back to the client.
+		 */
 		CancelRequestPacket *canc;
 		int			backendPID;
 		int32		cancelAuthCode;
@@ -540,7 +562,8 @@ ProcessStartupPacket(Port *port, bool ssl_done, bool gss_done)
 		backendPID = (int) pg_ntoh32(canc->backendPID);
 		cancelAuthCode = (int32) pg_ntoh32(canc->cancelAuthCode);
 
-		processCancelRequest(backendPID, cancelAuthCode);
+		if (backendPID != 0)
+			SendCancelRequest(backendPID, cancelAuthCode);
 		/* Not really an error, but we don't want to proceed further */
 		return STATUS_ERROR;
 	}
