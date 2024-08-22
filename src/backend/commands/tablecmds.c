@@ -700,7 +700,7 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	ListCell   *listptr;
 	AttrNumber	attnum;
 	bool		partitioned;
-	static char *validnsps[] = HEAP_RELOPT_NAMESPACES;
+	const char *const validnsps[] = HEAP_RELOPT_NAMESPACES;
 	Oid			ofTypeId;
 	ObjectAddress address;
 	LOCKMODE	parentLockmode;
@@ -7028,6 +7028,7 @@ ATExecAddColumn(List **wqueue, AlteredTableInfo *tab, Relation rel,
 	Relation	pgclass,
 				attrdesc;
 	HeapTuple	reltup;
+	Form_pg_class relform;
 	Form_pg_attribute attribute;
 	int			newattnum;
 	char		relkind;
@@ -7161,10 +7162,11 @@ ATExecAddColumn(List **wqueue, AlteredTableInfo *tab, Relation rel,
 	reltup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(myrelid));
 	if (!HeapTupleIsValid(reltup))
 		elog(ERROR, "cache lookup failed for relation %u", myrelid);
-	relkind = ((Form_pg_class) GETSTRUCT(reltup))->relkind;
+	relform = (Form_pg_class) GETSTRUCT(reltup);
+	relkind = relform->relkind;
 
 	/* Determine the new attribute's number */
-	newattnum = ((Form_pg_class) GETSTRUCT(reltup))->relnatts + 1;
+	newattnum = relform->relnatts + 1;
 	if (newattnum > MaxHeapAttributeNumber)
 		ereport(ERROR,
 				(errcode(ERRCODE_TOO_MANY_COLUMNS),
@@ -7193,7 +7195,7 @@ ATExecAddColumn(List **wqueue, AlteredTableInfo *tab, Relation rel,
 	/*
 	 * Update pg_class tuple as appropriate
 	 */
-	((Form_pg_class) GETSTRUCT(reltup))->relnatts = newattnum;
+	relform->relnatts = newattnum;
 
 	CatalogTupleUpdate(pgclass, &reltup->t_self, reltup);
 
@@ -7736,6 +7738,7 @@ ATExecSetNotNull(AlteredTableInfo *tab, Relation rel,
 				 const char *colName, LOCKMODE lockmode)
 {
 	HeapTuple	tuple;
+	Form_pg_attribute attTup;
 	AttrNumber	attnum;
 	Relation	attr_rel;
 	ObjectAddress address;
@@ -7753,7 +7756,8 @@ ATExecSetNotNull(AlteredTableInfo *tab, Relation rel,
 				 errmsg("column \"%s\" of relation \"%s\" does not exist",
 						colName, RelationGetRelationName(rel))));
 
-	attnum = ((Form_pg_attribute) GETSTRUCT(tuple))->attnum;
+	attTup = (Form_pg_attribute) GETSTRUCT(tuple);
+	attnum = attTup->attnum;
 
 	/* Prevent them from altering a system attribute */
 	if (attnum <= 0)
@@ -7765,9 +7769,9 @@ ATExecSetNotNull(AlteredTableInfo *tab, Relation rel,
 	/*
 	 * Okay, actually perform the catalog change ... if needed
 	 */
-	if (!((Form_pg_attribute) GETSTRUCT(tuple))->attnotnull)
+	if (!attTup->attnotnull)
 	{
-		((Form_pg_attribute) GETSTRUCT(tuple))->attnotnull = true;
+		attTup->attnotnull = true;
 
 		CatalogTupleUpdate(attr_rel, &tuple->t_self, tuple);
 
@@ -7777,8 +7781,7 @@ ATExecSetNotNull(AlteredTableInfo *tab, Relation rel,
 		 * this then we can skip that.  We needn't bother looking if we've
 		 * already found that we must verify some other not-null constraint.
 		 */
-		if (!tab->verify_new_notnull &&
-			!NotNullImpliedByRelConstraints(rel, (Form_pg_attribute) GETSTRUCT(tuple)))
+		if (!tab->verify_new_notnull && !NotNullImpliedByRelConstraints(rel, attTup))
 		{
 			/* Tell Phase 3 it needs to test the constraint */
 			tab->verify_new_notnull = true;
@@ -10758,6 +10761,23 @@ CloneFkReferencing(List **wqueue, Relation parentRel, Relation partRel)
 	foreach(cell, RelationGetFKeyList(parentRel))
 	{
 		ForeignKeyCacheInfo *fk = lfirst(cell);
+
+		/*
+		 * Refuse to attach a table as partition that this partitioned table
+		 * already has a foreign key to.  This isn't useful schema, which is
+		 * proven by the fact that there have been no user complaints that
+		 * it's already impossible to achieve this in the opposite direction,
+		 * i.e., creating a foreign key that references a partition.  This
+		 * restriction allows us to dodge some complexities around
+		 * pg_constraint and pg_trigger row creations that would be needed
+		 * during ATTACH/DETACH for this kind of relationship.
+		 */
+		if (fk->confrelid == RelationGetRelid(partRel))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("can't attach table \"%s\" as a partition which is referenced by foreign key \"%s\"",
+							RelationGetRelationName(partRel),
+							get_constraint_name(fk->conoid))));
 
 		clone = lappend_oid(clone, fk->conoid);
 	}
@@ -14897,7 +14917,7 @@ ATExecSetRelOptions(Relation rel, List *defList, AlterTableType operation,
 	Datum		repl_val[Natts_pg_class];
 	bool		repl_null[Natts_pg_class];
 	bool		repl_repl[Natts_pg_class];
-	static char *validnsps[] = HEAP_RELOPT_NAMESPACES;
+	const char *const validnsps[] = HEAP_RELOPT_NAMESPACES;
 
 	if (defList == NIL && operation != AT_ReplaceRelOptions)
 		return;					/* nothing to do */
@@ -20363,6 +20383,7 @@ createPartitionTable(RangeVar *newPartName, Relation modelRel,
 	tlc->options = CREATE_TABLE_LIKE_ALL &
 		~(CREATE_TABLE_LIKE_INDEXES | CREATE_TABLE_LIKE_IDENTITY | CREATE_TABLE_LIKE_STATISTICS);
 	tlc->relationOid = InvalidOid;
+	tlc->newRelationOid = InvalidOid;
 	createStmt->tableElts = lappend(createStmt->tableElts, tlc);
 
 	/* Need to make a wrapper PlannedStmt. */
@@ -20386,7 +20407,7 @@ createPartitionTable(RangeVar *newPartName, Relation modelRel,
 	 * Open the new partition with no lock, because we already have
 	 * AccessExclusiveLock placed there after creation.
 	 */
-	newRel = table_openrv(newPartName, NoLock);
+	newRel = table_open(tlc->newRelationOid, NoLock);
 
 	/*
 	 * We intended to create the partition with the same persistence as the

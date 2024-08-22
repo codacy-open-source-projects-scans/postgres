@@ -1155,7 +1155,7 @@ ProcessUtilitySlow(ParseState *pstate,
 						{
 							CreateStmt *cstmt = (CreateStmt *) stmt;
 							Datum		toast_options;
-							static char *validnsps[] = HEAP_RELOPT_NAMESPACES;
+							const char *const validnsps[] = HEAP_RELOPT_NAMESPACES;
 
 							/* Remember transformed RangeVar for LIKE */
 							table_rv = cstmt->relation;
@@ -1225,6 +1225,12 @@ ProcessUtilitySlow(ParseState *pstate,
 
 							morestmts = expandTableLikeClause(table_rv, like);
 							stmts = list_concat(morestmts, stmts);
+
+							/*
+							 * Store the OID of newly created relation to the
+							 * TableLikeClause for the caller to use it.
+							 */
+							like->newRelationOid = address.objectId;
 						}
 						else
 						{

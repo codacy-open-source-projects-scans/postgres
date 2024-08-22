@@ -2,6 +2,21 @@
  *
  * astreamer_gzip.c
  *
+ * Archive streamers that deal with data compressed using gzip.
+ * astreamer_gzip_writer applies gzip compression to the input data
+ * and writes the result to a file. astreamer_gzip_decompressor assumes
+ * that the input stream is compressed using gzip and decompresses it.
+ *
+ * Note that the code in this file is asymmetric with what we do for
+ * other compression types: for lz4 and zstd, there is a compressor and
+ * a decompressor, rather than a writer and a decompressor. The approach
+ * taken here is less flexible, because a writer can only write to a file,
+ * while a compressor can write to a subsequent astreamer which is free
+ * to do whatever it likes. The reason it's like this is because this
+ * code was adapated from old, less-modular pg_basebackup code that used
+ * the same APIs that astreamer_gzip_writer now uses, and it didn't seem
+ * necessary to change anything at the time.
+ *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
@@ -71,9 +86,16 @@ static const astreamer_ops astreamer_gzip_decompressor_ops = {
  * Create a astreamer that just compresses data using gzip, and then writes
  * it to a file.
  *
- * As in the case of astreamer_plain_writer_new, pathname is always used
- * for error reporting purposes; if file is NULL, it is also the opened and
- * closed so that the data may be written there.
+ * The caller must specify a pathname and may specify a file. The pathname is
+ * used for error-reporting purposes either way. If file is NULL, the pathname
+ * also identifies the file to which the data should be written: it is opened
+ * for writing and closed when done. If file is not NULL, the data is written
+ * there.
+ *
+ * Note that zlib does not use the FILE interface, but operates directly on
+ * a duplicate of the underlying fd. Hence, callers must take care if they
+ * plan to write any other data to the same FILE, either before or after using
+ * this.
  */
 astreamer *
 astreamer_gzip_writer_new(char *pathname, FILE *file,
@@ -97,6 +119,10 @@ astreamer_gzip_writer_new(char *pathname, FILE *file,
 	}
 	else
 	{
+		/*
+		 * We must dup the file handle so that gzclose doesn't break the
+		 * caller's FILE.  See comment for astreamer_gzip_writer_finalize.
+		 */
 		int			fd = dup(fileno(file));
 
 		if (fd < 0)

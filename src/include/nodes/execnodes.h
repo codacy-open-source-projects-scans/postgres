@@ -465,8 +465,8 @@ typedef struct ResultRelInfo
 	IndexInfo **ri_IndexRelationInfo;
 
 	/*
-	 * For UPDATE/DELETE result relations, the attribute number of the row
-	 * identity junk attribute in the source plan's output tuples
+	 * For UPDATE/DELETE/MERGE result relations, the attribute number of the
+	 * row identity junk attribute in the source plan's output tuples
 	 */
 	AttrNumber	ri_RowIdAttNo;
 
@@ -524,7 +524,9 @@ typedef struct ResultRelInfo
 	/* array of constraint-checking expr states */
 	ExprState **ri_ConstraintExprs;
 
-	/* arrays of stored generated columns expr states, for INSERT and UPDATE */
+	/*
+	 * Arrays of stored generated columns ExprStates for INSERT/UPDATE/MERGE.
+	 */
 	ExprState **ri_GeneratedExprsI;
 	ExprState **ri_GeneratedExprsU;
 
@@ -2182,8 +2184,7 @@ typedef struct MergeJoinState
  *	 HashJoinState information
  *
  *		hashclauses				original form of the hashjoin condition
- *		hj_OuterHashKeys		the outer hash keys in the hashjoin condition
- *		hj_HashOperators		the join operators in the hashjoin condition
+ *		hj_OuterHash			ExprState for hashing outer keys
  *		hj_HashTable			hash table for the hashjoin
  *								(NULL if table not built yet)
  *		hj_CurHashValue			hash value for current outer tuple
@@ -2213,9 +2214,7 @@ typedef struct HashJoinState
 {
 	JoinState	js;				/* its first field is NodeTag */
 	ExprState  *hashclauses;
-	List	   *hj_OuterHashKeys;	/* list of ExprState nodes */
-	List	   *hj_HashOperators;	/* list of operator OIDs */
-	List	   *hj_Collations;
+	ExprState  *hj_OuterHash;
 	HashJoinTable hj_HashTable;
 	uint32		hj_CurHashValue;
 	int			hj_CurBucketNo;
@@ -2768,7 +2767,10 @@ typedef struct HashState
 {
 	PlanState	ps;				/* its first field is NodeTag */
 	HashJoinTable hashtable;	/* hash table for the hashjoin */
-	List	   *hashkeys;		/* list of ExprState nodes */
+	ExprState  *hash_expr;		/* ExprState to get hash value */
+
+	FmgrInfo   *skew_hashfunction;	/* lookup data for skew hash function */
+	Oid			skew_collation; /* collation to call skew_hashfunction with */
 
 	/*
 	 * In a parallelized hash join, the leader retains a pointer to the
