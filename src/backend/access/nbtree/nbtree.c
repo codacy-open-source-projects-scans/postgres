@@ -133,6 +133,7 @@ bthandler(PG_FUNCTION_ARGS)
 	amroutine->amvacuumcleanup = btvacuumcleanup;
 	amroutine->amcanreturn = btcanreturn;
 	amroutine->amcostestimate = btcostestimate;
+	amroutine->amgettreeheight = btgettreeheight;
 	amroutine->amoptions = btoptions;
 	amroutine->amproperty = btproperty;
 	amroutine->ambuildphasename = btbuildphasename;
@@ -403,9 +404,7 @@ btrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 	 * Reset the scan keys
 	 */
 	if (scankey && scan->numberOfKeys > 0)
-		memmove(scan->keyData,
-				scankey,
-				scan->numberOfKeys * sizeof(ScanKeyData));
+		memcpy(scan->keyData, scankey, scan->numberOfKeys * sizeof(ScanKeyData));
 	so->numberOfKeys = 0;		/* until _bt_preprocess_keys sets it */
 	so->numArrayKeys = 0;		/* ditto */
 }
@@ -1444,4 +1443,13 @@ bool
 btcanreturn(Relation index, int attno)
 {
 	return true;
+}
+
+/*
+ * btgettreeheight() -- Compute tree height for use by btcostestimate().
+ */
+int
+btgettreeheight(Relation rel)
+{
+	return _bt_getrootheight(rel);
 }
