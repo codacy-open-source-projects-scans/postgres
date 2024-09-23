@@ -5581,7 +5581,7 @@
 
 { oid => '6230', descr => 'statistics: check if a stats object exists',
   proname => 'pg_stat_have_stats', provolatile => 'v', proparallel => 'r',
-  prorettype => 'bool', proargtypes => 'text oid oid',
+  prorettype => 'bool', proargtypes => 'text oid int8',
   prosrc => 'pg_stat_have_stats' },
 
 { oid => '6231', descr => 'statistics: information about subscription stats',
@@ -12309,5 +12309,11 @@
   proallargtypes => '{int8,pg_lsn,pg_lsn,int4}', proargmodes => '{o,o,o,o}',
   proargnames => '{summarized_tli,summarized_lsn,pending_lsn,summarizer_pid}',
   prosrc => 'pg_get_wal_summarizer_state' },
+
+# GiST stratnum implementations
+{ oid => '8047', descr => 'GiST support',
+  proname => 'gist_stratnum_identity', prorettype => 'int2',
+  proargtypes => 'int2',
+  prosrc => 'gist_stratnum_identity' },
 
 ]

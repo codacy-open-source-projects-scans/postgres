@@ -3040,6 +3040,12 @@ UnresolvedTup
 UnresolvedTupData
 UpdateContext
 UpdateStmt
+UpgradeTask
+UpgradeTaskProcessCB
+UpgradeTaskReport
+UpgradeTaskSlot
+UpgradeTaskSlotState
+UpgradeTaskStep
 UploadManifestCmd
 UpperRelationKind
 UpperUniquePath
