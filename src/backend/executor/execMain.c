@@ -71,6 +71,18 @@ ExecutorEnd_hook_type ExecutorEnd_hook = NULL;
 /* Hook for plugin to get control in ExecCheckPermissions() */
 ExecutorCheckPerms_hook_type ExecutorCheckPerms_hook = NULL;
 
+/*
+ * Check that the query ID is set, which is something that happens only
+ * if compute_query_id is enabled (or a module forced it), if track_activities
+ * is enabled, and if a client provided a query string to map with the query
+ * ID computed from it.
+ */
+#define EXEC_CHECK_QUERY_ID \
+do { \
+	Assert(!IsQueryIdEnabled() || !pgstat_track_activities ||		\
+		   !debug_query_string || pgstat_get_my_query_id() != 0);	\
+} while(0)
+
 /* decls for local routines only used within this module */
 static void InitPlan(QueryDesc *queryDesc, int eflags);
 static void CheckValidRowMarkRel(Relation rel, RowMarkType markType);
@@ -297,7 +309,7 @@ ExecutorRun(QueryDesc *queryDesc,
 			bool execute_once)
 {
 	/* If enabled, the query ID should be set. */
-	Assert(!IsQueryIdEnabled() || pgstat_get_my_query_id() != 0);
+	EXEC_CHECK_QUERY_ID;
 
 	if (ExecutorRun_hook)
 		(*ExecutorRun_hook) (queryDesc, direction, count, execute_once);
@@ -408,7 +420,7 @@ void
 ExecutorFinish(QueryDesc *queryDesc)
 {
 	/* If enabled, the query ID should be set. */
-	Assert(!IsQueryIdEnabled() || pgstat_get_my_query_id() != 0);
+	EXEC_CHECK_QUERY_ID;
 
 	if (ExecutorFinish_hook)
 		(*ExecutorFinish_hook) (queryDesc);
@@ -471,7 +483,7 @@ void
 ExecutorEnd(QueryDesc *queryDesc)
 {
 	/* If enabled, the query ID should be set. */
-	Assert(!IsQueryIdEnabled() || pgstat_get_my_query_id() != 0);
+	EXEC_CHECK_QUERY_ID;
 
 	if (ExecutorEnd_hook)
 		(*ExecutorEnd_hook) (queryDesc);
@@ -1036,6 +1048,10 @@ CheckValidResultRel(ResultRelInfo *resultRelInfo, CmdType operation,
 	Relation	resultRel = resultRelInfo->ri_RelationDesc;
 	FdwRoutine *fdwroutine;
 
+	/* Expect a fully-formed ResultRelInfo from InitResultRelInfo(). */
+	Assert(resultRelInfo->ri_needLockTagTuple ==
+		   IsInplaceUpdateRelation(resultRel));
+
 	switch (resultRel->rd_rel->relkind)
 	{
 		case RELKIND_RELATION:
@@ -1216,6 +1232,8 @@ InitResultRelInfo(ResultRelInfo *resultRelInfo,
 	resultRelInfo->ri_NumIndices = 0;
 	resultRelInfo->ri_IndexRelationDescs = NULL;
 	resultRelInfo->ri_IndexRelationInfo = NULL;
+	resultRelInfo->ri_needLockTagTuple =
+		IsInplaceUpdateRelation(resultRelationDesc);
 	/* make a copy so as not to depend on relcache info not changing... */
 	resultRelInfo->ri_TrigDesc = CopyTriggerDesc(resultRelationDesc->trigdesc);
 	if (resultRelInfo->ri_TrigDesc)

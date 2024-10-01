@@ -218,8 +218,8 @@ int			FastPathLockGroupsPerBackend = 0;
  * of fast-path lock slots.
  */
 #define FAST_PATH_SLOT(group, index) \
-	(AssertMacro(((group) >= 0) && ((group) < FastPathLockGroupsPerBackend)), \
-	 AssertMacro(((index) >= 0) && ((index) < FP_LOCK_SLOTS_PER_GROUP)), \
+	(AssertMacro((uint32) (group) < FastPathLockGroupsPerBackend), \
+	 AssertMacro((uint32) (index) < FP_LOCK_SLOTS_PER_GROUP), \
 	 ((group) * FP_LOCK_SLOTS_PER_GROUP + (index)))
 
 /*
@@ -227,10 +227,10 @@ int			FastPathLockGroupsPerBackend = 0;
  * the FAST_PATH_SLOT macro, split it into group and index (in the group).
  */
 #define FAST_PATH_GROUP(index)	\
-	(AssertMacro(((index) >= 0) && ((index) < FP_LOCK_SLOTS_PER_BACKEND)), \
+	(AssertMacro((uint32) (index) < FP_LOCK_SLOTS_PER_BACKEND), \
 	 ((index) / FP_LOCK_SLOTS_PER_GROUP))
 #define FAST_PATH_INDEX(index)	\
-	(AssertMacro(((index) >= 0) && ((index) < FP_LOCK_SLOTS_PER_BACKEND)), \
+	(AssertMacro((uint32) (index) < FP_LOCK_SLOTS_PER_BACKEND), \
 	 ((index) % FP_LOCK_SLOTS_PER_GROUP))
 
 /* Macros for manipulating proc->fpLockBits */
@@ -2304,6 +2304,16 @@ LockReleaseAll(LOCKMETHODID lockmethodid, bool allLocks)
 			else
 				locallock->numLockOwners = 0;
 		}
+
+#ifdef USE_ASSERT_CHECKING
+
+		/*
+		 * Tuple locks are currently held only for short durations within a
+		 * transaction. Check that we didn't forget to release one.
+		 */
+		if (LOCALLOCK_LOCKTAG(*locallock) == LOCKTAG_TUPLE && !allLocks)
+			elog(WARNING, "tuple lock held at commit");
+#endif
 
 		/*
 		 * If the lock or proclock pointers are NULL, this lock was taken via
