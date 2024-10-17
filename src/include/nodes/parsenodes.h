@@ -728,7 +728,7 @@ typedef struct ColumnDef
 	char	   *colname;		/* name of column */
 	TypeName   *typeName;		/* type of column */
 	char	   *compression;	/* compression method for column */
-	int			inhcount;		/* number of times column is inherited */
+	int16		inhcount;		/* number of times column is inherited */
 	bool		is_local;		/* column has local (non-inherited) def'n */
 	bool		is_not_null;	/* NOT NULL constraint specified? */
 	bool		is_from_type;	/* column definition came from table type */
@@ -1438,6 +1438,7 @@ typedef struct SortGroupClause
 	Index		tleSortGroupRef;	/* reference into targetlist */
 	Oid			eqop;			/* the equality operator ('=' op) */
 	Oid			sortop;			/* the ordering operator ('<' op), or 0 */
+	bool		reverse_sort;	/* is sortop a "greater than" operator? */
 	bool		nulls_first;	/* do NULLs come before normal values? */
 	/* can eqop be implemented by hashing? */
 	bool		hashable pg_node_attr(query_jumble_ignore);
@@ -2754,8 +2755,6 @@ typedef struct Constraint
 	char	   *cooked_expr;	/* CHECK or DEFAULT expression, as
 								 * nodeToString representation */
 	char		generated_when; /* ALWAYS or BY DEFAULT */
-	int			inhcount;		/* initial inheritance count to apply, for
-								 * "raw" NOT NULL constraints */
 	bool		nulls_not_distinct; /* null treatment for UNIQUE constraints */
 	List	   *keys;			/* String nodes naming referenced key
 								 * column(s); for UNIQUE/PK/NOT NULL */
