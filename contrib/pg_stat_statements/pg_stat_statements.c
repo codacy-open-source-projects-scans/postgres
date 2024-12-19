@@ -49,7 +49,6 @@
 
 #include "access/parallel.h"
 #include "catalog/pg_authid.h"
-#include "common/hashfn.h"
 #include "common/int.h"
 #include "executor/instrument.h"
 #include "funcapi.h"
@@ -59,9 +58,7 @@
 #include "nodes/queryjumble.h"
 #include "optimizer/planner.h"
 #include "parser/analyze.h"
-#include "parser/parsetree.h"
 #include "parser/scanner.h"
-#include "parser/scansup.h"
 #include "pgstat.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
@@ -338,7 +335,7 @@ static PlannedStmt *pgss_planner(Query *parse,
 static void pgss_ExecutorStart(QueryDesc *queryDesc, int eflags);
 static void pgss_ExecutorRun(QueryDesc *queryDesc,
 							 ScanDirection direction,
-							 uint64 count, bool execute_once);
+							 uint64 count);
 static void pgss_ExecutorFinish(QueryDesc *queryDesc);
 static void pgss_ExecutorEnd(QueryDesc *queryDesc);
 static void pgss_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
@@ -1024,16 +1021,15 @@ pgss_ExecutorStart(QueryDesc *queryDesc, int eflags)
  * ExecutorRun hook: all we need do is track nesting depth
  */
 static void
-pgss_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count,
-				 bool execute_once)
+pgss_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
 {
 	nesting_level++;
 	PG_TRY();
 	{
 		if (prev_ExecutorRun)
-			prev_ExecutorRun(queryDesc, direction, count, execute_once);
+			prev_ExecutorRun(queryDesc, direction, count);
 		else
-			standard_ExecutorRun(queryDesc, direction, count, execute_once);
+			standard_ExecutorRun(queryDesc, direction, count);
 	}
 	PG_FINALLY();
 	{
@@ -1872,9 +1868,14 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 		/* copy counters to a local variable to keep locking time short */
 		SpinLockAcquire(&entry->mutex);
 		tmp = entry->counters;
+		SpinLockRelease(&entry->mutex);
+
+		/*
+		 * The spinlock is not required when reading these two as they are
+		 * always updated when holding pgss->lock exclusively.
+		 */
 		stats_since = entry->stats_since;
 		minmax_stats_since = entry->minmax_stats_since;
-		SpinLockRelease(&entry->mutex);
 
 		/* Skip entry if unexecuted (ie, it's a pending "sticky" entry) */
 		if (IS_STICKY(tmp))

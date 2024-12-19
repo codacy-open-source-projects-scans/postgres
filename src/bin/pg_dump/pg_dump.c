@@ -49,10 +49,8 @@
 #include "catalog/pg_class_d.h"
 #include "catalog/pg_default_acl_d.h"
 #include "catalog/pg_largeobject_d.h"
-#include "catalog/pg_largeobject_metadata_d.h"
 #include "catalog/pg_proc_d.h"
-#include "catalog/pg_subscription.h"
-#include "catalog/pg_trigger_d.h"
+#include "catalog/pg_subscription_d.h"
 #include "catalog/pg_type_d.h"
 #include "common/connect.h"
 #include "common/int.h"
@@ -345,6 +343,10 @@ static void getTableData(DumpOptions *dopt, TableInfo *tblinfo, int numTables, c
 static void makeTableDataInfo(DumpOptions *dopt, TableInfo *tbinfo);
 static void buildMatViewRefreshDependencies(Archive *fout);
 static void getTableDataFKConstraints(void);
+static void determineNotNullFlags(Archive *fout, PGresult *res, int r,
+								  TableInfo *tbinfo, int j,
+								  int i_notnull_name, int i_notnull_noinherit,
+								  int i_notnull_islocal);
 static char *format_function_arguments(const FuncInfo *finfo, const char *funcargs,
 									   bool is_agg);
 static char *format_function_signature(Archive *fout,
@@ -426,6 +428,8 @@ main(int argc, char **argv)
 	char	   *error_detail = NULL;
 	bool		user_compression_defined = false;
 	DataDirSyncMethod sync_method = DATA_DIR_SYNC_METHOD_FSYNC;
+	bool		data_only = false;
+	bool		schema_only = false;
 
 	static DumpOptions dopt;
 
@@ -541,7 +545,7 @@ main(int argc, char **argv)
 		switch (c)
 		{
 			case 'a':			/* Dump data only */
-				dopt.dataOnly = true;
+				data_only = true;
 				break;
 
 			case 'b':			/* Dump LOs */
@@ -614,7 +618,7 @@ main(int argc, char **argv)
 				break;
 
 			case 's':			/* dump schema only */
-				dopt.schemaOnly = true;
+				schema_only = true;
 				break;
 
 			case 'S':			/* Username for superuser in plain text output */
@@ -778,20 +782,24 @@ main(int argc, char **argv)
 	if (dopt.binary_upgrade)
 		dopt.sequence_data = 1;
 
-	if (dopt.dataOnly && dopt.schemaOnly)
+	if (data_only && schema_only)
 		pg_fatal("options -s/--schema-only and -a/--data-only cannot be used together");
 
-	if (dopt.schemaOnly && foreign_servers_include_patterns.head != NULL)
+	if (schema_only && foreign_servers_include_patterns.head != NULL)
 		pg_fatal("options -s/--schema-only and --include-foreign-data cannot be used together");
 
 	if (numWorkers > 1 && foreign_servers_include_patterns.head != NULL)
 		pg_fatal("option --include-foreign-data is not supported with parallel backup");
 
-	if (dopt.dataOnly && dopt.outputClean)
+	if (data_only && dopt.outputClean)
 		pg_fatal("options -c/--clean and -a/--data-only cannot be used together");
 
 	if (dopt.if_exists && !dopt.outputClean)
 		pg_fatal("option --if-exists requires option -c/--clean");
+
+	/* set derivative flags */
+	dopt.dumpSchema = (!data_only);
+	dopt.dumpData = (!schema_only);
 
 	/*
 	 * --inserts are already implied above if --column-inserts or
@@ -975,7 +983,7 @@ main(int argc, char **argv)
 	 * -s means "schema only" and LOs are data, not schema, so we never
 	 * include LOs when -s is used.
 	 */
-	if (dopt.include_everything && !dopt.schemaOnly && !dopt.dontOutputLOs)
+	if (dopt.include_everything && dopt.dumpData && !dopt.dontOutputLOs)
 		dopt.outputLOs = true;
 
 	/*
@@ -989,15 +997,15 @@ main(int argc, char **argv)
 	 */
 	tblinfo = getSchemaData(fout, &numTables);
 
-	if (!dopt.schemaOnly)
+	if (dopt.dumpData)
 	{
 		getTableData(&dopt, tblinfo, numTables, 0);
 		buildMatViewRefreshDependencies(fout);
-		if (dopt.dataOnly)
+		if (!dopt.dumpSchema)
 			getTableDataFKConstraints();
 	}
 
-	if (dopt.schemaOnly && dopt.sequence_data)
+	if (!dopt.dumpData && dopt.sequence_data)
 		getTableData(&dopt, tblinfo, numTables, RELKIND_SEQUENCE);
 
 	/*
@@ -1089,8 +1097,8 @@ main(int argc, char **argv)
 	ropt->cparams.username = dopt.cparams.username ? pg_strdup(dopt.cparams.username) : NULL;
 	ropt->cparams.promptPassword = dopt.cparams.promptPassword;
 	ropt->dropSchema = dopt.outputClean;
-	ropt->dataOnly = dopt.dataOnly;
-	ropt->schemaOnly = dopt.schemaOnly;
+	ropt->dumpData = dopt.dumpData;
+	ropt->dumpSchema = dopt.dumpSchema;
 	ropt->if_exists = dopt.if_exists;
 	ropt->column_inserts = dopt.column_inserts;
 	ropt->dumpSections = dopt.dumpSections;
@@ -1210,7 +1218,7 @@ help(const char *progname)
 			 "                               servers matching PATTERN\n"));
 	printf(_("  --inserts                    dump data as INSERT commands, rather than COPY\n"));
 	printf(_("  --load-via-partition-root    load partitions via the root table\n"));
-	printf(_("  --no-comments                do not dump comments\n"));
+	printf(_("  --no-comments                do not dump comment commands\n"));
 	printf(_("  --no-publications            do not dump publications\n"));
 	printf(_("  --no-security-labels         do not dump security label assignments\n"));
 	printf(_("  --no-subscriptions           do not dump subscriptions\n"));
@@ -1985,7 +1993,7 @@ selectDumpableType(TypeInfo *tyinfo, Archive *fout)
  *		Mark a default ACL as to be dumped or not
  *
  * For per-schema default ACLs, dump if the schema is to be dumped.
- * Otherwise dump if we are dumping "everything".  Note that dataOnly
+ * Otherwise dump if we are dumping "everything".  Note that dumpSchema
  * and aclsSkip are checked separately.
  */
 static void
@@ -4159,8 +4167,8 @@ dumpPolicy(Archive *fout, const PolicyInfo *polinfo)
 	const char *cmd;
 	char	   *tag;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	/*
@@ -4282,6 +4290,7 @@ getPublications(Archive *fout)
 	int			i_pubdelete;
 	int			i_pubtruncate;
 	int			i_pubviaroot;
+	int			i_pubgencols;
 	int			i,
 				ntups;
 
@@ -4291,24 +4300,26 @@ getPublications(Archive *fout)
 	query = createPQExpBuffer();
 
 	/* Get the publications. */
-	if (fout->remoteVersion >= 130000)
-		appendPQExpBufferStr(query,
-							 "SELECT p.tableoid, p.oid, p.pubname, "
-							 "p.pubowner, "
-							 "p.puballtables, p.pubinsert, p.pubupdate, p.pubdelete, p.pubtruncate, p.pubviaroot "
-							 "FROM pg_publication p");
-	else if (fout->remoteVersion >= 110000)
-		appendPQExpBufferStr(query,
-							 "SELECT p.tableoid, p.oid, p.pubname, "
-							 "p.pubowner, "
-							 "p.puballtables, p.pubinsert, p.pubupdate, p.pubdelete, p.pubtruncate, false AS pubviaroot "
-							 "FROM pg_publication p");
+	appendPQExpBufferStr(query, "SELECT p.tableoid, p.oid, p.pubname, "
+						 "p.pubowner, p.puballtables, p.pubinsert, "
+						 "p.pubupdate, p.pubdelete, ");
+
+	if (fout->remoteVersion >= 110000)
+		appendPQExpBufferStr(query, "p.pubtruncate, ");
 	else
-		appendPQExpBufferStr(query,
-							 "SELECT p.tableoid, p.oid, p.pubname, "
-							 "p.pubowner, "
-							 "p.puballtables, p.pubinsert, p.pubupdate, p.pubdelete, false AS pubtruncate, false AS pubviaroot "
-							 "FROM pg_publication p");
+		appendPQExpBufferStr(query, "false AS pubtruncate, ");
+
+	if (fout->remoteVersion >= 130000)
+		appendPQExpBufferStr(query, "p.pubviaroot, ");
+	else
+		appendPQExpBufferStr(query, "false AS pubviaroot, ");
+
+	if (fout->remoteVersion >= 180000)
+		appendPQExpBufferStr(query, "p.pubgencols ");
+	else
+		appendPQExpBufferStr(query, "false AS pubgencols ");
+
+	appendPQExpBufferStr(query, "FROM pg_publication p");
 
 	res = ExecuteSqlQuery(fout, query->data, PGRES_TUPLES_OK);
 
@@ -4327,6 +4338,7 @@ getPublications(Archive *fout)
 	i_pubdelete = PQfnumber(res, "pubdelete");
 	i_pubtruncate = PQfnumber(res, "pubtruncate");
 	i_pubviaroot = PQfnumber(res, "pubviaroot");
+	i_pubgencols = PQfnumber(res, "pubgencols");
 
 	pubinfo = pg_malloc(ntups * sizeof(PublicationInfo));
 
@@ -4351,6 +4363,8 @@ getPublications(Archive *fout)
 			(strcmp(PQgetvalue(res, i, i_pubtruncate), "t") == 0);
 		pubinfo[i].pubviaroot =
 			(strcmp(PQgetvalue(res, i, i_pubviaroot), "t") == 0);
+		pubinfo[i].pubgencols =
+			(strcmp(PQgetvalue(res, i, i_pubgencols), "t") == 0);
 
 		/* Decide whether we want to dump it */
 		selectDumpableObject(&(pubinfo[i].dobj), fout);
@@ -4375,8 +4389,8 @@ dumpPublication(Archive *fout, const PublicationInfo *pubinfo)
 	char	   *qpubname;
 	bool		first = true;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	delq = createPQExpBuffer();
@@ -4431,6 +4445,9 @@ dumpPublication(Archive *fout, const PublicationInfo *pubinfo)
 
 	if (pubinfo->pubviaroot)
 		appendPQExpBufferStr(query, ", publish_via_partition_root = true");
+
+	if (pubinfo->pubgencols)
+		appendPQExpBufferStr(query, ", publish_generated_columns = true");
 
 	appendPQExpBufferStr(query, ");\n");
 
@@ -4690,8 +4707,8 @@ dumpPublicationNamespace(Archive *fout, const PublicationSchemaInfo *pubsinfo)
 	PQExpBuffer query;
 	char	   *tag;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	tag = psprintf("%s %s", pubinfo->dobj.name, schemainfo->dobj.name);
@@ -4733,8 +4750,8 @@ dumpPublicationTable(Archive *fout, const PublicationRelInfo *pubrinfo)
 	PQExpBuffer query;
 	char	   *tag;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	tag = psprintf("%s %s", pubinfo->dobj.name, tbinfo->dobj.name);
@@ -4951,20 +4968,20 @@ getSubscriptions(Archive *fout)
 	i_oid = PQfnumber(res, "oid");
 	i_subname = PQfnumber(res, "subname");
 	i_subowner = PQfnumber(res, "subowner");
+	i_subenabled = PQfnumber(res, "subenabled");
 	i_subbinary = PQfnumber(res, "subbinary");
 	i_substream = PQfnumber(res, "substream");
 	i_subtwophasestate = PQfnumber(res, "subtwophasestate");
 	i_subdisableonerr = PQfnumber(res, "subdisableonerr");
 	i_subpasswordrequired = PQfnumber(res, "subpasswordrequired");
 	i_subrunasowner = PQfnumber(res, "subrunasowner");
+	i_subfailover = PQfnumber(res, "subfailover");
 	i_subconninfo = PQfnumber(res, "subconninfo");
 	i_subslotname = PQfnumber(res, "subslotname");
 	i_subsynccommit = PQfnumber(res, "subsynccommit");
 	i_subpublications = PQfnumber(res, "subpublications");
 	i_suborigin = PQfnumber(res, "suborigin");
 	i_suboriginremotelsn = PQfnumber(res, "suboriginremotelsn");
-	i_subenabled = PQfnumber(res, "subenabled");
-	i_subfailover = PQfnumber(res, "subfailover");
 
 	subinfo = pg_malloc(ntups * sizeof(SubscriptionInfo));
 
@@ -4978,18 +4995,20 @@ getSubscriptions(Archive *fout)
 		subinfo[i].dobj.name = pg_strdup(PQgetvalue(res, i, i_subname));
 		subinfo[i].rolname = getRoleName(PQgetvalue(res, i, i_subowner));
 
+		subinfo[i].subenabled =
+			(strcmp(PQgetvalue(res, i, i_subenabled), "t") == 0);
 		subinfo[i].subbinary =
-			pg_strdup(PQgetvalue(res, i, i_subbinary));
-		subinfo[i].substream =
-			pg_strdup(PQgetvalue(res, i, i_substream));
-		subinfo[i].subtwophasestate =
-			pg_strdup(PQgetvalue(res, i, i_subtwophasestate));
+			(strcmp(PQgetvalue(res, i, i_subbinary), "t") == 0);
+		subinfo[i].substream = *(PQgetvalue(res, i, i_substream));
+		subinfo[i].subtwophasestate = *(PQgetvalue(res, i, i_subtwophasestate));
 		subinfo[i].subdisableonerr =
-			pg_strdup(PQgetvalue(res, i, i_subdisableonerr));
+			(strcmp(PQgetvalue(res, i, i_subdisableonerr), "t") == 0);
 		subinfo[i].subpasswordrequired =
-			pg_strdup(PQgetvalue(res, i, i_subpasswordrequired));
+			(strcmp(PQgetvalue(res, i, i_subpasswordrequired), "t") == 0);
 		subinfo[i].subrunasowner =
-			pg_strdup(PQgetvalue(res, i, i_subrunasowner));
+			(strcmp(PQgetvalue(res, i, i_subrunasowner), "t") == 0);
+		subinfo[i].subfailover =
+			(strcmp(PQgetvalue(res, i, i_subfailover), "t") == 0);
 		subinfo[i].subconninfo =
 			pg_strdup(PQgetvalue(res, i, i_subconninfo));
 		if (PQgetisnull(res, i, i_subslotname))
@@ -5007,10 +5026,6 @@ getSubscriptions(Archive *fout)
 		else
 			subinfo[i].suboriginremotelsn =
 				pg_strdup(PQgetvalue(res, i, i_suboriginremotelsn));
-		subinfo[i].subenabled =
-			pg_strdup(PQgetvalue(res, i, i_subenabled));
-		subinfo[i].subfailover =
-			pg_strdup(PQgetvalue(res, i, i_subfailover));
 
 		/* Decide whether we want to dump it */
 		selectDumpableObject(&(subinfo[i].dobj), fout);
@@ -5119,8 +5134,8 @@ dumpSubscriptionTable(Archive *fout, const SubRelInfo *subrinfo)
 	PQExpBuffer query;
 	char	   *tag;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	Assert(fout->dopt->binary_upgrade && fout->remoteVersion >= 170000);
@@ -5191,10 +5206,9 @@ dumpSubscription(Archive *fout, const SubscriptionInfo *subinfo)
 	char	  **pubnames = NULL;
 	int			npubnames = 0;
 	int			i;
-	char		two_phase_disabled[] = {LOGICALREP_TWOPHASE_STATE_DISABLED, '\0'};
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	delq = createPQExpBuffer();
@@ -5228,27 +5242,29 @@ dumpSubscription(Archive *fout, const SubscriptionInfo *subinfo)
 	else
 		appendPQExpBufferStr(query, "NONE");
 
-	if (strcmp(subinfo->subbinary, "t") == 0)
+	if (subinfo->subbinary)
 		appendPQExpBufferStr(query, ", binary = true");
 
-	if (strcmp(subinfo->substream, "t") == 0)
+	if (subinfo->substream == LOGICALREP_STREAM_ON)
 		appendPQExpBufferStr(query, ", streaming = on");
-	else if (strcmp(subinfo->substream, "p") == 0)
+	else if (subinfo->substream == LOGICALREP_STREAM_PARALLEL)
 		appendPQExpBufferStr(query, ", streaming = parallel");
+	else
+		appendPQExpBufferStr(query, ", streaming = off");
 
-	if (strcmp(subinfo->subtwophasestate, two_phase_disabled) != 0)
+	if (subinfo->subtwophasestate != LOGICALREP_TWOPHASE_STATE_DISABLED)
 		appendPQExpBufferStr(query, ", two_phase = on");
 
-	if (strcmp(subinfo->subdisableonerr, "t") == 0)
+	if (subinfo->subdisableonerr)
 		appendPQExpBufferStr(query, ", disable_on_error = true");
 
-	if (strcmp(subinfo->subpasswordrequired, "t") != 0)
+	if (!subinfo->subpasswordrequired)
 		appendPQExpBuffer(query, ", password_required = false");
 
-	if (strcmp(subinfo->subrunasowner, "t") == 0)
+	if (subinfo->subrunasowner)
 		appendPQExpBufferStr(query, ", run_as_owner = true");
 
-	if (strcmp(subinfo->subfailover, "t") == 0)
+	if (subinfo->subfailover)
 		appendPQExpBufferStr(query, ", failover = true");
 
 	if (strcmp(subinfo->subsynccommit, "off") != 0)
@@ -5284,7 +5300,7 @@ dumpSubscription(Archive *fout, const SubscriptionInfo *subinfo)
 			appendPQExpBuffer(query, ", '%s');\n", subinfo->suboriginremotelsn);
 		}
 
-		if (strcmp(subinfo->subenabled, "t") == 0)
+		if (subinfo->subenabled)
 		{
 			/*
 			 * Enable the subscription to allow the replication to continue
@@ -7237,20 +7253,15 @@ getOwnedSeqs(Archive *fout, TableInfo tblinfo[], int numTables)
 					 seqinfo->owning_tab, seqinfo->dobj.catId.oid);
 
 		/*
-		 * Only dump identity sequences if we're going to dump the table that
-		 * it belongs to.
-		 */
-		if (owning_tab->dobj.dump == DUMP_COMPONENT_NONE &&
-			seqinfo->is_identity_sequence)
-		{
-			seqinfo->dobj.dump = DUMP_COMPONENT_NONE;
-			continue;
-		}
-
-		/*
-		 * Otherwise we need to dump the components that are being dumped for
-		 * the table and any components which the sequence is explicitly
-		 * marked with.
+		 * For an identity sequence, dump exactly the same components for the
+		 * sequence as for the owning table.  This is important because we
+		 * treat the identity sequence as an integral part of the table.  For
+		 * example, there is not any DDL command that allows creation of such
+		 * a sequence independently of the table.
+		 *
+		 * For other owned sequences such as serial sequences, we need to dump
+		 * the components that are being dumped for the table and any
+		 * components that the sequence is explicitly marked with.
 		 *
 		 * We can't simply use the set of components which are being dumped
 		 * for the table as the table might be in an extension (and only the
@@ -7263,10 +7274,17 @@ getOwnedSeqs(Archive *fout, TableInfo tblinfo[], int numTables)
 		 * marked by checkExtensionMembership() and this will be a no-op as
 		 * the table will be equivalently marked.
 		 */
-		seqinfo->dobj.dump = seqinfo->dobj.dump | owning_tab->dobj.dump;
+		if (seqinfo->is_identity_sequence)
+			seqinfo->dobj.dump = owning_tab->dobj.dump;
+		else
+			seqinfo->dobj.dump |= owning_tab->dobj.dump;
 
+		/* Make sure that necessary data is available if we're dumping it */
 		if (seqinfo->dobj.dump != DUMP_COMPONENT_NONE)
+		{
 			seqinfo->interesting = true;
+			owning_tab->interesting = true;
+		}
 	}
 }
 
@@ -7343,8 +7361,8 @@ getPartitioningInfo(Archive *fout)
 	/* hash partitioning didn't exist before v11 */
 	if (fout->remoteVersion < 110000)
 		return;
-	/* needn't bother if schema-only dump */
-	if (fout->dopt->schemaOnly)
+	/* needn't bother if not dumping data */
+	if (!fout->dopt->dumpData)
 		return;
 
 	query = createPQExpBuffer();
@@ -8742,7 +8760,9 @@ getTableAttrs(Archive *fout, TableInfo *tblinfo, int numTables)
 	int			i_attlen;
 	int			i_attalign;
 	int			i_attislocal;
-	int			i_attnotnull;
+	int			i_notnull_name;
+	int			i_notnull_noinherit;
+	int			i_notnull_islocal;
 	int			i_attoptions;
 	int			i_attcollation;
 	int			i_attcompression;
@@ -8752,13 +8772,13 @@ getTableAttrs(Archive *fout, TableInfo *tblinfo, int numTables)
 
 	/*
 	 * We want to perform just one query against pg_attribute, and then just
-	 * one against pg_attrdef (for DEFAULTs) and one against pg_constraint
-	 * (for CHECK constraints).  However, we mustn't try to select every row
-	 * of those catalogs and then sort it out on the client side, because some
-	 * of the server-side functions we need would be unsafe to apply to tables
-	 * we don't have lock on.  Hence, we build an array of the OIDs of tables
-	 * we care about (and now have lock on!), and use a WHERE clause to
-	 * constrain which rows are selected.
+	 * one against pg_attrdef (for DEFAULTs) and two against pg_constraint
+	 * (for CHECK constraints and for NOT NULL constraints).  However, we
+	 * mustn't try to select every row of those catalogs and then sort it out
+	 * on the client side, because some of the server-side functions we need
+	 * would be unsafe to apply to tables we don't have lock on.  Hence, we
+	 * build an array of the OIDs of tables we care about (and now have lock
+	 * on!), and use a WHERE clause to constrain which rows are selected.
 	 */
 	appendPQExpBufferChar(tbloids, '{');
 	appendPQExpBufferChar(checkoids, '{');
@@ -8805,7 +8825,6 @@ getTableAttrs(Archive *fout, TableInfo *tblinfo, int numTables)
 						 "a.attstattarget,\n"
 						 "a.attstorage,\n"
 						 "t.typstorage,\n"
-						 "a.attnotnull,\n"
 						 "a.atthasdef,\n"
 						 "a.attisdropped,\n"
 						 "a.attlen,\n"
@@ -8821,6 +8840,30 @@ getTableAttrs(Archive *fout, TableInfo *tblinfo, int numTables)
 						 "FROM pg_catalog.pg_options_to_table(attfdwoptions) "
 						 "ORDER BY option_name"
 						 "), E',\n    ') AS attfdwoptions,\n");
+
+	/*
+	 * Find out any NOT NULL markings for each column.  In 18 and up we read
+	 * pg_constraint to obtain the constraint name.  notnull_noinherit is set
+	 * according to the NO INHERIT property.  For versions prior to 18, we
+	 * store an empty string as the name when a constraint is marked as
+	 * attnotnull (this cues dumpTableSchema to print the NOT NULL clause
+	 * without a name); also, such cases are never NO INHERIT.
+	 *
+	 * We track in notnull_islocal whether the constraint was defined directly
+	 * in this table or via an ancestor, for binary upgrade.  flagInhAttrs
+	 * might modify this later for servers older than 18; it's also in charge
+	 * of determining the correct inhcount.
+	 */
+	if (fout->remoteVersion >= 180000)
+		appendPQExpBufferStr(q,
+							 "co.conname AS notnull_name,\n"
+							 "co.connoinherit AS notnull_noinherit,\n"
+							 "co.conislocal AS notnull_islocal,\n");
+	else
+		appendPQExpBufferStr(q,
+							 "CASE WHEN a.attnotnull THEN '' ELSE NULL END AS notnull_name,\n"
+							 "false AS notnull_noinherit,\n"
+							 "a.attislocal AS notnull_islocal,\n");
 
 	if (fout->remoteVersion >= 140000)
 		appendPQExpBufferStr(q,
@@ -8856,10 +8899,24 @@ getTableAttrs(Archive *fout, TableInfo *tblinfo, int numTables)
 					  "FROM unnest('%s'::pg_catalog.oid[]) AS src(tbloid)\n"
 					  "JOIN pg_catalog.pg_attribute a ON (src.tbloid = a.attrelid) "
 					  "LEFT JOIN pg_catalog.pg_type t "
-					  "ON (a.atttypid = t.oid)\n"
-					  "WHERE a.attnum > 0::pg_catalog.int2\n"
-					  "ORDER BY a.attrelid, a.attnum",
+					  "ON (a.atttypid = t.oid)\n",
 					  tbloids->data);
+
+	/*
+	 * In versions 18 and up, we need pg_constraint for explicit NOT NULL
+	 * entries.  Also, we need to know if the NOT NULL for each column is
+	 * backing a primary key.
+	 */
+	if (fout->remoteVersion >= 180000)
+		appendPQExpBufferStr(q,
+							 " LEFT JOIN pg_catalog.pg_constraint co ON "
+							 "(a.attrelid = co.conrelid\n"
+							 "   AND co.contype = 'n' AND "
+							 "co.conkey = array[a.attnum])\n");
+
+	appendPQExpBufferStr(q,
+						 "WHERE a.attnum > 0::pg_catalog.int2\n"
+						 "ORDER BY a.attrelid, a.attnum");
 
 	res = ExecuteSqlQuery(fout, q->data, PGRES_TUPLES_OK);
 
@@ -8878,7 +8935,9 @@ getTableAttrs(Archive *fout, TableInfo *tblinfo, int numTables)
 	i_attlen = PQfnumber(res, "attlen");
 	i_attalign = PQfnumber(res, "attalign");
 	i_attislocal = PQfnumber(res, "attislocal");
-	i_attnotnull = PQfnumber(res, "attnotnull");
+	i_notnull_name = PQfnumber(res, "notnull_name");
+	i_notnull_noinherit = PQfnumber(res, "notnull_noinherit");
+	i_notnull_islocal = PQfnumber(res, "notnull_islocal");
 	i_attoptions = PQfnumber(res, "attoptions");
 	i_attcollation = PQfnumber(res, "attcollation");
 	i_attcompression = PQfnumber(res, "attcompression");
@@ -8943,8 +9002,9 @@ getTableAttrs(Archive *fout, TableInfo *tblinfo, int numTables)
 		tbinfo->attcompression = (char *) pg_malloc(numatts * sizeof(char));
 		tbinfo->attfdwoptions = (char **) pg_malloc(numatts * sizeof(char *));
 		tbinfo->attmissingval = (char **) pg_malloc(numatts * sizeof(char *));
-		tbinfo->notnull = (bool *) pg_malloc(numatts * sizeof(bool));
-		tbinfo->inhNotNull = (bool *) pg_malloc(numatts * sizeof(bool));
+		tbinfo->notnull_constrs = (char **) pg_malloc(numatts * sizeof(char *));
+		tbinfo->notnull_noinh = (bool *) pg_malloc(numatts * sizeof(bool));
+		tbinfo->notnull_islocal = (bool *) pg_malloc(numatts * sizeof(bool));
 		tbinfo->attrdefs = (AttrDefInfo **) pg_malloc(numatts * sizeof(AttrDefInfo *));
 		hasdefaults = false;
 
@@ -8968,7 +9028,13 @@ getTableAttrs(Archive *fout, TableInfo *tblinfo, int numTables)
 			tbinfo->attlen[j] = atoi(PQgetvalue(res, r, i_attlen));
 			tbinfo->attalign[j] = *(PQgetvalue(res, r, i_attalign));
 			tbinfo->attislocal[j] = (PQgetvalue(res, r, i_attislocal)[0] == 't');
-			tbinfo->notnull[j] = (PQgetvalue(res, r, i_attnotnull)[0] == 't');
+
+			/* Handle not-null constraint name and flags */
+			determineNotNullFlags(fout, res, r,
+								  tbinfo, j,
+								  i_notnull_name, i_notnull_noinherit,
+								  i_notnull_islocal);
+
 			tbinfo->attoptions[j] = pg_strdup(PQgetvalue(res, r, i_attoptions));
 			tbinfo->attcollation[j] = atooid(PQgetvalue(res, r, i_attcollation));
 			tbinfo->attcompression[j] = *(PQgetvalue(res, r, i_attcompression));
@@ -8977,8 +9043,6 @@ getTableAttrs(Archive *fout, TableInfo *tblinfo, int numTables)
 			tbinfo->attrdefs[j] = NULL; /* fix below */
 			if (PQgetvalue(res, r, i_atthasdef)[0] == 't')
 				hasdefaults = true;
-			/* these flags will be set in flagInhAttrs() */
-			tbinfo->inhNotNull[j] = false;
 		}
 
 		if (hasdefaults)
@@ -8996,7 +9060,7 @@ getTableAttrs(Archive *fout, TableInfo *tblinfo, int numTables)
 	 * Now get info about column defaults.  This is skipped for a data-only
 	 * dump, as it is only needed for table schemas.
 	 */
-	if (!dopt->dataOnly && tbloids->len > 1)
+	if (dopt->dumpSchema && tbloids->len > 1)
 	{
 		AttrDefInfo *attrdefs;
 		int			numDefaults;
@@ -9126,7 +9190,7 @@ getTableAttrs(Archive *fout, TableInfo *tblinfo, int numTables)
 	 * Get info about table CHECK constraints.  This is skipped for a
 	 * data-only dump, as it is only needed for table schemas.
 	 */
-	if (!dopt->dataOnly && checkoids->len > 2)
+	if (dopt->dumpSchema && checkoids->len > 2)
 	{
 		ConstraintInfo *constrs;
 		int			numConstrs;
@@ -9257,6 +9321,110 @@ getTableAttrs(Archive *fout, TableInfo *tblinfo, int numTables)
 	destroyPQExpBuffer(q);
 	destroyPQExpBuffer(tbloids);
 	destroyPQExpBuffer(checkoids);
+}
+
+/*
+ * Based on the getTableAttrs query's row corresponding to one column, set
+ * the name and flags to handle a not-null constraint for that column in
+ * the tbinfo struct.
+ *
+ * Result row 'r' is for tbinfo's attribute 'j'.
+ *
+ * There are three possibilities:
+ * 1) the column has no not-null constraints. In that case, ->notnull_constrs
+ *    (the constraint name) remains NULL.
+ * 2) The column has a constraint with no name (this is the case when
+ *    constraints come from pre-18 servers).  In this case, ->notnull_constrs
+ *    is set to the empty string; dumpTableSchema will print just "NOT NULL".
+ * 3) The column has a constraint with a known name; in that case
+ *    notnull_constrs carries that name and dumpTableSchema will print
+ *    "CONSTRAINT the_name NOT NULL".  However, if the name is the default
+ *    (table_column_not_null), there's no need to print that name in the dump,
+ *    so notnull_constrs is set to the empty string and it behaves as the case
+ *    above.
+ *
+ * In a child table that inherits from a parent already containing NOT NULL
+ * constraints and the columns in the child don't have their own NOT NULL
+ * declarations, we suppress printing constraints in the child: the
+ * constraints are acquired at the point where the child is attached to the
+ * parent.  This is tracked in ->notnull_inh (which is set in flagInhAttrs for
+ * servers pre-18).
+ *
+ * Any of these constraints might have the NO INHERIT bit.  If so we set
+ * ->notnull_noinh and NO INHERIT will be printed by dumpTableSchema.
+ *
+ * In case 3 above, the name comparison is a bit of a hack; it actually fails
+ * to do the right thing in all but the trivial case.  However, the downside
+ * of getting it wrong is simply that the name is printed rather than
+ * suppressed, so it's not a big deal.
+ */
+static void
+determineNotNullFlags(Archive *fout, PGresult *res, int r,
+					  TableInfo *tbinfo, int j,
+					  int i_notnull_name, int i_notnull_noinherit,
+					  int i_notnull_islocal)
+{
+	DumpOptions *dopt = fout->dopt;
+
+	/*
+	 * notnull_noinh is straight from the query result. notnull_islocal also,
+	 * though flagInhAttrs may change that one later in versions < 18.
+	 */
+	tbinfo->notnull_noinh[j] = PQgetvalue(res, r, i_notnull_noinherit)[0] == 't';
+	tbinfo->notnull_islocal[j] = PQgetvalue(res, r, i_notnull_islocal)[0] == 't';
+
+	/*
+	 * Determine a constraint name to use.  If the column is not marked not-
+	 * null, we set NULL which cues ... to do nothing.  An empty string says
+	 * to print an unnamed NOT NULL, and anything else is a constraint name to
+	 * use.
+	 */
+	if (fout->remoteVersion < 180000)
+	{
+		/*
+		 * < 18 doesn't have not-null names, so an unnamed constraint is
+		 * sufficient.
+		 */
+		if (PQgetisnull(res, r, i_notnull_name))
+			tbinfo->notnull_constrs[j] = NULL;
+		else
+			tbinfo->notnull_constrs[j] = "";
+	}
+	else
+	{
+		if (PQgetisnull(res, r, i_notnull_name))
+			tbinfo->notnull_constrs[j] = NULL;
+		else
+		{
+			/*
+			 * In binary upgrade of inheritance child tables, must have a
+			 * constraint name that we can UPDATE later.
+			 */
+			if (dopt->binary_upgrade &&
+				!tbinfo->ispartition &&
+				!tbinfo->notnull_islocal)
+			{
+				tbinfo->notnull_constrs[j] =
+					pstrdup(PQgetvalue(res, r, i_notnull_name));
+			}
+			else
+			{
+				char	   *default_name;
+
+				/* XXX should match ChooseConstraintName better */
+				default_name = psprintf("%s_%s_not_null", tbinfo->dobj.name,
+										tbinfo->attnames[j]);
+				if (strcmp(default_name,
+						   PQgetvalue(res, r, i_notnull_name)) == 0)
+					tbinfo->notnull_constrs[j] = "";
+				else
+				{
+					tbinfo->notnull_constrs[j] =
+						pstrdup(PQgetvalue(res, r, i_notnull_name));
+				}
+			}
+		}
+	}
 }
 
 /*
@@ -10036,13 +10204,13 @@ dumpCommentExtended(Archive *fout, const char *type,
 	/* Comments are schema not data ... except LO comments are data */
 	if (strcmp(type, "LARGE OBJECT") != 0)
 	{
-		if (dopt->dataOnly)
+		if (!dopt->dumpSchema)
 			return;
 	}
 	else
 	{
 		/* We do dump LO comments in binary-upgrade mode */
-		if (dopt->schemaOnly && !dopt->binary_upgrade)
+		if (!dopt->dumpData && !dopt->binary_upgrade)
 			return;
 	}
 
@@ -10149,7 +10317,7 @@ dumpTableComment(Archive *fout, const TableInfo *tbinfo,
 		return;
 
 	/* Comments are SCHEMA not data */
-	if (dopt->dataOnly)
+	if (!dopt->dumpSchema)
 		return;
 
 	/* Search for comments associated with relation, using table */
@@ -10595,8 +10763,8 @@ dumpNamespace(Archive *fout, const NamespaceInfo *nspinfo)
 	PQExpBuffer delq;
 	char	   *qnspname;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	q = createPQExpBuffer();
@@ -10672,8 +10840,8 @@ dumpExtension(Archive *fout, const ExtensionInfo *extinfo)
 	PQExpBuffer delq;
 	char	   *qextname;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	q = createPQExpBuffer();
@@ -10797,8 +10965,8 @@ dumpType(Archive *fout, const TypeInfo *tyinfo)
 {
 	DumpOptions *dopt = fout->dopt;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	/* Dump out in proper style */
@@ -11908,8 +12076,8 @@ dumpShellType(Archive *fout, const ShellTypeInfo *stinfo)
 	DumpOptions *dopt = fout->dopt;
 	PQExpBuffer q;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	q = createPQExpBuffer();
@@ -11960,8 +12128,8 @@ dumpProcLang(Archive *fout, const ProcLangInfo *plang)
 	FuncInfo   *inlineInfo = NULL;
 	FuncInfo   *validatorInfo = NULL;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	/*
@@ -12168,8 +12336,8 @@ dumpFunc(Archive *fout, const FuncInfo *finfo)
 	int			nconfigitems = 0;
 	const char *keyword;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	query = createPQExpBuffer();
@@ -12365,7 +12533,7 @@ dumpFunc(Archive *fout, const FuncInfo *finfo)
 
 	if (*protrftypes)
 	{
-		Oid		   *typeids = palloc(FUNC_MAX_ARGS * sizeof(Oid));
+		Oid		   *typeids = pg_malloc(FUNC_MAX_ARGS * sizeof(Oid));
 		int			i;
 
 		appendPQExpBufferStr(q, " TRANSFORM ");
@@ -12377,6 +12545,8 @@ dumpFunc(Archive *fout, const FuncInfo *finfo)
 			appendPQExpBuffer(q, "FOR TYPE %s",
 							  getFormattedTypeName(fout, typeids[i], zeroAsNone));
 		}
+
+		free(typeids);
 	}
 
 	if (prokind[0] == PROKIND_WINDOW)
@@ -12560,8 +12730,8 @@ dumpCast(Archive *fout, const CastInfo *cast)
 	const char *sourceType;
 	const char *targetType;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	/* Cannot dump if we don't have the cast function's info */
@@ -12666,8 +12836,8 @@ dumpTransform(Archive *fout, const TransformInfo *transform)
 	char	   *lanname;
 	const char *transformType;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	/* Cannot dump if we don't have the transform functions' info */
@@ -12815,8 +12985,8 @@ dumpOpr(Archive *fout, const OprInfo *oprinfo)
 	char	   *oprregproc;
 	char	   *oprref;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	/*
@@ -13102,8 +13272,8 @@ dumpAccessMethod(Archive *fout, const AccessMethodInfo *aminfo)
 	PQExpBuffer delq;
 	char	   *qamname;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	q = createPQExpBuffer();
@@ -13205,8 +13375,8 @@ dumpOpclass(Archive *fout, const OpclassInfo *opcinfo)
 	bool		needComma;
 	int			i;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	query = createPQExpBuffer();
@@ -13476,8 +13646,8 @@ dumpOpfamily(Archive *fout, const OpfamilyInfo *opfinfo)
 	bool		needComma;
 	int			i;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	query = createPQExpBuffer();
@@ -13683,8 +13853,8 @@ dumpCollation(Archive *fout, const CollInfo *collinfo)
 	const char *colllocale;
 	const char *collicurules;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	query = createPQExpBuffer();
@@ -13937,8 +14107,8 @@ dumpConversion(Archive *fout, const ConvInfo *convinfo)
 	const char *conproc;
 	bool		condefault;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	query = createPQExpBuffer();
@@ -14085,8 +14255,8 @@ dumpAgg(Archive *fout, const AggInfo *agginfo)
 	const char *proparallel;
 	char		defaultfinalmodify;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	query = createPQExpBuffer();
@@ -14415,8 +14585,8 @@ dumpTSParser(Archive *fout, const TSParserInfo *prsinfo)
 	PQExpBuffer delq;
 	char	   *qprsname;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	q = createPQExpBuffer();
@@ -14483,8 +14653,8 @@ dumpTSDictionary(Archive *fout, const TSDictInfo *dictinfo)
 	char	   *nspname;
 	char	   *tmplname;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	q = createPQExpBuffer();
@@ -14559,8 +14729,8 @@ dumpTSTemplate(Archive *fout, const TSTemplateInfo *tmplinfo)
 	PQExpBuffer delq;
 	char	   *qtmplname;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	q = createPQExpBuffer();
@@ -14625,8 +14795,8 @@ dumpTSConfig(Archive *fout, const TSConfigInfo *cfginfo)
 	int			i_tokenname;
 	int			i_dictname;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	q = createPQExpBuffer();
@@ -14737,8 +14907,8 @@ dumpForeignDataWrapper(Archive *fout, const FdwInfo *fdwinfo)
 	PQExpBuffer delq;
 	char	   *qfdwname;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	q = createPQExpBuffer();
@@ -14810,8 +14980,8 @@ dumpForeignServer(Archive *fout, const ForeignServerInfo *srvinfo)
 	char	   *qsrvname;
 	char	   *fdwname;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	q = createPQExpBuffer();
@@ -15001,8 +15171,8 @@ dumpDefaultACL(Archive *fout, const DefaultACLInfo *daclinfo)
 	PQExpBuffer tag;
 	const char *type;
 
-	/* Do nothing in data-only dump, or if we're skipping ACLs */
-	if (dopt->dataOnly || dopt->aclsSkip)
+	/* Do nothing if not dumping schema, or if we're skipping ACLs */
+	if (!dopt->dumpSchema || dopt->aclsSkip)
 		return;
 
 	q = createPQExpBuffer();
@@ -15102,7 +15272,7 @@ dumpACL(Archive *fout, DumpId objDumpId, DumpId altDumpId,
 		return InvalidDumpId;
 
 	/* --data-only skips ACLs *except* large object ACLs */
-	if (dopt->dataOnly && strcmp(type, "LARGE OBJECT") != 0)
+	if (!dopt->dumpSchema && strcmp(type, "LARGE OBJECT") != 0)
 		return InvalidDumpId;
 
 	sql = createPQExpBuffer();
@@ -15231,13 +15401,13 @@ dumpSecLabel(Archive *fout, const char *type, const char *name,
 	 */
 	if (strcmp(type, "LARGE OBJECT") != 0)
 	{
-		if (dopt->dataOnly)
+		if (!dopt->dumpSchema)
 			return;
 	}
 	else
 	{
 		/* We do dump large object security labels in binary-upgrade mode */
-		if (dopt->schemaOnly && !dopt->binary_upgrade)
+		if (!dopt->dumpData && !dopt->binary_upgrade)
 			return;
 	}
 
@@ -15305,7 +15475,7 @@ dumpTableSecLabel(Archive *fout, const TableInfo *tbinfo, const char *reltypenam
 		return;
 
 	/* SecLabel are SCHEMA not data */
-	if (dopt->dataOnly)
+	if (!dopt->dumpSchema)
 		return;
 
 	/* Search for comments associated with relation, using table */
@@ -15544,8 +15714,8 @@ dumpTable(Archive *fout, const TableInfo *tbinfo)
 	DumpId		tableAclDumpId = InvalidDumpId;
 	char	   *namecopy;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	if (tbinfo->dobj.dump & DUMP_COMPONENT_DEFINITION)
@@ -15961,13 +16131,14 @@ dumpTableSchema(Archive *fout, const TableInfo *tbinfo)
 									 !tbinfo->attrdefs[j]->separate);
 
 					/*
-					 * Not Null constraint --- suppress if inherited, except
-					 * if partition, or in binary-upgrade case where that
-					 * won't work.
+					 * Not Null constraint --- print it if it is locally
+					 * defined, or if binary upgrade.  (In the latter case, we
+					 * reset conislocal below.)
 					 */
-					print_notnull = (tbinfo->notnull[j] &&
-									 (!tbinfo->inhNotNull[j] ||
-									  tbinfo->ispartition || dopt->binary_upgrade));
+					print_notnull = (tbinfo->notnull_constrs[j] != NULL &&
+									 (tbinfo->notnull_islocal[j] ||
+									  dopt->binary_upgrade ||
+									  tbinfo->ispartition));
 
 					/*
 					 * Skip column if fully defined by reloftype, except in
@@ -16023,9 +16194,22 @@ dumpTableSchema(Archive *fout, const TableInfo *tbinfo)
 											  tbinfo->attrdefs[j]->adef_expr);
 					}
 
+					print_notnull = (tbinfo->notnull_constrs[j] != NULL &&
+									 (tbinfo->notnull_islocal[j] ||
+									  dopt->binary_upgrade ||
+									  tbinfo->ispartition));
 
 					if (print_notnull)
-						appendPQExpBufferStr(q, " NOT NULL");
+					{
+						if (tbinfo->notnull_constrs[j][0] == '\0')
+							appendPQExpBufferStr(q, " NOT NULL");
+						else
+							appendPQExpBuffer(q, " CONSTRAINT %s NOT NULL",
+											  fmtId(tbinfo->notnull_constrs[j]));
+
+						if (tbinfo->notnull_noinh[j])
+							appendPQExpBufferStr(q, " NO INHERIT");
+					}
 
 					/* Add collation if not default for the type */
 					if (OidIsValid(tbinfo->attcollation[j]))
@@ -16037,6 +16221,38 @@ dumpTableSchema(Archive *fout, const TableInfo *tbinfo)
 							appendPQExpBuffer(q, " COLLATE %s",
 											  fmtQualifiedDumpable(coll));
 					}
+				}
+
+				/*
+				 * On the other hand, if we choose not to print a column
+				 * (likely because it is created by inheritance), but the
+				 * column has a locally-defined not-null constraint, we need
+				 * to dump the constraint as a standalone object.
+				 *
+				 * This syntax isn't SQL-conforming, but if you wanted
+				 * standard output you wouldn't be creating non-standard
+				 * objects to begin with.
+				 */
+				if (!shouldPrintColumn(dopt, tbinfo, j) &&
+					!tbinfo->attisdropped[j] &&
+					tbinfo->notnull_constrs[j] != NULL &&
+					tbinfo->notnull_islocal[j])
+				{
+					/* Format properly if not first attr */
+					if (actual_atts == 0)
+						appendPQExpBufferStr(q, " (");
+					else
+						appendPQExpBufferChar(q, ',');
+					appendPQExpBufferStr(q, "\n    ");
+					actual_atts++;
+
+					if (tbinfo->notnull_constrs[j][0] == '\0')
+						appendPQExpBuffer(q, "NOT NULL %s",
+										  fmtId(tbinfo->attnames[j]));
+					else
+						appendPQExpBuffer(q, "CONSTRAINT %s NOT NULL %s",
+										  tbinfo->notnull_constrs[j],
+										  fmtId(tbinfo->attnames[j]));
 				}
 			}
 
@@ -16203,6 +16419,7 @@ dumpTableSchema(Archive *fout, const TableInfo *tbinfo)
 			 tbinfo->relkind == RELKIND_PARTITIONED_TABLE))
 		{
 			bool		firstitem;
+			bool		firstitem_extra;
 
 			/*
 			 * Drop any dropped columns.  Merge the pg_attribute manipulations
@@ -16279,6 +16496,71 @@ dumpTableSchema(Archive *fout, const TableInfo *tbinfo)
 			}
 			if (!firstitem)
 				appendPQExpBufferStr(q, ");\n");
+
+			/*
+			 * Fix up not-null constraints that come from inheritance.  As
+			 * above, do the pg_constraint manipulations in a single SQL
+			 * command.  (Actually, two in special cases, if we're doing an
+			 * upgrade from < 18).
+			 */
+			firstitem = true;
+			firstitem_extra = true;
+			resetPQExpBuffer(extra);
+			for (j = 0; j < tbinfo->numatts; j++)
+			{
+				/*
+				 * If a not-null constraint comes from inheritance, reset
+				 * conislocal.  The inhcount is fixed by ALTER TABLE INHERIT,
+				 * below.  Special hack: in versions < 18, columns with no
+				 * local definition need their constraint to be matched by
+				 * column number in conkeys instead of by contraint name,
+				 * because the latter is not available.  (We distinguish the
+				 * case because the constraint name is the empty string.)
+				 */
+				if (tbinfo->notnull_constrs[j] != NULL &&
+					!tbinfo->notnull_islocal[j])
+				{
+					if (tbinfo->notnull_constrs[j][0] != '\0')
+					{
+						if (firstitem)
+						{
+							appendPQExpBufferStr(q, "UPDATE pg_catalog.pg_constraint\n"
+												 "SET conislocal = false\n"
+												 "WHERE contype = 'n' AND conrelid = ");
+							appendStringLiteralAH(q, qualrelname, fout);
+							appendPQExpBufferStr(q, "::pg_catalog.regclass AND\n"
+												 "conname IN (");
+							firstitem = false;
+						}
+						else
+							appendPQExpBufferStr(q, ", ");
+						appendStringLiteralAH(q, tbinfo->notnull_constrs[j], fout);
+					}
+					else
+					{
+						if (firstitem_extra)
+						{
+							appendPQExpBufferStr(extra, "UPDATE pg_catalog.pg_constraint\n"
+												 "SET conislocal = false\n"
+												 "WHERE contype = 'n' AND conrelid = ");
+							appendStringLiteralAH(extra, qualrelname, fout);
+							appendPQExpBufferStr(extra, "::pg_catalog.regclass AND\n"
+												 "conkey IN (");
+							firstitem_extra = false;
+						}
+						else
+							appendPQExpBufferStr(extra, ", ");
+						appendPQExpBuffer(extra, "'{%d}'", j + 1);
+					}
+				}
+			}
+			if (!firstitem)
+				appendPQExpBufferStr(q, ");\n");
+			if (!firstitem_extra)
+				appendPQExpBufferStr(extra, ");\n");
+
+			if (extra->len > 0)
+				appendBinaryPQExpBuffer(q, extra->data, extra->len);
 
 			/*
 			 * Add inherited CHECK constraints, if any.
@@ -16412,18 +16694,6 @@ dumpTableSchema(Archive *fout, const TableInfo *tbinfo)
 			/* None of this applies to dropped columns */
 			if (tbinfo->attisdropped[j])
 				continue;
-
-			/*
-			 * If we didn't dump the column definition explicitly above, and
-			 * it is not-null and did not inherit that property from a parent,
-			 * we have to mark it separately.
-			 */
-			if (!shouldPrintColumn(dopt, tbinfo, j) &&
-				tbinfo->notnull[j] && !tbinfo->inhNotNull[j])
-				appendPQExpBuffer(q,
-								  "ALTER %sTABLE ONLY %s ALTER COLUMN %s SET NOT NULL;\n",
-								  foreign, qualrelname,
-								  fmtId(tbinfo->attnames[j]));
 
 			/*
 			 * Dump per-column statistics information. We only issue an ALTER
@@ -16641,8 +16911,8 @@ dumpTableAttach(Archive *fout, const TableAttachInfo *attachinfo)
 	PGresult   *res;
 	char	   *partbound;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	q = createPQExpBuffer();
@@ -16713,8 +16983,8 @@ dumpAttrDef(Archive *fout, const AttrDefInfo *adinfo)
 	char	   *tag;
 	char	   *foreign;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	/* Skip if not "separate"; it was dumped in the table's definition */
@@ -16802,8 +17072,8 @@ dumpIndex(Archive *fout, const IndxInfo *indxinfo)
 	char	   *qindxname;
 	char	   *qqindxname;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	q = createPQExpBuffer();
@@ -16935,8 +17205,8 @@ dumpIndex(Archive *fout, const IndxInfo *indxinfo)
 static void
 dumpIndexAttach(Archive *fout, const IndexAttachInfo *attachinfo)
 {
-	/* Do nothing in data-only dump */
-	if (fout->dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!fout->dopt->dumpSchema)
 		return;
 
 	if (attachinfo->partitionIdx->dobj.dump & DUMP_COMPONENT_DEFINITION)
@@ -16982,8 +17252,8 @@ dumpStatisticsExt(Archive *fout, const StatsExtInfo *statsextinfo)
 	PGresult   *res;
 	char	   *stxdef;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	q = createPQExpBuffer();
@@ -17058,8 +17328,8 @@ dumpConstraint(Archive *fout, const ConstraintInfo *coninfo)
 	char	   *tag = NULL;
 	char	   *foreign;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	q = createPQExpBuffer();
@@ -17408,7 +17678,7 @@ collectSequences(Archive *fout)
 	if (fout->remoteVersion < 100000)
 		return;
 	else if (fout->remoteVersion < 180000 ||
-			 (fout->dopt->schemaOnly && !fout->dopt->sequence_data))
+			 (!fout->dopt->dumpData && !fout->dopt->sequence_data))
 		query = "SELECT seqrelid, format_type(seqtypid, NULL), "
 			"seqstart, seqincrement, "
 			"seqmax, seqmin, "
@@ -17795,8 +18065,8 @@ dumpTrigger(Archive *fout, const TriggerInfo *tginfo)
 	char	   *qtabname;
 	char	   *tag;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	query = createPQExpBuffer();
@@ -17917,8 +18187,8 @@ dumpEventTrigger(Archive *fout, const EventTriggerInfo *evtinfo)
 	PQExpBuffer delqry;
 	char	   *qevtname;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	query = createPQExpBuffer();
@@ -18008,8 +18278,8 @@ dumpRule(Archive *fout, const RuleInfo *rinfo)
 	PGresult   *res;
 	char	   *tag;
 
-	/* Do nothing in data-only dump */
-	if (dopt->dataOnly)
+	/* Do nothing if not dumping schema */
+	if (!dopt->dumpSchema)
 		return;
 
 	/*
@@ -18275,7 +18545,7 @@ processExtensionTables(Archive *fout, ExtensionInfo extinfo[],
 	 * objects for them, ensuring their data will be dumped even though the
 	 * tables themselves won't be.
 	 *
-	 * Note that we create TableDataInfo objects even in schemaOnly mode, ie,
+	 * Note that we create TableDataInfo objects even in schema-only mode, ie,
 	 * user data in a configuration table is treated like schema data. This
 	 * seems appropriate since system data in a config table would get
 	 * reloaded by CREATE EXTENSION.  If the extension is not listed in the

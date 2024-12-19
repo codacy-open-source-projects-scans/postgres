@@ -33,11 +33,9 @@
 #include "catalog/index.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_opfamily_d.h"
-#include "commands/tablecmds.h"
 #include "common/pg_prng.h"
 #include "lib/bloomfilter.h"
 #include "miscadmin.h"
-#include "storage/lmgr.h"
 #include "storage/smgr.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
@@ -721,7 +719,7 @@ bt_check_every_level(Relation rel, Relation heaprel, bool heapkeyspace,
 			 RelationGetRelationName(state->heaprel));
 
 		table_index_build_scan(state->heaprel, state->rel, indexinfo, true, false,
-							   bt_tuple_present_callback, (void *) state, scan);
+							   bt_tuple_present_callback, state, scan);
 
 		ereport(DEBUG1,
 				(errmsg_internal("finished verifying presence of " INT64_FORMAT " tuples from table \"%s\" with bitset %.2f%% set",

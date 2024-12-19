@@ -168,6 +168,12 @@ static Datum ExecJustScanVarVirt(ExprState *state, ExprContext *econtext, bool *
 static Datum ExecJustAssignInnerVarVirt(ExprState *state, ExprContext *econtext, bool *isnull);
 static Datum ExecJustAssignOuterVarVirt(ExprState *state, ExprContext *econtext, bool *isnull);
 static Datum ExecJustAssignScanVarVirt(ExprState *state, ExprContext *econtext, bool *isnull);
+static Datum ExecJustHashInnerVarWithIV(ExprState *state, ExprContext *econtext, bool *isnull);
+static Datum ExecJustHashOuterVar(ExprState *state, ExprContext *econtext, bool *isnull);
+static Datum ExecJustHashInnerVar(ExprState *state, ExprContext *econtext, bool *isnull);
+static Datum ExecJustHashOuterVarVirt(ExprState *state, ExprContext *econtext, bool *isnull);
+static Datum ExecJustHashInnerVarVirt(ExprState *state, ExprContext *econtext, bool *isnull);
+static Datum ExecJustHashOuterVarStrict(ExprState *state, ExprContext *econtext, bool *isnull);
 
 /* execution helper functions */
 static pg_attribute_always_inline void ExecAggPlainTransByVal(AggState *aggstate,
@@ -273,7 +279,51 @@ ExecReadyInterpretedExpr(ExprState *state)
 	 * the full interpreter is a measurable overhead for these, and these
 	 * patterns occur often enough to be worth optimizing.
 	 */
-	if (state->steps_len == 3)
+	if (state->steps_len == 5)
+	{
+		ExprEvalOp	step0 = state->steps[0].opcode;
+		ExprEvalOp	step1 = state->steps[1].opcode;
+		ExprEvalOp	step2 = state->steps[2].opcode;
+		ExprEvalOp	step3 = state->steps[3].opcode;
+
+		if (step0 == EEOP_INNER_FETCHSOME &&
+			step1 == EEOP_HASHDATUM_SET_INITVAL &&
+			step2 == EEOP_INNER_VAR &&
+			step3 == EEOP_HASHDATUM_NEXT32)
+		{
+			state->evalfunc_private = (void *) ExecJustHashInnerVarWithIV;
+			return;
+		}
+	}
+	else if (state->steps_len == 4)
+	{
+		ExprEvalOp	step0 = state->steps[0].opcode;
+		ExprEvalOp	step1 = state->steps[1].opcode;
+		ExprEvalOp	step2 = state->steps[2].opcode;
+
+		if (step0 == EEOP_OUTER_FETCHSOME &&
+			step1 == EEOP_OUTER_VAR &&
+			step2 == EEOP_HASHDATUM_FIRST)
+		{
+			state->evalfunc_private = (void *) ExecJustHashOuterVar;
+			return;
+		}
+		else if (step0 == EEOP_INNER_FETCHSOME &&
+				 step1 == EEOP_INNER_VAR &&
+				 step2 == EEOP_HASHDATUM_FIRST)
+		{
+			state->evalfunc_private = (void *) ExecJustHashInnerVar;
+			return;
+		}
+		else if (step0 == EEOP_OUTER_FETCHSOME &&
+				 step1 == EEOP_OUTER_VAR &&
+				 step2 == EEOP_HASHDATUM_FIRST_STRICT)
+		{
+			state->evalfunc_private = (void *) ExecJustHashOuterVarStrict;
+			return;
+		}
+	}
+	else if (state->steps_len == 3)
 	{
 		ExprEvalOp	step0 = state->steps[0].opcode;
 		ExprEvalOp	step1 = state->steps[1].opcode;
@@ -281,44 +331,56 @@ ExecReadyInterpretedExpr(ExprState *state)
 		if (step0 == EEOP_INNER_FETCHSOME &&
 			step1 == EEOP_INNER_VAR)
 		{
-			state->evalfunc_private = (void *) ExecJustInnerVar;
+			state->evalfunc_private = ExecJustInnerVar;
 			return;
 		}
 		else if (step0 == EEOP_OUTER_FETCHSOME &&
 				 step1 == EEOP_OUTER_VAR)
 		{
-			state->evalfunc_private = (void *) ExecJustOuterVar;
+			state->evalfunc_private = ExecJustOuterVar;
 			return;
 		}
 		else if (step0 == EEOP_SCAN_FETCHSOME &&
 				 step1 == EEOP_SCAN_VAR)
 		{
-			state->evalfunc_private = (void *) ExecJustScanVar;
+			state->evalfunc_private = ExecJustScanVar;
 			return;
 		}
 		else if (step0 == EEOP_INNER_FETCHSOME &&
 				 step1 == EEOP_ASSIGN_INNER_VAR)
 		{
-			state->evalfunc_private = (void *) ExecJustAssignInnerVar;
+			state->evalfunc_private = ExecJustAssignInnerVar;
 			return;
 		}
 		else if (step0 == EEOP_OUTER_FETCHSOME &&
 				 step1 == EEOP_ASSIGN_OUTER_VAR)
 		{
-			state->evalfunc_private = (void *) ExecJustAssignOuterVar;
+			state->evalfunc_private = ExecJustAssignOuterVar;
 			return;
 		}
 		else if (step0 == EEOP_SCAN_FETCHSOME &&
 				 step1 == EEOP_ASSIGN_SCAN_VAR)
 		{
-			state->evalfunc_private = (void *) ExecJustAssignScanVar;
+			state->evalfunc_private = ExecJustAssignScanVar;
 			return;
 		}
 		else if (step0 == EEOP_CASE_TESTVAL &&
 				 step1 == EEOP_FUNCEXPR_STRICT &&
 				 state->steps[0].d.casetest.value)
 		{
-			state->evalfunc_private = (void *) ExecJustApplyFuncToCase;
+			state->evalfunc_private = ExecJustApplyFuncToCase;
+			return;
+		}
+		else if (step0 == EEOP_INNER_VAR &&
+				 step1 == EEOP_HASHDATUM_FIRST)
+		{
+			state->evalfunc_private = (void *) ExecJustHashInnerVarVirt;
+			return;
+		}
+		else if (step0 == EEOP_OUTER_VAR &&
+				 step1 == EEOP_HASHDATUM_FIRST)
+		{
+			state->evalfunc_private = (void *) ExecJustHashOuterVarVirt;
 			return;
 		}
 	}
@@ -328,37 +390,37 @@ ExecReadyInterpretedExpr(ExprState *state)
 
 		if (step0 == EEOP_CONST)
 		{
-			state->evalfunc_private = (void *) ExecJustConst;
+			state->evalfunc_private = ExecJustConst;
 			return;
 		}
 		else if (step0 == EEOP_INNER_VAR)
 		{
-			state->evalfunc_private = (void *) ExecJustInnerVarVirt;
+			state->evalfunc_private = ExecJustInnerVarVirt;
 			return;
 		}
 		else if (step0 == EEOP_OUTER_VAR)
 		{
-			state->evalfunc_private = (void *) ExecJustOuterVarVirt;
+			state->evalfunc_private = ExecJustOuterVarVirt;
 			return;
 		}
 		else if (step0 == EEOP_SCAN_VAR)
 		{
-			state->evalfunc_private = (void *) ExecJustScanVarVirt;
+			state->evalfunc_private = ExecJustScanVarVirt;
 			return;
 		}
 		else if (step0 == EEOP_ASSIGN_INNER_VAR)
 		{
-			state->evalfunc_private = (void *) ExecJustAssignInnerVarVirt;
+			state->evalfunc_private = ExecJustAssignInnerVarVirt;
 			return;
 		}
 		else if (step0 == EEOP_ASSIGN_OUTER_VAR)
 		{
-			state->evalfunc_private = (void *) ExecJustAssignOuterVarVirt;
+			state->evalfunc_private = ExecJustAssignOuterVarVirt;
 			return;
 		}
 		else if (step0 == EEOP_ASSIGN_SCAN_VAR)
 		{
-			state->evalfunc_private = (void *) ExecJustAssignScanVarVirt;
+			state->evalfunc_private = ExecJustAssignScanVarVirt;
 			return;
 		}
 	}
@@ -379,7 +441,7 @@ ExecReadyInterpretedExpr(ExprState *state)
 	state->flags |= EEO_FLAG_DIRECT_THREADED;
 #endif							/* EEO_USE_COMPUTED_GOTO */
 
-	state->evalfunc_private = (void *) ExecInterpExpr;
+	state->evalfunc_private = ExecInterpExpr;
 }
 
 
@@ -1308,11 +1370,23 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			 * The arguments are already evaluated into fcinfo->args.
 			 */
 			FunctionCallInfo fcinfo = op->d.func.fcinfo_data;
+			Datum		save_arg0 = fcinfo->args[0].value;
 
 			/* if either argument is NULL they can't be equal */
 			if (!fcinfo->args[0].isnull && !fcinfo->args[1].isnull)
 			{
 				Datum		result;
+
+				/*
+				 * If first argument is of varlena type, it might be an
+				 * expanded datum.  We need to ensure that the value passed to
+				 * the comparison function is a read-only pointer.  However,
+				 * if we end by returning the first argument, that will be the
+				 * original read-write pointer if it was read-write.
+				 */
+				if (op->d.func.make_ro)
+					fcinfo->args[0].value =
+						MakeExpandedObjectReadOnlyInternal(save_arg0);
 
 				fcinfo->isnull = false;
 				result = op->d.func.fn_addr(fcinfo);
@@ -1328,7 +1402,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			}
 
 			/* Arguments aren't equal, so return the first one */
-			*op->resvalue = fcinfo->args[0].value;
+			*op->resvalue = save_arg0;
 			*op->resnull = fcinfo->args[0].isnull;
 
 			EEO_NEXT();
@@ -2214,7 +2288,7 @@ get_cached_rowtype(Oid type_id, int32 typmod,
 						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 						 errmsg("type %s is not composite",
 								format_type_be(type_id))));
-			rowcache->cacheptr = (void *) typentry;
+			rowcache->cacheptr = typentry;
 			rowcache->tupdesc_id = typentry->tupDesc_identifier;
 			if (changed)
 				*changed = true;
@@ -2239,7 +2313,7 @@ get_cached_rowtype(Oid type_id, int32 typmod,
 			tupDesc = lookup_rowtype_tupdesc(type_id, typmod);
 			/* Drop pin acquired by lookup_rowtype_tupdesc */
 			ReleaseTupleDesc(tupDesc);
-			rowcache->cacheptr = (void *) tupDesc;
+			rowcache->cacheptr = tupDesc;
 			rowcache->tupdesc_id = 0;	/* not a valid value for non-RECORD */
 			if (changed)
 				*changed = true;
@@ -2470,6 +2544,148 @@ static Datum
 ExecJustAssignScanVarVirt(ExprState *state, ExprContext *econtext, bool *isnull)
 {
 	return ExecJustAssignVarVirtImpl(state, econtext->ecxt_scantuple, isnull);
+}
+
+/*
+ * implementation for hashing an inner Var, seeding with an initial value.
+ */
+static Datum
+ExecJustHashInnerVarWithIV(ExprState *state, ExprContext *econtext,
+						   bool *isnull)
+{
+	ExprEvalStep *fetchop = &state->steps[0];
+	ExprEvalStep *setivop = &state->steps[1];
+	ExprEvalStep *innervar = &state->steps[2];
+	ExprEvalStep *hashop = &state->steps[3];
+	FunctionCallInfo fcinfo = hashop->d.hashdatum.fcinfo_data;
+	int			attnum = innervar->d.var.attnum;
+	uint32		hashkey;
+
+	CheckOpSlotCompatibility(fetchop, econtext->ecxt_innertuple);
+	slot_getsomeattrs(econtext->ecxt_innertuple, fetchop->d.fetch.last_var);
+
+	fcinfo->args[0].value = econtext->ecxt_innertuple->tts_values[attnum];
+	fcinfo->args[0].isnull = econtext->ecxt_innertuple->tts_isnull[attnum];
+
+	hashkey = DatumGetUInt32(setivop->d.hashdatum_initvalue.init_value);
+	hashkey = pg_rotate_left32(hashkey, 1);
+
+	if (!fcinfo->args[0].isnull)
+	{
+		uint32		hashvalue;
+
+		hashvalue = DatumGetUInt32(hashop->d.hashdatum.fn_addr(fcinfo));
+		hashkey = hashkey ^ hashvalue;
+	}
+
+	*isnull = false;
+	return UInt32GetDatum(hashkey);
+}
+
+/* implementation of ExecJustHash(Inner|Outer)Var */
+static pg_attribute_always_inline Datum
+ExecJustHashVarImpl(ExprState *state, TupleTableSlot *slot, bool *isnull)
+{
+	ExprEvalStep *fetchop = &state->steps[0];
+	ExprEvalStep *var = &state->steps[1];
+	ExprEvalStep *hashop = &state->steps[2];
+	FunctionCallInfo fcinfo = hashop->d.hashdatum.fcinfo_data;
+	int			attnum = var->d.var.attnum;
+
+	CheckOpSlotCompatibility(fetchop, slot);
+	slot_getsomeattrs(slot, fetchop->d.fetch.last_var);
+
+	fcinfo->args[0].value = slot->tts_values[attnum];
+	fcinfo->args[0].isnull = slot->tts_isnull[attnum];
+
+	*isnull = false;
+
+	if (!fcinfo->args[0].isnull)
+		return DatumGetUInt32(hashop->d.hashdatum.fn_addr(fcinfo));
+	else
+		return (Datum) 0;
+}
+
+/* implementation for hashing an outer Var */
+static Datum
+ExecJustHashOuterVar(ExprState *state, ExprContext *econtext, bool *isnull)
+{
+	return ExecJustHashVarImpl(state, econtext->ecxt_outertuple, isnull);
+}
+
+/* implementation for hashing an inner Var */
+static Datum
+ExecJustHashInnerVar(ExprState *state, ExprContext *econtext, bool *isnull)
+{
+	return ExecJustHashVarImpl(state, econtext->ecxt_innertuple, isnull);
+}
+
+/* implementation of ExecJustHash(Inner|Outer)VarVirt */
+static pg_attribute_always_inline Datum
+ExecJustHashVarVirtImpl(ExprState *state, TupleTableSlot *slot, bool *isnull)
+{
+	ExprEvalStep *var = &state->steps[0];
+	ExprEvalStep *hashop = &state->steps[1];
+	FunctionCallInfo fcinfo = hashop->d.hashdatum.fcinfo_data;
+	int			attnum = var->d.var.attnum;
+
+	fcinfo->args[0].value = slot->tts_values[attnum];
+	fcinfo->args[0].isnull = slot->tts_isnull[attnum];
+
+	*isnull = false;
+
+	if (!fcinfo->args[0].isnull)
+		return DatumGetUInt32(hashop->d.hashdatum.fn_addr(fcinfo));
+	else
+		return (Datum) 0;
+}
+
+/* Like ExecJustHashInnerVar, optimized for virtual slots */
+static Datum
+ExecJustHashInnerVarVirt(ExprState *state, ExprContext *econtext,
+						 bool *isnull)
+{
+	return ExecJustHashVarVirtImpl(state, econtext->ecxt_innertuple, isnull);
+}
+
+/* Like ExecJustHashOuterVar, optimized for virtual slots */
+static Datum
+ExecJustHashOuterVarVirt(ExprState *state, ExprContext *econtext,
+						 bool *isnull)
+{
+	return ExecJustHashVarVirtImpl(state, econtext->ecxt_outertuple, isnull);
+}
+
+/*
+ * implementation for hashing an outer Var.  Returns NULL on NULL input.
+ */
+static Datum
+ExecJustHashOuterVarStrict(ExprState *state, ExprContext *econtext,
+						   bool *isnull)
+{
+	ExprEvalStep *fetchop = &state->steps[0];
+	ExprEvalStep *var = &state->steps[1];
+	ExprEvalStep *hashop = &state->steps[2];
+	FunctionCallInfo fcinfo = hashop->d.hashdatum.fcinfo_data;
+	int			attnum = var->d.var.attnum;
+
+	CheckOpSlotCompatibility(fetchop, econtext->ecxt_outertuple);
+	slot_getsomeattrs(econtext->ecxt_outertuple, fetchop->d.fetch.last_var);
+
+	fcinfo->args[0].value = econtext->ecxt_outertuple->tts_values[attnum];
+	fcinfo->args[0].isnull = econtext->ecxt_outertuple->tts_isnull[attnum];
+
+	if (!fcinfo->args[0].isnull)
+	{
+		*isnull = false;
+		return DatumGetUInt32(hashop->d.hashdatum.fn_addr(fcinfo));
+	}
+	else
+	{
+		/* return NULL on NULL input */
+		*isnull = true;
+		return (Datum) 0;
+	}
 }
 
 #if defined(EEO_USE_COMPUTED_GOTO)
@@ -4686,9 +4902,9 @@ ExecEvalJsonCoercion(ExprState *state, ExprEvalStep *op,
 
 	/*
 	 * Prepare to call json_populate_type() to coerce the boolean result of
-	 * JSON_EXISTS_OP to the target type.  If the the target type is integer
-	 * or a domain over integer, call the boolean-to-integer cast function
-	 * instead, because the integer's input function (which is what
+	 * JSON_EXISTS_OP to the target type.  If the target type is integer or a
+	 * domain over integer, call the boolean-to-integer cast function instead,
+	 * because the integer's input function (which is what
 	 * json_populate_type() calls to coerce to scalar target types) doesn't
 	 * accept boolean literals as valid input.  We only have a special case
 	 * for integer and domains thereof as it seems common to use those types

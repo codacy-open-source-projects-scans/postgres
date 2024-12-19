@@ -17,11 +17,9 @@
 #include "access/htup_details.h"
 #include "access/sysattr.h"
 #include "access/table.h"
-#include "catalog/pg_class.h"
 #include "catalog/pg_opfamily.h"
 #include "commands/defrem.h"
 #include "commands/explain.h"
-#include "commands/vacuum.h"
 #include "executor/execAsync.h"
 #include "foreign/fdwapi.h"
 #include "funcapi.h"
@@ -29,7 +27,6 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/appendinfo.h"
-#include "optimizer/clauses.h"
 #include "optimizer/cost.h"
 #include "optimizer/inherit.h"
 #include "optimizer/optimizer.h"
@@ -633,7 +630,7 @@ postgresGetForeignRelSize(PlannerInfo *root,
 	 * functions.
 	 */
 	fpinfo = (PgFdwRelationInfo *) palloc0(sizeof(PgFdwRelationInfo));
-	baserel->fdw_private = (void *) fpinfo;
+	baserel->fdw_private = fpinfo;
 
 	/* Base foreign tables need to be pushed down always. */
 	fpinfo->pushdown_safe = true;
@@ -1135,7 +1132,7 @@ postgresGetForeignPaths(PlannerInfo *root,
 			clauses = generate_implied_equalities_for_column(root,
 															 baserel,
 															 ec_member_matches_foreign,
-															 (void *) &arg,
+															 &arg,
 															 baserel->lateral_referencers);
 
 			/* Done if there are no more expressions in the foreign rel */
@@ -1517,7 +1514,7 @@ postgresBeginForeignScan(ForeignScanState *node, int eflags)
 	 * We'll save private state in node->fdw_state.
 	 */
 	fsstate = (PgFdwScanState *) palloc0(sizeof(PgFdwScanState));
-	node->fdw_state = (void *) fsstate;
+	node->fdw_state = fsstate;
 
 	/*
 	 * Identify which user to do the remote access as.  This should match what
@@ -2667,7 +2664,7 @@ postgresBeginDirectModify(ForeignScanState *node, int eflags)
 	 * We'll save private state in node->fdw_state.
 	 */
 	dmstate = (PgFdwDirectModifyState *) palloc0(sizeof(PgFdwDirectModifyState));
-	node->fdw_state = (void *) dmstate;
+	node->fdw_state = dmstate;
 
 	/*
 	 * Identify which user to do the remote access as.  This should match what
@@ -7621,7 +7618,7 @@ make_tuple_from_result_row(PGresult *res,
 	errpos.rel = rel;
 	errpos.fsstate = fsstate;
 	errcallback.callback = conversion_error_callback;
-	errcallback.arg = (void *) &errpos;
+	errcallback.arg = &errpos;
 	errcallback.previous = error_context_stack;
 	error_context_stack = &errcallback;
 

@@ -30,7 +30,6 @@
 #include "common/logging.h"
 #include "common/string.h"
 #include "copy.h"
-#include "crosstabview.h"
 #include "describe.h"
 #include "fe_utils/cancel.h"
 #include "fe_utils/print.h"
@@ -38,10 +37,8 @@
 #include "help.h"
 #include "input.h"
 #include "large_obj.h"
-#include "libpq-fe.h"
 #include "libpq/pqcomm.h"
 #include "mainloop.h"
-#include "portability/instr_time.h"
 #include "pqexpbuffer.h"
 #include "psqlscanslash.h"
 #include "settings.h"
@@ -4085,6 +4082,7 @@ SyncVariables(void)
 	pset.sversion = PQserverVersion(pset.db);
 
 	SetVariable(pset.vars, "DBNAME", PQdb(pset.db));
+	SetVariable(pset.vars, "SERVICE", PQservice(pset.db));
 	SetVariable(pset.vars, "USER", PQuser(pset.db));
 	SetVariable(pset.vars, "HOST", PQhost(pset.db));
 	SetVariable(pset.vars, "PORT", PQport(pset.db));
@@ -4118,6 +4116,7 @@ void
 UnsyncVariables(void)
 {
 	SetVariable(pset.vars, "DBNAME", NULL);
+	SetVariable(pset.vars, "SERVICE", NULL);
 	SetVariable(pset.vars, "USER", NULL);
 	SetVariable(pset.vars, "HOST", NULL);
 	SetVariable(pset.vars, "PORT", NULL);

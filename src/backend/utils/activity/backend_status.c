@@ -16,11 +16,9 @@
 #include "miscadmin.h"
 #include "pg_trace.h"
 #include "pgstat.h"
-#include "port/atomics.h"		/* for memory barriers */
 #include "storage/ipc.h"
 #include "storage/proc.h"		/* for MyProc */
 #include "storage/procarray.h"
-#include "storage/sinvaladt.h"
 #include "utils/ascii.h"
 #include "utils/guc.h"			/* for application_name */
 #include "utils/memutils.h"
@@ -1036,6 +1034,31 @@ pgstat_get_my_query_id(void)
 	 * backend which means that there won't be concurrent writes.
 	 */
 	return MyBEEntry->st_query_id;
+}
+
+/* ----------
+ * pgstat_get_backend_type_by_proc_number() -
+ *
+ *	Return the type of the backend with the specified ProcNumber.  This looks
+ *	directly at the BackendStatusArray, so the return value may be out of date.
+ *	The only current use of this function is in pg_signal_backend(), which is
+ *	inherently racy, so we don't worry too much about this.
+ *
+ *	It is the caller's responsibility to use this wisely; at minimum, callers
+ *	should ensure that procNumber is valid and perform the required permissions
+ *	checks.
+ * ----------
+ */
+BackendType
+pgstat_get_backend_type_by_proc_number(ProcNumber procNumber)
+{
+	volatile PgBackendStatus *status = &BackendStatusArray[procNumber];
+
+	/*
+	 * We bypass the changecount mechanism since fetching and storing an int
+	 * is almost certainly atomic.
+	 */
+	return status->st_backendType;
 }
 
 /* ----------

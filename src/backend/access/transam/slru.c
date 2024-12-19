@@ -70,7 +70,7 @@
 #include "pgstat.h"
 #include "storage/fd.h"
 #include "storage/shmem.h"
-#include "utils/guc_hooks.h"
+#include "utils/guc.h"
 
 /*
  * Converts segment number to the filename of the segment.
@@ -358,7 +358,7 @@ check_slru_buffers(const char *name, int *newval)
 	if (*newval % SLRU_BANK_SIZE == 0)
 		return true;
 
-	GUC_check_errdetail("\"%s\" must be a multiple of %d", name,
+	GUC_check_errdetail("\"%s\" must be a multiple of %d.", name,
 						SLRU_BANK_SIZE);
 	return false;
 }

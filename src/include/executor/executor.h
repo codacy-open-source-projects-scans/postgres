@@ -78,8 +78,7 @@ extern PGDLLIMPORT ExecutorStart_hook_type ExecutorStart_hook;
 /* Hook for plugins to get control in ExecutorRun() */
 typedef void (*ExecutorRun_hook_type) (QueryDesc *queryDesc,
 									   ScanDirection direction,
-									   uint64 count,
-									   bool execute_once);
+									   uint64 count);
 extern PGDLLIMPORT ExecutorRun_hook_type ExecutorRun_hook;
 
 /* Hook for plugins to get control in ExecutorFinish() */
@@ -141,6 +140,7 @@ extern TupleHashTable BuildTupleHashTable(PlanState *parent,
 										  MemoryContext tempcxt, bool use_variable_hash_iv);
 extern TupleHashTable BuildTupleHashTableExt(PlanState *parent,
 											 TupleDesc inputDesc,
+											 const TupleTableSlotOps *inputOps,
 											 int numCols, AttrNumber *keyColIdx,
 											 const Oid *eqfuncoids,
 											 FmgrInfo *hashfunctions,
@@ -160,7 +160,7 @@ extern TupleHashEntry LookupTupleHashEntryHash(TupleHashTable hashtable,
 extern TupleHashEntry FindTupleHashEntry(TupleHashTable hashtable,
 										 TupleTableSlot *slot,
 										 ExprState *eqcomp,
-										 FmgrInfo *hashfunctions);
+										 ExprState *hashexpr);
 extern void ResetTupleHashTable(TupleHashTable hashtable);
 
 /*
@@ -200,9 +200,9 @@ ExecGetJunkAttribute(TupleTableSlot *slot, AttrNumber attno, bool *isNull)
 extern void ExecutorStart(QueryDesc *queryDesc, int eflags);
 extern void standard_ExecutorStart(QueryDesc *queryDesc, int eflags);
 extern void ExecutorRun(QueryDesc *queryDesc,
-						ScanDirection direction, uint64 count, bool execute_once);
+						ScanDirection direction, uint64 count);
 extern void standard_ExecutorRun(QueryDesc *queryDesc,
-								 ScanDirection direction, uint64 count, bool execute_once);
+								 ScanDirection direction, uint64 count);
 extern void ExecutorFinish(QueryDesc *queryDesc);
 extern void standard_ExecutorFinish(QueryDesc *queryDesc);
 extern void ExecutorEnd(QueryDesc *queryDesc);
@@ -289,6 +289,14 @@ extern ExprState *ExecInitCheck(List *qual, PlanState *parent);
 extern List *ExecInitExprList(List *nodes, PlanState *parent);
 extern ExprState *ExecBuildAggTrans(AggState *aggstate, struct AggStatePerPhaseData *phase,
 									bool doSort, bool doHash, bool nullcheck);
+extern ExprState *ExecBuildHash32FromAttrs(TupleDesc desc,
+										   const TupleTableSlotOps *ops,
+										   FmgrInfo *hashfunctions,
+										   Oid *collations,
+										   int numCols,
+										   AttrNumber *keyColIdx,
+										   PlanState *parent,
+										   uint32 init_value);
 extern ExprState *ExecBuildHash32Expr(TupleDesc desc,
 									  const TupleTableSlotOps *ops,
 									  const Oid *hashfunc_oids,
@@ -658,7 +666,7 @@ extern void check_exclusion_constraint(Relation heap, Relation index,
 /*
  * prototypes from functions in execReplication.c
  */
-extern StrategyNumber get_equal_strategy_number_for_am(Oid am);
+extern StrategyNumber get_equal_strategy_number(Oid opclass);
 extern bool RelationFindReplTupleByIndex(Relation rel, Oid idxoid,
 										 LockTupleMode lockmode,
 										 TupleTableSlot *searchslot,

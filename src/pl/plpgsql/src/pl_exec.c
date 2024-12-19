@@ -19,11 +19,9 @@
 
 #include "access/detoast.h"
 #include "access/htup_details.h"
-#include "access/transam.h"
 #include "access/tupconvert.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
-#include "commands/defrem.h"
 #include "executor/execExpr.h"
 #include "executor/spi.h"
 #include "executor/tstoreReceiver.h"
@@ -34,13 +32,10 @@
 #include "optimizer/optimizer.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_type.h"
-#include "parser/scansup.h"
 #include "plpgsql.h"
 #include "storage/proc.h"
 #include "tcop/cmdtag.h"
 #include "tcop/pquery.h"
-#include "tcop/tcopprot.h"
-#include "tcop/utility.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
@@ -868,7 +863,7 @@ coerce_function_result_tuple(PLpgSQL_execstate *estate, TupleDesc tupdesc)
 
 			resultsize = EOH_get_flat_size(&erh->hdr);
 			tuphdr = (HeapTupleHeader) SPI_palloc(resultsize);
-			EOH_flatten_into(&erh->hdr, (void *) tuphdr, resultsize);
+			EOH_flatten_into(&erh->hdr, tuphdr, resultsize);
 			HeapTupleHeaderSetTypeId(tuphdr, tupdesc->tdtypeid);
 			HeapTupleHeaderSetTypMod(tuphdr, tupdesc->tdtypmod);
 			estate->retval = PointerGetDatum(tuphdr);
@@ -4031,7 +4026,7 @@ plpgsql_estate_setup(PLpgSQL_execstate *estate,
 	/* initialize our ParamListInfo with appropriate hook functions */
 	estate->paramLI = makeParamList(0);
 	estate->paramLI->paramFetch = plpgsql_param_fetch;
-	estate->paramLI->paramFetchArg = (void *) estate;
+	estate->paramLI->paramFetchArg = estate;
 	estate->paramLI->paramCompile = plpgsql_param_compile;
 	estate->paramLI->paramCompileArg = NULL;	/* not needed */
 	estate->paramLI->parserSetup = (ParserSetupHook) plpgsql_parser_setup;
@@ -4190,7 +4185,7 @@ exec_prepare_plan(PLpgSQL_execstate *estate,
 	 */
 	memset(&options, 0, sizeof(options));
 	options.parserSetup = (ParserSetupHook) plpgsql_parser_setup;
-	options.parserSetupArg = (void *) expr;
+	options.parserSetupArg = expr;
 	options.parseMode = expr->parseMode;
 	options.cursorOptions = cursorOptions;
 	plan = SPI_prepare_extended(expr->query, &options);
@@ -6177,7 +6172,7 @@ exec_eval_simple_expr(PLpgSQL_execstate *estate,
 	 * possibly setting ecxt_param_list_info to NULL; we've already forced use
 	 * of a generic plan.
 	 */
-	paramLI->parserSetupArg = (void *) expr;
+	paramLI->parserSetupArg = expr;
 	econtext->ecxt_param_list_info = paramLI;
 
 	/*
@@ -6286,7 +6281,7 @@ setup_param_list(PLpgSQL_execstate *estate, PLpgSQL_expr *expr)
 		 * Callers must save and restore parserSetupArg if there is any chance
 		 * that they are interrupting an active use of parameters.
 		 */
-		paramLI->parserSetupArg = (void *) expr;
+		paramLI->parserSetupArg = expr;
 
 		/*
 		 * Also make sure this is set before parser hooks need it.  There is

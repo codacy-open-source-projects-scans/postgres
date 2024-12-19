@@ -55,9 +55,7 @@
 #include "commands/dbcommands.h"
 #include "libpq/pqsignal.h"
 #include "pgstat.h"
-#include "postmaster/fork_process.h"
 #include "postmaster/interrupt.h"
-#include "postmaster/postmaster.h"
 #include "replication/logical.h"
 #include "replication/slotsync.h"
 #include "replication/snapbuild.h"
@@ -1517,7 +1515,7 @@ update_synced_slots_inactive_since(void)
 	 * correctly interpret the inactive_since if the standby gets promoted
 	 * without a restart. We don't want the slots to appear inactive for a
 	 * long time after promotion if they haven't been synchronized recently.
-	 * Whoever acquires the slot i.e.makes the slot active will reset it.
+	 * Whoever acquires the slot, i.e., makes the slot active, will reset it.
 	 */
 	if (!StandbyMode)
 		return;

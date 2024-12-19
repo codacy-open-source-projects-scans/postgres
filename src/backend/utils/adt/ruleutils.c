@@ -2516,6 +2516,28 @@ pg_get_constraintdef_worker(Oid constraintId, bool fullCommand,
 								 conForm->connoinherit ? " NO INHERIT" : "");
 				break;
 			}
+		case CONSTRAINT_NOTNULL:
+			{
+				if (conForm->conrelid)
+				{
+					AttrNumber	attnum;
+
+					attnum = extractNotNullColumn(tup);
+
+					appendStringInfo(&buf, "NOT NULL %s",
+									 quote_identifier(get_attname(conForm->conrelid,
+																  attnum, false)));
+					if (((Form_pg_constraint) GETSTRUCT(tup))->connoinherit)
+						appendStringInfoString(&buf, " NO INHERIT");
+				}
+				else if (conForm->contypid)
+				{
+					/* conkey is null for domain not-null constraints */
+					appendStringInfoString(&buf, "NOT NULL");
+				}
+				break;
+			}
+
 		case CONSTRAINT_TRIGGER:
 
 			/*
@@ -3751,9 +3773,8 @@ deparse_context_for_plan_tree(PlannedStmt *pstmt, List *rtable_names)
 		dpns->appendrels = NULL;	/* don't need it */
 
 	/*
-	 * Set up column name aliases.  We will get rather bogus results for join
-	 * RTEs, but that doesn't matter because plan trees don't contain any join
-	 * alias Vars.
+	 * Set up column name aliases, ignoring any join RTEs; they don't matter
+	 * because plan trees don't contain any join alias Vars.
 	 */
 	set_simple_column_names(dpns);
 
@@ -4045,8 +4066,10 @@ set_deparse_for_query(deparse_namespace *dpns, Query *query,
  *
  * This handles EXPLAIN and cases where we only have relation RTEs.  Without
  * a join tree, we can't do anything smart about join RTEs, but we don't
- * need to (note that EXPLAIN should never see join alias Vars anyway).
- * If we do hit a join RTE we'll just process it like a non-table base RTE.
+ * need to, because EXPLAIN should never see join alias Vars anyway.
+ * If we find a join RTE we'll just skip it, leaving its deparse_columns
+ * struct all-zero.  If somehow we try to deparse a join alias Var, we'll
+ * error out cleanly because the struct's num_cols will be zero.
  */
 static void
 set_simple_column_names(deparse_namespace *dpns)
@@ -4060,13 +4083,14 @@ set_simple_column_names(deparse_namespace *dpns)
 		dpns->rtable_columns = lappend(dpns->rtable_columns,
 									   palloc0(sizeof(deparse_columns)));
 
-	/* Assign unique column aliases within each RTE */
+	/* Assign unique column aliases within each non-join RTE */
 	forboth(lc, dpns->rtable, lc2, dpns->rtable_columns)
 	{
 		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
 		deparse_columns *colinfo = (deparse_columns *) lfirst(lc2);
 
-		set_relation_column_names(dpns, rte, colinfo);
+		if (rte->rtekind != RTE_JOIN)
+			set_relation_column_names(dpns, rte, colinfo);
 	}
 }
 
@@ -6331,13 +6355,19 @@ get_setop_query(Node *setOp, Query *query, deparse_context *context)
 		Query	   *subquery = rte->subquery;
 
 		Assert(subquery != NULL);
-		Assert(subquery->setOperations == NULL);
-		/* Need parens if WITH, ORDER BY, FOR UPDATE, or LIMIT; see gram.y */
+
+		/*
+		 * We need parens if WITH, ORDER BY, FOR UPDATE, or LIMIT; see gram.y.
+		 * Also add parens if the leaf query contains its own set operations.
+		 * (That shouldn't happen unless one of the other clauses is also
+		 * present, see transformSetOperationTree; but let's be safe.)
+		 */
 		need_paren = (subquery->cteList ||
 					  subquery->sortClause ||
 					  subquery->rowMarks ||
 					  subquery->limitOffset ||
-					  subquery->limitCount);
+					  subquery->limitCount ||
+					  subquery->setOperations);
 		if (need_paren)
 			appendStringInfoChar(buf, '(');
 		get_query_def(subquery, buf, context->namespaces,

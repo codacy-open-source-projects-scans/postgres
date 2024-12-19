@@ -288,7 +288,12 @@ extern PGDLLIMPORT int VacuumCostBalance;
 extern PGDLLIMPORT bool VacuumCostActive;
 
 
-/* in tcop/postgres.c */
+/* in utils/misc/stack_depth.c */
+
+extern PGDLLIMPORT int max_stack_depth;
+
+/* Required daylight between max_stack_depth and the kernel limit, in bytes */
+#define STACK_DEPTH_SLOP (512 * 1024L)
 
 typedef char *pg_stack_base_t;
 
@@ -296,6 +301,7 @@ extern pg_stack_base_t set_stack_base(void);
 extern void restore_stack_base(pg_stack_base_t base);
 extern void check_stack_depth(void);
 extern bool stack_is_too_deep(void);
+extern long get_stack_depth_rlimit(void);
 
 /* in tcop/utility.c */
 extern void PreventCommandIfReadOnly(const char *cmdname);
@@ -333,6 +339,7 @@ typedef enum BackendType
 
 	/* Backends and other backend-like processes */
 	B_BACKEND,
+	B_DEAD_END_BACKEND,
 	B_AUTOVAC_LAUNCHER,
 	B_AUTOVAC_WORKER,
 	B_BG_WORKER,
@@ -392,7 +399,9 @@ extern char *GetUserNameFromId(Oid roleid, bool noerr);
 extern Oid	GetUserId(void);
 extern Oid	GetOuterUserId(void);
 extern Oid	GetSessionUserId(void);
+extern bool GetSessionUserIsSuperuser(void);
 extern Oid	GetAuthenticatedUserId(void);
+extern void SetAuthenticatedUserId(Oid userid);
 extern void GetUserIdAndSecContext(Oid *userid, int *sec_context);
 extern void SetUserIdAndSecContext(Oid userid, int sec_context);
 extern bool InLocalUserIdChange(void);
