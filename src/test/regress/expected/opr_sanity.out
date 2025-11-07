@@ -875,6 +875,9 @@ uuid_extract_timestamp(uuid)
 uuid_extract_version(uuid)
 crc32(bytea)
 crc32c(bytea)
+bytea(smallint)
+bytea(integer)
+bytea(bigint)
 bytea_larger(bytea,bytea)
 bytea_smaller(bytea,bytea)
 -- Check that functions without argument are not marked as leakproof.
@@ -1467,7 +1470,7 @@ WHERE aggfnoid = 0 OR aggtransfn = 0 OR
     (aggkind = 'n' AND aggnumdirectargs > 0) OR
     aggfinalmodify NOT IN ('r', 's', 'w') OR
     aggmfinalmodify NOT IN ('r', 's', 'w') OR
-    aggtranstype = 0 OR aggtransspace < 0 OR aggmtransspace < 0;
+    aggtranstype = 0 OR aggmtransspace < 0;
  ctid | aggfnoid 
 ------+----------
 (0 rows)

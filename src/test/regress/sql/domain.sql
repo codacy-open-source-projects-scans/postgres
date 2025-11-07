@@ -602,6 +602,9 @@ insert into domain_test values (1, 2);
 -- should fail
 alter table domain_test add column c str_domain;
 
+-- disallow duplicated not-null constraints
+create domain int_domain1 as int constraint nn1 not null constraint nn2 not null;
+
 create domain str_domain2 as text check (value <> 'foo') default 'foo';
 
 -- should fail
@@ -880,6 +883,16 @@ select pg_basetype(1);  -- expect NULL not error
 
 drop domain mytext cascade;
 
+--
+-- Explicit enforceability specification not allowed
+---
+CREATE DOMAIN constraint_enforced_dom AS int CONSTRAINT the_constraint CHECK (value > 0) ENFORCED;
+CREATE DOMAIN constraint_not_enforced_dom AS int CONSTRAINT the_constraint CHECK (value > 0) NOT ENFORCED;
+CREATE DOMAIN constraint_enforced_dom AS int;
+-- XXX misleading error messages
+ALTER DOMAIN constraint_enforced_dom ADD CONSTRAINT the_constraint CHECK (value > 0) ENFORCED;
+ALTER DOMAIN constraint_enforced_dom ADD CONSTRAINT the_constraint CHECK (value > 0) NOT ENFORCED;
+DROP DOMAIN constraint_enforced_dom;
 
 --
 -- Information schema

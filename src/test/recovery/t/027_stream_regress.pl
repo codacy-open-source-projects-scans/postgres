@@ -1,5 +1,5 @@
 
-# Copyright (c) 2024, PostgreSQL Global Development Group
+# Copyright (c) 2024-2025, PostgreSQL Global Development Group
 
 # Run the standard regression tests with streaming replication
 use strict;
@@ -81,7 +81,14 @@ my $rc =
 	  . "--max-concurrent-tests=20 "
 	  . "--inputdir=../regress "
 	  . "--outputdir=\"$outputdir\"");
-if ($rc != 0)
+
+# Regression diffs are only meaningful if both the primary and the standby
+# are still alive after a regression test failure.  A crash would cause a
+# useless increase in the log quantity, mostly filled with information
+# related to queries that could not run.
+my $primary_alive = $node_primary->is_alive;
+my $standby_alive = $node_standby_1->is_alive;
+if ($rc != 0 && $primary_alive && $standby_alive)
 {
 	# Dump out the regression diffs file, if there is one
 	my $diffs = "$outputdir/regression.diffs";
@@ -93,6 +100,8 @@ if ($rc != 0)
 	}
 }
 is($rc, 0, 'regression tests pass');
+is($primary_alive, 1, 'primary alive after regression test run');
+is($standby_alive, 1, 'standby alive after regression test run');
 
 # Clobber all sequences with their next value, so that we don't have
 # differences between nodes due to caching.
@@ -105,19 +114,26 @@ $node_primary->wait_for_replay_catchup($node_standby_1);
 # Perform a logical dump of primary and standby, and check that they match
 command_ok(
 	[
-		'pg_dumpall', '-f', $outputdir . '/primary.dump',
-		'--no-sync', '-p', $node_primary->port,
-		'--no-unlogged-table-data'    # if unlogged, standby has schema only
+		'pg_dumpall',
+		'--file' => $outputdir . '/primary.dump',
+		'--no-sync', '--no-statistics',
+		'--restrict-key' => 'test',
+		'--port' => $node_primary->port,
+		'--no-unlogged-table-data',    # if unlogged, standby has schema only
 	],
 	'dump primary server');
 command_ok(
 	[
-		'pg_dumpall', '-f', $outputdir . '/standby.dump',
-		'--no-sync', '-p', $node_standby_1->port
+		'pg_dumpall',
+		'--file' => $outputdir . '/standby.dump',
+		'--no-sync', '--no-statistics',
+		'--restrict-key' => 'test',
+		'--port' => $node_standby_1->port,
 	],
 	'dump standby server');
-command_ok(
-	[ 'diff', $outputdir . '/primary.dump', $outputdir . '/standby.dump' ],
+compare_files(
+	$outputdir . '/primary.dump',
+	$outputdir . '/standby.dump',
 	'compare primary and standby dumps');
 
 # Likewise for the catalogs of the regression database, after disabling
@@ -128,30 +144,29 @@ $node_primary->wait_for_replay_catchup($node_standby_1);
 command_ok(
 	[
 		'pg_dump',
-		('--schema', 'pg_catalog'),
-		('-f', $outputdir . '/catalogs_primary.dump'),
+		'--schema' => 'pg_catalog',
+		'--file' => $outputdir . '/catalogs_primary.dump',
 		'--no-sync',
-		('-p', $node_primary->port),
+		'--restrict-key' => 'test',
+		'--port', $node_primary->port,
 		'--no-unlogged-table-data',
-		'regression'
+		'regression',
 	],
 	'dump catalogs of primary server');
 command_ok(
 	[
 		'pg_dump',
-		('--schema', 'pg_catalog'),
-		('-f', $outputdir . '/catalogs_standby.dump'),
+		'--schema' => 'pg_catalog',
+		'--file' => $outputdir . '/catalogs_standby.dump',
 		'--no-sync',
-		('-p', $node_standby_1->port),
-		'regression'
+		'--restrict-key' => 'test',
+		'--port' => $node_standby_1->port,
+		'regression',
 	],
 	'dump catalogs of standby server');
-command_ok(
-	[
-		'diff',
-		$outputdir . '/catalogs_primary.dump',
-		$outputdir . '/catalogs_standby.dump'
-	],
+compare_files(
+	$outputdir . '/catalogs_primary.dump',
+	$outputdir . '/catalogs_standby.dump',
 	'compare primary and standby catalog dumps');
 
 # Check some data from pg_stat_statements.

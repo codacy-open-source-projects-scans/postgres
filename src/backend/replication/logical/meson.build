@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2024, PostgreSQL Global Development Group
+# Copyright (c) 2022-2025, PostgreSQL Global Development Group
 
 backend_sources += files(
   'applyparallelworker.c',
@@ -12,8 +12,10 @@ backend_sources += files(
   'proto.c',
   'relation.c',
   'reorderbuffer.c',
+  'sequencesync.c',
   'slotsync.c',
   'snapbuild.c',
+  'syncutils.c',
   'tablesync.c',
   'worker.c',
 )

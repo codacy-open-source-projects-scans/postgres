@@ -9,13 +9,14 @@
  *	  polluting the namespace with lots of stuff...
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/c.h
  *
  *-------------------------------------------------------------------------
  */
+/* IWYU pragma: always_keep */
 /*
  *----------------------------------------------------------------
  *	 TABLE OF CONTENTS
@@ -45,6 +46,8 @@
  */
 #ifndef C_H
 #define C_H
+
+/* IWYU pragma: begin_exports */
 
 /*
  * These headers must be included before any system headers, because on some
@@ -90,8 +93,6 @@
 
 /* ----------------------------------------------------------------
  *				Section 1: compiler characteristics
- *
- * type prefixes (const, signed, volatile, inline) are handled in pg_config.h.
  * ----------------------------------------------------------------
  */
 
@@ -106,12 +107,17 @@
 #endif
 
 /*
+ * Previously used PostgreSQL-specific spelling, for backward compatibility
+ * for extensions.
+ */
+#define pg_restrict restrict
+
+/*
  * Attribute macros
  *
  * GCC: https://gcc.gnu.org/onlinedocs/gcc/Function-Attributes.html
  * GCC: https://gcc.gnu.org/onlinedocs/gcc/Type-Attributes.html
  * Clang: https://clang.llvm.org/docs/AttributeReference.html
- * Sunpro: https://docs.oracle.com/cd/E18659_01/html/821-1384/gjzke.html
  */
 
 /*
@@ -132,14 +138,34 @@
 
 /*
  * pg_nodiscard means the compiler should warn if the result of a function
- * call is ignored.  The name "nodiscard" is chosen in alignment with
- * (possibly future) C and C++ standards.  For maximum compatibility, use it
- * as a function declaration specifier, so it goes before the return type.
+ * call is ignored.  The name "nodiscard" is chosen in alignment with the C23
+ * standard attribute with the same name.  For maximum forward compatibility,
+ * place it before the declaration.
  */
 #ifdef __GNUC__
 #define pg_nodiscard __attribute__((warn_unused_result))
 #else
 #define pg_nodiscard
+#endif
+
+/*
+ * pg_noreturn corresponds to the C11 noreturn/_Noreturn function specifier.
+ * We can't use the standard name "noreturn" because some third-party code
+ * uses __attribute__((noreturn)) in headers, which would get confused if
+ * "noreturn" is defined to "_Noreturn", as is done by <stdnoreturn.h>.
+ *
+ * In a declaration, function specifiers go before the function name.  The
+ * common style is to put them before the return type.  (The MSVC fallback has
+ * the same requirement.  The GCC fallback is more flexible.)
+ */
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#define pg_noreturn _Noreturn
+#elif defined(__GNUC__)
+#define pg_noreturn __attribute__((noreturn))
+#elif defined(_MSC_VER)
+#define pg_noreturn __declspec(noreturn)
+#else
+#define pg_noreturn
 #endif
 
 /*
@@ -210,30 +236,24 @@
 #define pg_attribute_printf(f,a)
 #endif
 
-/* GCC and Sunpro support aligned, packed and noreturn */
-#if defined(__GNUC__) || defined(__SUNPRO_C)
+/* GCC supports aligned and packed */
+#if defined(__GNUC__)
 #define pg_attribute_aligned(a) __attribute__((aligned(a)))
-#define pg_attribute_noreturn() __attribute__((noreturn))
 #define pg_attribute_packed() __attribute__((packed))
-#define HAVE_PG_ATTRIBUTE_NORETURN 1
 #elif defined(_MSC_VER)
 /*
- * MSVC supports aligned.  noreturn is also possible but in MSVC it is
- * declared before the definition while pg_attribute_noreturn() macro
- * is currently used after the definition.
+ * MSVC supports aligned.
  *
  * Packing is also possible but only by wrapping the entire struct definition
  * which doesn't fit into our current macro declarations.
  */
 #define pg_attribute_aligned(a) __declspec(align(a))
-#define pg_attribute_noreturn()
 #else
 /*
  * NB: aligned and packed are not given default definitions because they
  * affect code functionality; they *must* be implemented by the compiler
  * if they are to be used.
  */
-#define pg_attribute_noreturn()
 #endif
 
 /*
@@ -242,8 +262,8 @@
  * choose not to.  But, if possible, don't force inlining in unoptimized
  * debug builds.
  */
-#if (defined(__GNUC__) && __GNUC__ > 3 && defined(__OPTIMIZE__)) || defined(__SUNPRO_C)
-/* GCC > 3 and Sunpro support always_inline via __attribute__ */
+#if defined(__GNUC__) && defined(__OPTIMIZE__)
+/* GCC supports always_inline via __attribute__ */
 #define pg_attribute_always_inline __attribute__((always_inline)) inline
 #elif defined(_MSC_VER)
 /* MSVC has a special keyword for this */
@@ -259,8 +279,8 @@
  * for proper cost attribution.  Note that unlike the pg_attribute_XXX macros
  * above, this should be placed before the function's return type and name.
  */
-/* GCC and Sunpro support noinline via __attribute__ */
-#if (defined(__GNUC__) && __GNUC__ > 2) || defined(__SUNPRO_C)
+/* GCC supports noinline via __attribute__ */
+#if defined(__GNUC__)
 #define pg_noinline __attribute__((noinline))
 /* msvc via declspec */
 #elif defined(_MSC_VER)
@@ -316,13 +336,69 @@
 #endif
 
 /*
+ * Define a compiler-independent macro for determining if an expression is a
+ * compile-time integer const.  We don't define this macro to return 0 when
+ * unsupported due to the risk of users of the macro misbehaving if we return
+ * 0 when the expression *is* an integer constant.  Callers may check if this
+ * macro is defined by checking if HAVE_PG_INTEGER_CONSTANT_P is defined.
+ */
+#if defined(HAVE__BUILTIN_CONSTANT_P)
+
+/* When __builtin_constant_p() is available, use it. */
+#define pg_integer_constant_p(x) __builtin_constant_p(x)
+#define HAVE_PG_INTEGER_CONSTANT_P
+#elif defined(_MSC_VER) && defined(__STDC_VERSION__)
+
+/*
+ * With MSVC we can use a trick with _Generic to make this work.  This has
+ * been borrowed from:
+ * https://stackoverflow.com/questions/49480442/detecting-integer-constant-expressions-in-macros
+ * and only works with integer constants.  Compilation will fail if given a
+ * constant or variable of any type other than an integer.
+ */
+#define pg_integer_constant_p(x) \
+	_Generic((1 ? ((void *) ((x) * (uintptr_t) 0)) : &(int) {1}), int *: 1, void *: 0)
+#define HAVE_PG_INTEGER_CONSTANT_P
+#endif
+
+/*
+ * pg_assume(expr) states that we assume `expr` to evaluate to true. In assert
+ * enabled builds pg_assume() is turned into an assertion, in optimized builds
+ * we try to clue the compiler into the fact that `expr` is true.
+ *
+ * This is useful for two purposes:
+ *
+ * 1) Avoid compiler warnings by telling the compiler about assumptions the
+ *	  code makes. This is particularly useful when building with optimizations
+ *	  and w/o assertions.
+ *
+ * 2) Help the compiler to generate more efficient code
+ *
+ * It is unspecified whether `expr` is evaluated, therefore it better be
+ * side-effect free.
+ */
+#if defined(USE_ASSERT_CHECKING)
+#define pg_assume(expr) Assert(expr)
+#elif defined(HAVE__BUILTIN_UNREACHABLE)
+#define pg_assume(expr) \
+	do { \
+		if (!(expr)) \
+			__builtin_unreachable(); \
+	} while (0)
+#elif defined(_MSC_VER)
+#define pg_assume(expr) __assume(expr)
+#else
+#define pg_assume(expr) ((void) 0)
+#endif
+
+/*
  * Hints to the compiler about the likelihood of a branch. Both likely() and
  * unlikely() return the boolean value of the contained expression.
  *
  * These should only be used sparingly, in very hot code paths. It's very easy
  * to mis-estimate likelihoods.
  */
-#if __GNUC__ >= 3
+#ifdef __GNUC__
 #define likely(x)	__builtin_expect((x) != 0, 1)
 #define unlikely(x) __builtin_expect((x) != 0, 0)
 #else
@@ -359,25 +435,7 @@
  * pretty trivial: VA_ARGS_NARGS_() returns its 64th argument, and we set up
  * the call so that that is the appropriate one of the list of constants.
  * This idea is due to Laurent Deniau.
- *
- * MSVC has an implementation of __VA_ARGS__ that doesn't conform to the
- * standard unless you use the /Zc:preprocessor compiler flag, but that
- * isn't available before Visual Studio 2019.  For now, use a different
- * definition that also works on older compilers.
  */
-#ifdef _MSC_VER
-#define EXPAND(args) args
-#define VA_ARGS_NARGS(...) \
-	VA_ARGS_NARGS_ EXPAND((__VA_ARGS__, \
-				   63,62,61,60,                   \
-				   59,58,57,56,55,54,53,52,51,50, \
-				   49,48,47,46,45,44,43,42,41,40, \
-				   39,38,37,36,35,34,33,32,31,30, \
-				   29,28,27,26,25,24,23,22,21,20, \
-				   19,18,17,16,15,14,13,12,11,10, \
-				   9, 8, 7, 6, 5, 4, 3, 2, 1, 0))
-#else
-
 #define VA_ARGS_NARGS(...) \
 	VA_ARGS_NARGS_(__VA_ARGS__, \
 				   63,62,61,60,                   \
@@ -387,7 +445,6 @@
 				   29,28,27,26,25,24,23,22,21,20, \
 				   19,18,17,16,15,14,13,12,11,10, \
 				   9, 8, 7, 6, 5, 4, 3, 2, 1, 0)
-#endif
 
 #define VA_ARGS_NARGS_( \
 	_01,_02,_03,_04,_05,_06,_07,_08,_09,_10, \
@@ -502,8 +559,6 @@ typedef uint32 bits32;			/* >= 32 bits */
 /* snprintf format strings to use for 64-bit integers */
 #define INT64_FORMAT "%" PRId64
 #define UINT64_FORMAT "%" PRIu64
-#define INT64_HEX_FORMAT "%" PRIx64
-#define UINT64_HEX_FORMAT "%" PRIx64
 
 /*
  * 128-bit signed and unsigned integers
@@ -583,11 +638,11 @@ typedef signed int Offset;
 typedef float float4;
 typedef double float8;
 
-#ifdef USE_FLOAT8_BYVAL
+/*
+ * float8, int8, and related datatypes are now always pass-by-value.
+ * We keep this symbol to avoid breaking extension code that may use it.
+ */
 #define FLOAT8PASSBYVAL true
-#else
-#define FLOAT8PASSBYVAL false
-#endif
 
 /*
  * Oid, RegProcedure, TransactionId, SubTransactionId, MultiXactId,
@@ -634,7 +689,7 @@ typedef uint32 CommandId;
  * representation is no longer convenient.  It's recommended that code always
  * use macros VARDATA_ANY, VARSIZE_ANY, VARSIZE_ANY_EXHDR, VARDATA, VARSIZE,
  * and SET_VARSIZE instead of relying on direct mentions of the struct fields.
- * See postgres.h for details of the TOASTed form.
+ * See varatt.h for details of the TOASTed form.
  * ----------------
  */
 struct varlena
@@ -709,12 +764,6 @@ typedef NameData *Name;
  *		True iff bool is valid.
  */
 #define BoolIsValid(boolean)	((boolean) == false || (boolean) == true)
-
-/*
- * PointerIsValid
- *		True iff pointer is valid.
- */
-#define PointerIsValid(pointer) ((const void*)(pointer) != NULL)
 
 /*
  * PointerIsAligned
@@ -855,8 +904,8 @@ typedef NameData *Name;
  * we should declare it as long as !FRONTEND.
  */
 #ifndef FRONTEND
-extern void ExceptionalCondition(const char *conditionName,
-								 const char *fileName, int lineNumber) pg_attribute_noreturn();
+pg_noreturn extern void ExceptionalCondition(const char *conditionName,
+											 const char *fileName, int lineNumber);
 #endif
 
 /*
@@ -1261,9 +1310,9 @@ extern int	fdatasync(int fildes);
  * Similarly, wrappers around labs()/llabs() matching our int64.
  */
 #if SIZEOF_LONG == 8
-#define i64abs(i) labs(i)
+#define i64abs(i) ((int64) labs(i))
 #elif SIZEOF_LONG_LONG == 8
-#define i64abs(i) llabs(i)
+#define i64abs(i) ((int64) llabs(i))
 #else
 #error "cannot find integer type of the same size as int64_t"
 #endif
@@ -1326,5 +1375,30 @@ typedef intptr_t sigjmp_buf[5];
 
 /* /port compatibility functions */
 #include "port.h"
+
+/*
+ * char16_t and char32_t
+ *      Unicode code points.
+ *
+ * uchar.h should always be available in C11, but it's not available on
+ * Mac. However, these types are keywords in C++11, so when using C++, we
+ * can't redefine the types.
+ *
+ * XXX: when uchar.h is available everywhere, we can remove this check and
+ * just include uchar.h unconditionally.
+ *
+ * XXX: this section is out of place because uchar.h needs to be included
+ * after port.h, due to an interaction with win32_port.h in some cases.
+ */
+#ifdef HAVE_UCHAR_H
+#include <uchar.h>
+#else
+#ifndef __cplusplus
+typedef uint16_t char16_t;
+typedef uint32_t char32_t;
+#endif
+#endif
+
+/* IWYU pragma: end_exports */
 
 #endif							/* C_H */

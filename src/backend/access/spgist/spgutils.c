@@ -4,7 +4,7 @@
  *	  various support functions for SP-GiST
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -50,6 +50,9 @@ spghandler(PG_FUNCTION_ARGS)
 	amroutine->amoptsprocnum = SPGIST_OPTIONS_PROC;
 	amroutine->amcanorder = false;
 	amroutine->amcanorderbyop = true;
+	amroutine->amcanhash = false;
+	amroutine->amconsistentequality = false;
+	amroutine->amconsistentordering = false;
 	amroutine->amcanbackward = false;
 	amroutine->amcanunique = false;
 	amroutine->amcanmulticol = false;
@@ -92,6 +95,8 @@ spghandler(PG_FUNCTION_ARGS)
 	amroutine->amestimateparallelscan = NULL;
 	amroutine->aminitparallelscan = NULL;
 	amroutine->amparallelrescan = NULL;
+	amroutine->amtranslatestrategy = NULL;
+	amroutine->amtranslatecmptype = NULL;
 
 	PG_RETURN_POINTER(amroutine);
 }
@@ -331,7 +336,9 @@ getSpGistTupleDesc(Relation index, SpGistTypeDesc *keyType)
 		att->attcollation = InvalidOid;
 		/* In case we changed typlen, we'd better reset following offsets */
 		for (int i = spgFirstIncludeColumn; i < outTupDesc->natts; i++)
-			TupleDescAttr(outTupDesc, i)->attcacheoff = -1;
+			TupleDescCompactAttr(outTupDesc, i)->attcacheoff = -1;
+
+		populate_compact_attribute(outTupDesc, spgKeyColumn);
 	}
 	return outTupDesc;
 }
@@ -778,7 +785,7 @@ SpGistGetInnerTypeSize(SpGistTypeDesc *att, Datum datum)
 	else if (att->attlen > 0)
 		size = att->attlen;
 	else
-		size = VARSIZE_ANY(datum);
+		size = VARSIZE_ANY(DatumGetPointer(datum));
 
 	return MAXALIGN(size);
 }
@@ -797,7 +804,7 @@ memcpyInnerDatum(void *target, SpGistTypeDesc *att, Datum datum)
 	}
 	else
 	{
-		size = (att->attlen > 0) ? att->attlen : VARSIZE_ANY(datum);
+		size = (att->attlen > 0) ? att->attlen : VARSIZE_ANY(DatumGetPointer(datum));
 		memcpy(target, DatumGetPointer(datum), size);
 	}
 }
@@ -861,7 +868,7 @@ SpGistGetLeafTupleSize(TupleDesc tupleDescriptor,
  * Construct a leaf tuple containing the given heap TID and datum values
  */
 SpGistLeafTuple
-spgFormLeafTuple(SpGistState *state, ItemPointer heapPtr,
+spgFormLeafTuple(SpGistState *state, const ItemPointerData *heapPtr,
 				 const Datum *datums, const bool *isnulls)
 {
 	SpGistLeafTuple tup;
@@ -1193,7 +1200,7 @@ spgExtractNodeLabels(SpGistState *state, SpGistInnerTuple innerTuple)
  * rather than returning InvalidOffsetNumber.
  */
 OffsetNumber
-SpGistPageAddNewItem(SpGistState *state, Page page, Item item, Size size,
+SpGistPageAddNewItem(SpGistState *state, Page page, const void *item, Size size,
 					 OffsetNumber *startOffset, bool errorOK)
 {
 	SpGistPageOpaque opaque = SpGistPageGetOpaque(page);

@@ -3,7 +3,7 @@
  * varlena.c
  *	  Functions for the variable-length built-in types.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -35,17 +35,12 @@
 #include "port/pg_bswap.h"
 #include "regex/regex.h"
 #include "utils/builtins.h"
-#include "utils/bytea.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/pg_locale.h"
 #include "utils/sortsupport.h"
 #include "utils/varlena.h"
-
-
-/* GUC variable */
-int			bytea_output = BYTEA_OUTPUT_HEX;
 
 typedef struct varlena VarString;
 
@@ -54,7 +49,9 @@ typedef struct varlena VarString;
  */
 typedef struct
 {
+	pg_locale_t locale;			/* collation used for substring matching */
 	bool		is_multibyte_char_in_char;	/* need to check char boundaries? */
+	bool		greedy;			/* find longest possible substring? */
 
 	char	   *str1;			/* haystack string */
 	char	   *str2;			/* needle string */
@@ -65,7 +62,13 @@ typedef struct
 	int			skiptablemask;	/* mask for ANDing with skiptable subscripts */
 	int			skiptable[256]; /* skip distance for given mismatched char */
 
+	/*
+	 * Note that with nondeterministic collations, the length of the last
+	 * match is not necessarily equal to the length of the "needle" passed in.
+	 */
 	char	   *last_match;		/* pointer to last match in 'str1' */
+	int			last_match_len; /* length of last match */
+	int			last_match_len_tmp; /* same but for internal use */
 
 	/*
 	 * Sometimes we need to convert the byte position of a match to a
@@ -140,12 +143,6 @@ static int	text_position_get_match_pos(TextPositionState *state);
 static void text_position_cleanup(TextPositionState *state);
 static void check_collation_set(Oid collid);
 static int	text_cmp(text *arg1, text *arg2, Oid collid);
-static bytea *bytea_catenate(bytea *t1, bytea *t2);
-static bytea *bytea_substring(Datum str,
-							  int S,
-							  int L,
-							  bool length_not_specified);
-static bytea *bytea_overlay(bytea *t1, bytea *t2, int sp, int sl);
 static void appendStringInfoText(StringInfo str, const text *t);
 static bool split_text(FunctionCallInfo fcinfo, SplitTextOutputData *tstate);
 static void split_text_accum_result(SplitTextOutputData *tstate,
@@ -270,307 +267,6 @@ text_to_cstring_buffer(const text *src, char *dst, size_t dst_len)
 /*****************************************************************************
  *	 USER I/O ROUTINES														 *
  *****************************************************************************/
-
-
-#define VAL(CH)			((CH) - '0')
-#define DIG(VAL)		((VAL) + '0')
-
-/*
- *		byteain			- converts from printable representation of byte array
- *
- *		Non-printable characters must be passed as '\nnn' (octal) and are
- *		converted to internal form.  '\' must be passed as '\\'.
- *		ereport(ERROR, ...) if bad form.
- *
- *		BUGS:
- *				The input is scanned twice.
- *				The error checking of input is minimal.
- */
-Datum
-byteain(PG_FUNCTION_ARGS)
-{
-	char	   *inputText = PG_GETARG_CSTRING(0);
-	Node	   *escontext = fcinfo->context;
-	char	   *tp;
-	char	   *rp;
-	int			bc;
-	bytea	   *result;
-
-	/* Recognize hex input */
-	if (inputText[0] == '\\' && inputText[1] == 'x')
-	{
-		size_t		len = strlen(inputText);
-
-		bc = (len - 2) / 2 + VARHDRSZ;	/* maximum possible length */
-		result = palloc(bc);
-		bc = hex_decode_safe(inputText + 2, len - 2, VARDATA(result),
-							 escontext);
-		SET_VARSIZE(result, bc + VARHDRSZ); /* actual length */
-
-		PG_RETURN_BYTEA_P(result);
-	}
-
-	/* Else, it's the traditional escaped style */
-	for (bc = 0, tp = inputText; *tp != '\0'; bc++)
-	{
-		if (tp[0] != '\\')
-			tp++;
-		else if ((tp[0] == '\\') &&
-				 (tp[1] >= '0' && tp[1] <= '3') &&
-				 (tp[2] >= '0' && tp[2] <= '7') &&
-				 (tp[3] >= '0' && tp[3] <= '7'))
-			tp += 4;
-		else if ((tp[0] == '\\') &&
-				 (tp[1] == '\\'))
-			tp += 2;
-		else
-		{
-			/*
-			 * one backslash, not followed by another or ### valid octal
-			 */
-			ereturn(escontext, (Datum) 0,
-					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-					 errmsg("invalid input syntax for type %s", "bytea")));
-		}
-	}
-
-	bc += VARHDRSZ;
-
-	result = (bytea *) palloc(bc);
-	SET_VARSIZE(result, bc);
-
-	tp = inputText;
-	rp = VARDATA(result);
-	while (*tp != '\0')
-	{
-		if (tp[0] != '\\')
-			*rp++ = *tp++;
-		else if ((tp[0] == '\\') &&
-				 (tp[1] >= '0' && tp[1] <= '3') &&
-				 (tp[2] >= '0' && tp[2] <= '7') &&
-				 (tp[3] >= '0' && tp[3] <= '7'))
-		{
-			bc = VAL(tp[1]);
-			bc <<= 3;
-			bc += VAL(tp[2]);
-			bc <<= 3;
-			*rp++ = bc + VAL(tp[3]);
-
-			tp += 4;
-		}
-		else if ((tp[0] == '\\') &&
-				 (tp[1] == '\\'))
-		{
-			*rp++ = '\\';
-			tp += 2;
-		}
-		else
-		{
-			/*
-			 * We should never get here. The first pass should not allow it.
-			 */
-			ereturn(escontext, (Datum) 0,
-					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-					 errmsg("invalid input syntax for type %s", "bytea")));
-		}
-	}
-
-	PG_RETURN_BYTEA_P(result);
-}
-
-/*
- *		byteaout		- converts to printable representation of byte array
- *
- *		In the traditional escaped format, non-printable characters are
- *		printed as '\nnn' (octal) and '\' as '\\'.
- */
-Datum
-byteaout(PG_FUNCTION_ARGS)
-{
-	bytea	   *vlena = PG_GETARG_BYTEA_PP(0);
-	char	   *result;
-	char	   *rp;
-
-	if (bytea_output == BYTEA_OUTPUT_HEX)
-	{
-		/* Print hex format */
-		rp = result = palloc(VARSIZE_ANY_EXHDR(vlena) * 2 + 2 + 1);
-		*rp++ = '\\';
-		*rp++ = 'x';
-		rp += hex_encode(VARDATA_ANY(vlena), VARSIZE_ANY_EXHDR(vlena), rp);
-	}
-	else if (bytea_output == BYTEA_OUTPUT_ESCAPE)
-	{
-		/* Print traditional escaped format */
-		char	   *vp;
-		uint64		len;
-		int			i;
-
-		len = 1;				/* empty string has 1 char */
-		vp = VARDATA_ANY(vlena);
-		for (i = VARSIZE_ANY_EXHDR(vlena); i != 0; i--, vp++)
-		{
-			if (*vp == '\\')
-				len += 2;
-			else if ((unsigned char) *vp < 0x20 || (unsigned char) *vp > 0x7e)
-				len += 4;
-			else
-				len++;
-		}
-
-		/*
-		 * In principle len can't overflow uint32 if the input fit in 1GB, but
-		 * for safety let's check rather than relying on palloc's internal
-		 * check.
-		 */
-		if (len > MaxAllocSize)
-			ereport(ERROR,
-					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg_internal("result of bytea output conversion is too large")));
-		rp = result = (char *) palloc(len);
-
-		vp = VARDATA_ANY(vlena);
-		for (i = VARSIZE_ANY_EXHDR(vlena); i != 0; i--, vp++)
-		{
-			if (*vp == '\\')
-			{
-				*rp++ = '\\';
-				*rp++ = '\\';
-			}
-			else if ((unsigned char) *vp < 0x20 || (unsigned char) *vp > 0x7e)
-			{
-				int			val;	/* holds unprintable chars */
-
-				val = *vp;
-				rp[0] = '\\';
-				rp[3] = DIG(val & 07);
-				val >>= 3;
-				rp[2] = DIG(val & 07);
-				val >>= 3;
-				rp[1] = DIG(val & 03);
-				rp += 4;
-			}
-			else
-				*rp++ = *vp;
-		}
-	}
-	else
-	{
-		elog(ERROR, "unrecognized \"bytea_output\" setting: %d",
-			 bytea_output);
-		rp = result = NULL;		/* keep compiler quiet */
-	}
-	*rp = '\0';
-	PG_RETURN_CSTRING(result);
-}
-
-/*
- *		bytearecv			- converts external binary format to bytea
- */
-Datum
-bytearecv(PG_FUNCTION_ARGS)
-{
-	StringInfo	buf = (StringInfo) PG_GETARG_POINTER(0);
-	bytea	   *result;
-	int			nbytes;
-
-	nbytes = buf->len - buf->cursor;
-	result = (bytea *) palloc(nbytes + VARHDRSZ);
-	SET_VARSIZE(result, nbytes + VARHDRSZ);
-	pq_copymsgbytes(buf, VARDATA(result), nbytes);
-	PG_RETURN_BYTEA_P(result);
-}
-
-/*
- *		byteasend			- converts bytea to binary format
- *
- * This is a special case: just copy the input...
- */
-Datum
-byteasend(PG_FUNCTION_ARGS)
-{
-	bytea	   *vlena = PG_GETARG_BYTEA_P_COPY(0);
-
-	PG_RETURN_BYTEA_P(vlena);
-}
-
-Datum
-bytea_string_agg_transfn(PG_FUNCTION_ARGS)
-{
-	StringInfo	state;
-
-	state = PG_ARGISNULL(0) ? NULL : (StringInfo) PG_GETARG_POINTER(0);
-
-	/* Append the value unless null, preceding it with the delimiter. */
-	if (!PG_ARGISNULL(1))
-	{
-		bytea	   *value = PG_GETARG_BYTEA_PP(1);
-		bool		isfirst = false;
-
-		/*
-		 * You might think we can just throw away the first delimiter, however
-		 * we must keep it as we may be a parallel worker doing partial
-		 * aggregation building a state to send to the main process.  We need
-		 * to keep the delimiter of every aggregation so that the combine
-		 * function can properly join up the strings of two separately
-		 * partially aggregated results.  The first delimiter is only stripped
-		 * off in the final function.  To know how much to strip off the front
-		 * of the string, we store the length of the first delimiter in the
-		 * StringInfo's cursor field, which we don't otherwise need here.
-		 */
-		if (state == NULL)
-		{
-			state = makeStringAggState(fcinfo);
-			isfirst = true;
-		}
-
-		if (!PG_ARGISNULL(2))
-		{
-			bytea	   *delim = PG_GETARG_BYTEA_PP(2);
-
-			appendBinaryStringInfo(state, VARDATA_ANY(delim),
-								   VARSIZE_ANY_EXHDR(delim));
-			if (isfirst)
-				state->cursor = VARSIZE_ANY_EXHDR(delim);
-		}
-
-		appendBinaryStringInfo(state, VARDATA_ANY(value),
-							   VARSIZE_ANY_EXHDR(value));
-	}
-
-	/*
-	 * The transition type for string_agg() is declared to be "internal",
-	 * which is a pass-by-value type the same size as a pointer.
-	 */
-	if (state)
-		PG_RETURN_POINTER(state);
-	PG_RETURN_NULL();
-}
-
-Datum
-bytea_string_agg_finalfn(PG_FUNCTION_ARGS)
-{
-	StringInfo	state;
-
-	/* cannot be called directly because of internal-type argument */
-	Assert(AggCheckCallContext(fcinfo, NULL));
-
-	state = PG_ARGISNULL(0) ? NULL : (StringInfo) PG_GETARG_POINTER(0);
-
-	if (state != NULL)
-	{
-		/* As per comment in transfn, strip data before the cursor position */
-		bytea	   *result;
-		int			strippedlen = state->len - state->cursor;
-
-		result = (bytea *) palloc(strippedlen + VARHDRSZ);
-		SET_VARSIZE(result, strippedlen + VARHDRSZ);
-		memcpy(VARDATA(result), &state->data[state->cursor], strippedlen);
-		PG_RETURN_BYTEA_P(result);
-	}
-	else
-		PG_RETURN_NULL();
-}
 
 /*
  *		textin			- converts cstring to internal representation
@@ -712,13 +408,12 @@ text_length(Datum str)
 {
 	/* fastpath when max encoding length is one */
 	if (pg_database_encoding_max_length() == 1)
-		PG_RETURN_INT32(toast_raw_datum_size(str) - VARHDRSZ);
+		return (toast_raw_datum_size(str) - VARHDRSZ);
 	else
 	{
 		text	   *t = DatumGetTextPP(str);
 
-		PG_RETURN_INT32(pg_mbstrlen_with_len(VARDATA_ANY(t),
-											 VARSIZE_ANY_EXHDR(t)));
+		return (pg_mbstrlen_with_len(VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t)));
 	}
 }
 
@@ -1178,15 +873,21 @@ text_position(text *t1, text *t2, Oid collid)
 	TextPositionState state;
 	int			result;
 
+	check_collation_set(collid);
+
 	/* Empty needle always matches at position 1 */
 	if (VARSIZE_ANY_EXHDR(t2) < 1)
 		return 1;
 
 	/* Otherwise, can't match if haystack is shorter than needle */
-	if (VARSIZE_ANY_EXHDR(t1) < VARSIZE_ANY_EXHDR(t2))
+	if (VARSIZE_ANY_EXHDR(t1) < VARSIZE_ANY_EXHDR(t2) &&
+		pg_newlocale_from_collation(collid)->deterministic)
 		return 0;
 
 	text_position_setup(t1, t2, collid, &state);
+	/* don't need greedy mode here */
+	state.greedy = false;
+
 	if (!text_position_next(&state))
 		result = 0;
 	else
@@ -1217,18 +918,17 @@ text_position_setup(text *t1, text *t2, Oid collid, TextPositionState *state)
 {
 	int			len1 = VARSIZE_ANY_EXHDR(t1);
 	int			len2 = VARSIZE_ANY_EXHDR(t2);
-	pg_locale_t mylocale;
 
 	check_collation_set(collid);
 
-	mylocale = pg_newlocale_from_collation(collid);
+	state->locale = pg_newlocale_from_collation(collid);
 
-	if (!mylocale->deterministic)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("nondeterministic collations are not supported for substring searches")));
+	/*
+	 * Most callers need greedy mode, but some might want to unset this to
+	 * optimize.
+	 */
+	state->greedy = true;
 
-	Assert(len1 > 0);
 	Assert(len2 > 0);
 
 	/*
@@ -1264,8 +964,11 @@ text_position_setup(text *t1, text *t2, Oid collid, TextPositionState *state)
 	 * point in wasting cycles initializing the table.  We also choose not to
 	 * use B-M-H for needles of length 1, since the skip table can't possibly
 	 * save anything in that case.
+	 *
+	 * (With nondeterministic collations, the search is already
+	 * multibyte-aware, so we don't need this.)
 	 */
-	if (len1 >= len2 && len2 > 1)
+	if (len1 >= len2 && len2 > 1 && state->locale->deterministic)
 	{
 		int			searchlength = len1 - len2;
 		int			skiptablemask;
@@ -1343,7 +1046,7 @@ text_position_next(TextPositionState *state)
 
 	/* Start from the point right after the previous match. */
 	if (state->last_match)
-		start_ptr = state->last_match + needle_len;
+		start_ptr = state->last_match + state->last_match_len;
 	else
 		start_ptr = state->str1;
 
@@ -1359,7 +1062,7 @@ retry:
 	 * multi-byte character, we need to verify that the match was at a
 	 * character boundary, not in the middle of a multi-byte character.
 	 */
-	if (state->is_multibyte_char_in_char)
+	if (state->is_multibyte_char_in_char && state->locale->deterministic)
 	{
 		/* Walk one character at a time, until we reach the match. */
 
@@ -1387,6 +1090,7 @@ retry:
 	}
 
 	state->last_match = matchptr;
+	state->last_match_len = state->last_match_len_tmp;
 	return true;
 }
 
@@ -1408,7 +1112,62 @@ text_position_next_internal(char *start_ptr, TextPositionState *state)
 
 	Assert(start_ptr >= haystack && start_ptr <= haystack_end);
 
-	if (needle_len == 1)
+	state->last_match_len_tmp = needle_len;
+
+	if (!state->locale->deterministic)
+	{
+		/*
+		 * With a nondeterministic collation, we have to use an unoptimized
+		 * route.  We walk through the haystack and see if at each position
+		 * there is a substring of the remaining string that is equal to the
+		 * needle under the given collation.
+		 *
+		 * Note, the found substring could have a different length than the
+		 * needle, including being empty.  Callers that want to skip over the
+		 * found string need to read the length of the found substring from
+		 * last_match_len rather than just using the length of their needle.
+		 *
+		 * Most callers will require "greedy" semantics, meaning that we need
+		 * to find the longest such substring, not the shortest.  For callers
+		 * that don't need greedy semantics, we can finish on the first match.
+		 */
+		const char *result_hptr = NULL;
+
+		hptr = start_ptr;
+		while (hptr < haystack_end)
+		{
+			/*
+			 * First check the common case that there is a match in the
+			 * haystack of exactly the length of the needle.
+			 */
+			if (!state->greedy &&
+				haystack_end - hptr >= needle_len &&
+				pg_strncoll(hptr, needle_len, needle, needle_len, state->locale) == 0)
+				return (char *) hptr;
+
+			/*
+			 * Else check if any of the possible substrings starting at hptr
+			 * are equal to the needle.
+			 */
+			for (const char *test_end = hptr; test_end < haystack_end; test_end += pg_mblen(test_end))
+			{
+				if (pg_strncoll(hptr, (test_end - hptr), needle, needle_len, state->locale) == 0)
+				{
+					state->last_match_len_tmp = (test_end - hptr);
+					result_hptr = hptr;
+					if (!state->greedy)
+						break;
+				}
+			}
+			if (result_hptr)
+				break;
+
+			hptr += pg_mblen(hptr);
+		}
+
+		return (char *) result_hptr;
+	}
+	else if (needle_len == 1)
 	{
 		/* No point in using B-M-H for a one-character needle */
 		char		nchar = *needle;
@@ -1912,14 +1671,13 @@ varstr_sortsupport(SortSupport ssup, Oid typid, Oid collid)
 		 *
 		 * Even apart from the risk of broken locales, it's possible that
 		 * there are platforms where the use of abbreviated keys should be
-		 * disabled at compile time.  Having only 4 byte datums could make
-		 * worst-case performance drastically more likely, for example.
-		 * Moreover, macOS's strxfrm() implementation is known to not
-		 * effectively concentrate a significant amount of entropy from the
-		 * original string in earlier transformed blobs.  It's possible that
-		 * other supported platforms are similarly encumbered.  So, if we ever
-		 * get past disabling this categorically, we may still want or need to
-		 * disable it for particular platforms.
+		 * disabled at compile time.  For example, macOS's strxfrm()
+		 * implementation is known to not effectively concentrate a
+		 * significant amount of entropy from the original string in earlier
+		 * transformed blobs.  It's possible that other supported platforms
+		 * are similarly encumbered.  So, if we ever get past disabling this
+		 * categorically, we may still want or need to disable it for
+		 * particular platforms.
 		 */
 		if (!pg_strxfrm_enabled(locale))
 			abbreviate = false;
@@ -2373,18 +2131,12 @@ varstr_abbrev_convert(Datum original, SortSupport ssup)
 	addHyperLogLog(&sss->full_card, hash);
 
 	/* Hash abbreviated key */
-#if SIZEOF_DATUM == 8
 	{
-		uint32		lohalf,
-					hihalf;
+		uint32		tmp;
 
-		lohalf = (uint32) res;
-		hihalf = (uint32) (res >> 32);
-		hash = DatumGetUInt32(hash_uint32(lohalf ^ hihalf));
+		tmp = DatumGetUInt32(res) ^ (uint32) (DatumGetUInt64(res) >> 32);
+		hash = DatumGetUInt32(hash_uint32(tmp));
 	}
-#else							/* SIZEOF_DATUM != 8 */
-	hash = DatumGetUInt32(hash_uint32((uint32) res));
-#endif
 
 	addHyperLogLog(&sss->abbr_card, hash);
 
@@ -2887,446 +2639,6 @@ bttext_pattern_sortsupport(PG_FUNCTION_ARGS)
 }
 
 
-/*-------------------------------------------------------------
- * byteaoctetlen
- *
- * get the number of bytes contained in an instance of type 'bytea'
- *-------------------------------------------------------------
- */
-Datum
-byteaoctetlen(PG_FUNCTION_ARGS)
-{
-	Datum		str = PG_GETARG_DATUM(0);
-
-	/* We need not detoast the input at all */
-	PG_RETURN_INT32(toast_raw_datum_size(str) - VARHDRSZ);
-}
-
-/*
- * byteacat -
- *	  takes two bytea* and returns a bytea* that is the concatenation of
- *	  the two.
- *
- * Cloned from textcat and modified as required.
- */
-Datum
-byteacat(PG_FUNCTION_ARGS)
-{
-	bytea	   *t1 = PG_GETARG_BYTEA_PP(0);
-	bytea	   *t2 = PG_GETARG_BYTEA_PP(1);
-
-	PG_RETURN_BYTEA_P(bytea_catenate(t1, t2));
-}
-
-/*
- * bytea_catenate
- *	Guts of byteacat(), broken out so it can be used by other functions
- *
- * Arguments can be in short-header form, but not compressed or out-of-line
- */
-static bytea *
-bytea_catenate(bytea *t1, bytea *t2)
-{
-	bytea	   *result;
-	int			len1,
-				len2,
-				len;
-	char	   *ptr;
-
-	len1 = VARSIZE_ANY_EXHDR(t1);
-	len2 = VARSIZE_ANY_EXHDR(t2);
-
-	/* paranoia ... probably should throw error instead? */
-	if (len1 < 0)
-		len1 = 0;
-	if (len2 < 0)
-		len2 = 0;
-
-	len = len1 + len2 + VARHDRSZ;
-	result = (bytea *) palloc(len);
-
-	/* Set size of result string... */
-	SET_VARSIZE(result, len);
-
-	/* Fill data field of result string... */
-	ptr = VARDATA(result);
-	if (len1 > 0)
-		memcpy(ptr, VARDATA_ANY(t1), len1);
-	if (len2 > 0)
-		memcpy(ptr + len1, VARDATA_ANY(t2), len2);
-
-	return result;
-}
-
-#define PG_STR_GET_BYTEA(str_) \
-	DatumGetByteaPP(DirectFunctionCall1(byteain, CStringGetDatum(str_)))
-
-/*
- * bytea_substr()
- * Return a substring starting at the specified position.
- * Cloned from text_substr and modified as required.
- *
- * Input:
- *	- string
- *	- starting position (is one-based)
- *	- string length (optional)
- *
- * If the starting position is zero or less, then return from the start of the string
- * adjusting the length to be consistent with the "negative start" per SQL.
- * If the length is less than zero, an ERROR is thrown. If no third argument
- * (length) is provided, the length to the end of the string is assumed.
- */
-Datum
-bytea_substr(PG_FUNCTION_ARGS)
-{
-	PG_RETURN_BYTEA_P(bytea_substring(PG_GETARG_DATUM(0),
-									  PG_GETARG_INT32(1),
-									  PG_GETARG_INT32(2),
-									  false));
-}
-
-/*
- * bytea_substr_no_len -
- *	  Wrapper to avoid opr_sanity failure due to
- *	  one function accepting a different number of args.
- */
-Datum
-bytea_substr_no_len(PG_FUNCTION_ARGS)
-{
-	PG_RETURN_BYTEA_P(bytea_substring(PG_GETARG_DATUM(0),
-									  PG_GETARG_INT32(1),
-									  -1,
-									  true));
-}
-
-static bytea *
-bytea_substring(Datum str,
-				int S,
-				int L,
-				bool length_not_specified)
-{
-	int32		S1;				/* adjusted start position */
-	int32		L1;				/* adjusted substring length */
-	int32		E;				/* end position */
-
-	/*
-	 * The logic here should generally match text_substring().
-	 */
-	S1 = Max(S, 1);
-
-	if (length_not_specified)
-	{
-		/*
-		 * Not passed a length - DatumGetByteaPSlice() grabs everything to the
-		 * end of the string if we pass it a negative value for length.
-		 */
-		L1 = -1;
-	}
-	else if (L < 0)
-	{
-		/* SQL99 says to throw an error for E < S, i.e., negative length */
-		ereport(ERROR,
-				(errcode(ERRCODE_SUBSTRING_ERROR),
-				 errmsg("negative substring length not allowed")));
-		L1 = -1;				/* silence stupider compilers */
-	}
-	else if (pg_add_s32_overflow(S, L, &E))
-	{
-		/*
-		 * L could be large enough for S + L to overflow, in which case the
-		 * substring must run to end of string.
-		 */
-		L1 = -1;
-	}
-	else
-	{
-		/*
-		 * A zero or negative value for the end position can happen if the
-		 * start was negative or one. SQL99 says to return a zero-length
-		 * string.
-		 */
-		if (E < 1)
-			return PG_STR_GET_BYTEA("");
-
-		L1 = E - S1;
-	}
-
-	/*
-	 * If the start position is past the end of the string, SQL99 says to
-	 * return a zero-length string -- DatumGetByteaPSlice() will do that for
-	 * us.  We need only convert S1 to zero-based starting position.
-	 */
-	return DatumGetByteaPSlice(str, S1 - 1, L1);
-}
-
-/*
- * byteaoverlay
- *	Replace specified substring of first string with second
- *
- * The SQL standard defines OVERLAY() in terms of substring and concatenation.
- * This code is a direct implementation of what the standard says.
- */
-Datum
-byteaoverlay(PG_FUNCTION_ARGS)
-{
-	bytea	   *t1 = PG_GETARG_BYTEA_PP(0);
-	bytea	   *t2 = PG_GETARG_BYTEA_PP(1);
-	int			sp = PG_GETARG_INT32(2);	/* substring start position */
-	int			sl = PG_GETARG_INT32(3);	/* substring length */
-
-	PG_RETURN_BYTEA_P(bytea_overlay(t1, t2, sp, sl));
-}
-
-Datum
-byteaoverlay_no_len(PG_FUNCTION_ARGS)
-{
-	bytea	   *t1 = PG_GETARG_BYTEA_PP(0);
-	bytea	   *t2 = PG_GETARG_BYTEA_PP(1);
-	int			sp = PG_GETARG_INT32(2);	/* substring start position */
-	int			sl;
-
-	sl = VARSIZE_ANY_EXHDR(t2); /* defaults to length(t2) */
-	PG_RETURN_BYTEA_P(bytea_overlay(t1, t2, sp, sl));
-}
-
-static bytea *
-bytea_overlay(bytea *t1, bytea *t2, int sp, int sl)
-{
-	bytea	   *result;
-	bytea	   *s1;
-	bytea	   *s2;
-	int			sp_pl_sl;
-
-	/*
-	 * Check for possible integer-overflow cases.  For negative sp, throw a
-	 * "substring length" error because that's what should be expected
-	 * according to the spec's definition of OVERLAY().
-	 */
-	if (sp <= 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_SUBSTRING_ERROR),
-				 errmsg("negative substring length not allowed")));
-	if (pg_add_s32_overflow(sp, sl, &sp_pl_sl))
-		ereport(ERROR,
-				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-				 errmsg("integer out of range")));
-
-	s1 = bytea_substring(PointerGetDatum(t1), 1, sp - 1, false);
-	s2 = bytea_substring(PointerGetDatum(t1), sp_pl_sl, -1, true);
-	result = bytea_catenate(s1, t2);
-	result = bytea_catenate(result, s2);
-
-	return result;
-}
-
-/*
- * bit_count
- */
-Datum
-bytea_bit_count(PG_FUNCTION_ARGS)
-{
-	bytea	   *t1 = PG_GETARG_BYTEA_PP(0);
-
-	PG_RETURN_INT64(pg_popcount(VARDATA_ANY(t1), VARSIZE_ANY_EXHDR(t1)));
-}
-
-/*
- * byteapos -
- *	  Return the position of the specified substring.
- *	  Implements the SQL POSITION() function.
- * Cloned from textpos and modified as required.
- */
-Datum
-byteapos(PG_FUNCTION_ARGS)
-{
-	bytea	   *t1 = PG_GETARG_BYTEA_PP(0);
-	bytea	   *t2 = PG_GETARG_BYTEA_PP(1);
-	int			pos;
-	int			px,
-				p;
-	int			len1,
-				len2;
-	char	   *p1,
-			   *p2;
-
-	len1 = VARSIZE_ANY_EXHDR(t1);
-	len2 = VARSIZE_ANY_EXHDR(t2);
-
-	if (len2 <= 0)
-		PG_RETURN_INT32(1);		/* result for empty pattern */
-
-	p1 = VARDATA_ANY(t1);
-	p2 = VARDATA_ANY(t2);
-
-	pos = 0;
-	px = (len1 - len2);
-	for (p = 0; p <= px; p++)
-	{
-		if ((*p2 == *p1) && (memcmp(p1, p2, len2) == 0))
-		{
-			pos = p + 1;
-			break;
-		};
-		p1++;
-	};
-
-	PG_RETURN_INT32(pos);
-}
-
-/*-------------------------------------------------------------
- * byteaGetByte
- *
- * this routine treats "bytea" as an array of bytes.
- * It returns the Nth byte (a number between 0 and 255).
- *-------------------------------------------------------------
- */
-Datum
-byteaGetByte(PG_FUNCTION_ARGS)
-{
-	bytea	   *v = PG_GETARG_BYTEA_PP(0);
-	int32		n = PG_GETARG_INT32(1);
-	int			len;
-	int			byte;
-
-	len = VARSIZE_ANY_EXHDR(v);
-
-	if (n < 0 || n >= len)
-		ereport(ERROR,
-				(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
-				 errmsg("index %d out of valid range, 0..%d",
-						n, len - 1)));
-
-	byte = ((unsigned char *) VARDATA_ANY(v))[n];
-
-	PG_RETURN_INT32(byte);
-}
-
-/*-------------------------------------------------------------
- * byteaGetBit
- *
- * This routine treats a "bytea" type like an array of bits.
- * It returns the value of the Nth bit (0 or 1).
- *
- *-------------------------------------------------------------
- */
-Datum
-byteaGetBit(PG_FUNCTION_ARGS)
-{
-	bytea	   *v = PG_GETARG_BYTEA_PP(0);
-	int64		n = PG_GETARG_INT64(1);
-	int			byteNo,
-				bitNo;
-	int			len;
-	int			byte;
-
-	len = VARSIZE_ANY_EXHDR(v);
-
-	if (n < 0 || n >= (int64) len * 8)
-		ereport(ERROR,
-				(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
-				 errmsg("index %lld out of valid range, 0..%lld",
-						(long long) n, (long long) len * 8 - 1)));
-
-	/* n/8 is now known < len, so safe to cast to int */
-	byteNo = (int) (n / 8);
-	bitNo = (int) (n % 8);
-
-	byte = ((unsigned char *) VARDATA_ANY(v))[byteNo];
-
-	if (byte & (1 << bitNo))
-		PG_RETURN_INT32(1);
-	else
-		PG_RETURN_INT32(0);
-}
-
-/*-------------------------------------------------------------
- * byteaSetByte
- *
- * Given an instance of type 'bytea' creates a new one with
- * the Nth byte set to the given value.
- *
- *-------------------------------------------------------------
- */
-Datum
-byteaSetByte(PG_FUNCTION_ARGS)
-{
-	bytea	   *res = PG_GETARG_BYTEA_P_COPY(0);
-	int32		n = PG_GETARG_INT32(1);
-	int32		newByte = PG_GETARG_INT32(2);
-	int			len;
-
-	len = VARSIZE(res) - VARHDRSZ;
-
-	if (n < 0 || n >= len)
-		ereport(ERROR,
-				(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
-				 errmsg("index %d out of valid range, 0..%d",
-						n, len - 1)));
-
-	/*
-	 * Now set the byte.
-	 */
-	((unsigned char *) VARDATA(res))[n] = newByte;
-
-	PG_RETURN_BYTEA_P(res);
-}
-
-/*-------------------------------------------------------------
- * byteaSetBit
- *
- * Given an instance of type 'bytea' creates a new one with
- * the Nth bit set to the given value.
- *
- *-------------------------------------------------------------
- */
-Datum
-byteaSetBit(PG_FUNCTION_ARGS)
-{
-	bytea	   *res = PG_GETARG_BYTEA_P_COPY(0);
-	int64		n = PG_GETARG_INT64(1);
-	int32		newBit = PG_GETARG_INT32(2);
-	int			len;
-	int			oldByte,
-				newByte;
-	int			byteNo,
-				bitNo;
-
-	len = VARSIZE(res) - VARHDRSZ;
-
-	if (n < 0 || n >= (int64) len * 8)
-		ereport(ERROR,
-				(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
-				 errmsg("index %lld out of valid range, 0..%lld",
-						(long long) n, (long long) len * 8 - 1)));
-
-	/* n/8 is now known < len, so safe to cast to int */
-	byteNo = (int) (n / 8);
-	bitNo = (int) (n % 8);
-
-	/*
-	 * sanity check!
-	 */
-	if (newBit != 0 && newBit != 1)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("new bit must be 0 or 1")));
-
-	/*
-	 * Update the byte.
-	 */
-	oldByte = ((unsigned char *) VARDATA(res))[byteNo];
-
-	if (newBit == 0)
-		newByte = oldByte & (~(1 << bitNo));
-	else
-		newByte = oldByte | (1 << bitNo);
-
-	((unsigned char *) VARDATA(res))[byteNo] = newByte;
-
-	PG_RETURN_BYTEA_P(res);
-}
-
-
 /* text_name()
  * Converts a text type to a Name type.
  */
@@ -3441,7 +2753,7 @@ SplitIdentifierString(char *rawstring, char separator,
 		nextp++;				/* skip leading whitespace */
 
 	if (*nextp == '\0')
-		return true;			/* allow empty string */
+		return true;			/* empty string represents empty list */
 
 	/* At the top of the loop, we are at start of a new identifier. */
 	do
@@ -3568,7 +2880,7 @@ SplitDirectoriesString(char *rawstring, char separator,
 		nextp++;				/* skip leading whitespace */
 
 	if (*nextp == '\0')
-		return true;			/* allow empty string */
+		return true;			/* empty string represents empty list */
 
 	/* At the top of the loop, we are at start of a new directory. */
 	do
@@ -3689,7 +3001,7 @@ SplitGUCList(char *rawstring, char separator,
 		nextp++;				/* skip leading whitespace */
 
 	if (*nextp == '\0')
-		return true;			/* allow empty string */
+		return true;			/* empty string represents empty list */
 
 	/* At the top of the loop, we are at start of a new identifier. */
 	do
@@ -3754,235 +3066,6 @@ SplitGUCList(char *rawstring, char separator,
 	} while (!done);
 
 	return true;
-}
-
-
-/*****************************************************************************
- *	Comparison Functions used for bytea
- *
- * Note: btree indexes need these routines not to leak memory; therefore,
- * be careful to free working copies of toasted datums.  Most places don't
- * need to be so careful.
- *****************************************************************************/
-
-Datum
-byteaeq(PG_FUNCTION_ARGS)
-{
-	Datum		arg1 = PG_GETARG_DATUM(0);
-	Datum		arg2 = PG_GETARG_DATUM(1);
-	bool		result;
-	Size		len1,
-				len2;
-
-	/*
-	 * We can use a fast path for unequal lengths, which might save us from
-	 * having to detoast one or both values.
-	 */
-	len1 = toast_raw_datum_size(arg1);
-	len2 = toast_raw_datum_size(arg2);
-	if (len1 != len2)
-		result = false;
-	else
-	{
-		bytea	   *barg1 = DatumGetByteaPP(arg1);
-		bytea	   *barg2 = DatumGetByteaPP(arg2);
-
-		result = (memcmp(VARDATA_ANY(barg1), VARDATA_ANY(barg2),
-						 len1 - VARHDRSZ) == 0);
-
-		PG_FREE_IF_COPY(barg1, 0);
-		PG_FREE_IF_COPY(barg2, 1);
-	}
-
-	PG_RETURN_BOOL(result);
-}
-
-Datum
-byteane(PG_FUNCTION_ARGS)
-{
-	Datum		arg1 = PG_GETARG_DATUM(0);
-	Datum		arg2 = PG_GETARG_DATUM(1);
-	bool		result;
-	Size		len1,
-				len2;
-
-	/*
-	 * We can use a fast path for unequal lengths, which might save us from
-	 * having to detoast one or both values.
-	 */
-	len1 = toast_raw_datum_size(arg1);
-	len2 = toast_raw_datum_size(arg2);
-	if (len1 != len2)
-		result = true;
-	else
-	{
-		bytea	   *barg1 = DatumGetByteaPP(arg1);
-		bytea	   *barg2 = DatumGetByteaPP(arg2);
-
-		result = (memcmp(VARDATA_ANY(barg1), VARDATA_ANY(barg2),
-						 len1 - VARHDRSZ) != 0);
-
-		PG_FREE_IF_COPY(barg1, 0);
-		PG_FREE_IF_COPY(barg2, 1);
-	}
-
-	PG_RETURN_BOOL(result);
-}
-
-Datum
-bytealt(PG_FUNCTION_ARGS)
-{
-	bytea	   *arg1 = PG_GETARG_BYTEA_PP(0);
-	bytea	   *arg2 = PG_GETARG_BYTEA_PP(1);
-	int			len1,
-				len2;
-	int			cmp;
-
-	len1 = VARSIZE_ANY_EXHDR(arg1);
-	len2 = VARSIZE_ANY_EXHDR(arg2);
-
-	cmp = memcmp(VARDATA_ANY(arg1), VARDATA_ANY(arg2), Min(len1, len2));
-
-	PG_FREE_IF_COPY(arg1, 0);
-	PG_FREE_IF_COPY(arg2, 1);
-
-	PG_RETURN_BOOL((cmp < 0) || ((cmp == 0) && (len1 < len2)));
-}
-
-Datum
-byteale(PG_FUNCTION_ARGS)
-{
-	bytea	   *arg1 = PG_GETARG_BYTEA_PP(0);
-	bytea	   *arg2 = PG_GETARG_BYTEA_PP(1);
-	int			len1,
-				len2;
-	int			cmp;
-
-	len1 = VARSIZE_ANY_EXHDR(arg1);
-	len2 = VARSIZE_ANY_EXHDR(arg2);
-
-	cmp = memcmp(VARDATA_ANY(arg1), VARDATA_ANY(arg2), Min(len1, len2));
-
-	PG_FREE_IF_COPY(arg1, 0);
-	PG_FREE_IF_COPY(arg2, 1);
-
-	PG_RETURN_BOOL((cmp < 0) || ((cmp == 0) && (len1 <= len2)));
-}
-
-Datum
-byteagt(PG_FUNCTION_ARGS)
-{
-	bytea	   *arg1 = PG_GETARG_BYTEA_PP(0);
-	bytea	   *arg2 = PG_GETARG_BYTEA_PP(1);
-	int			len1,
-				len2;
-	int			cmp;
-
-	len1 = VARSIZE_ANY_EXHDR(arg1);
-	len2 = VARSIZE_ANY_EXHDR(arg2);
-
-	cmp = memcmp(VARDATA_ANY(arg1), VARDATA_ANY(arg2), Min(len1, len2));
-
-	PG_FREE_IF_COPY(arg1, 0);
-	PG_FREE_IF_COPY(arg2, 1);
-
-	PG_RETURN_BOOL((cmp > 0) || ((cmp == 0) && (len1 > len2)));
-}
-
-Datum
-byteage(PG_FUNCTION_ARGS)
-{
-	bytea	   *arg1 = PG_GETARG_BYTEA_PP(0);
-	bytea	   *arg2 = PG_GETARG_BYTEA_PP(1);
-	int			len1,
-				len2;
-	int			cmp;
-
-	len1 = VARSIZE_ANY_EXHDR(arg1);
-	len2 = VARSIZE_ANY_EXHDR(arg2);
-
-	cmp = memcmp(VARDATA_ANY(arg1), VARDATA_ANY(arg2), Min(len1, len2));
-
-	PG_FREE_IF_COPY(arg1, 0);
-	PG_FREE_IF_COPY(arg2, 1);
-
-	PG_RETURN_BOOL((cmp > 0) || ((cmp == 0) && (len1 >= len2)));
-}
-
-Datum
-byteacmp(PG_FUNCTION_ARGS)
-{
-	bytea	   *arg1 = PG_GETARG_BYTEA_PP(0);
-	bytea	   *arg2 = PG_GETARG_BYTEA_PP(1);
-	int			len1,
-				len2;
-	int			cmp;
-
-	len1 = VARSIZE_ANY_EXHDR(arg1);
-	len2 = VARSIZE_ANY_EXHDR(arg2);
-
-	cmp = memcmp(VARDATA_ANY(arg1), VARDATA_ANY(arg2), Min(len1, len2));
-	if ((cmp == 0) && (len1 != len2))
-		cmp = (len1 < len2) ? -1 : 1;
-
-	PG_FREE_IF_COPY(arg1, 0);
-	PG_FREE_IF_COPY(arg2, 1);
-
-	PG_RETURN_INT32(cmp);
-}
-
-Datum
-bytea_larger(PG_FUNCTION_ARGS)
-{
-	bytea	   *arg1 = PG_GETARG_BYTEA_PP(0);
-	bytea	   *arg2 = PG_GETARG_BYTEA_PP(1);
-	bytea	   *result;
-	int			len1,
-				len2;
-	int			cmp;
-
-	len1 = VARSIZE_ANY_EXHDR(arg1);
-	len2 = VARSIZE_ANY_EXHDR(arg2);
-
-	cmp = memcmp(VARDATA_ANY(arg1), VARDATA_ANY(arg2), Min(len1, len2));
-	result = ((cmp > 0) || ((cmp == 0) && (len1 > len2)) ? arg1 : arg2);
-
-	PG_RETURN_BYTEA_P(result);
-}
-
-Datum
-bytea_smaller(PG_FUNCTION_ARGS)
-{
-	bytea	   *arg1 = PG_GETARG_BYTEA_PP(0);
-	bytea	   *arg2 = PG_GETARG_BYTEA_PP(1);
-	bytea	   *result;
-	int			len1,
-				len2;
-	int			cmp;
-
-	len1 = VARSIZE_ANY_EXHDR(arg1);
-	len2 = VARSIZE_ANY_EXHDR(arg2);
-
-	cmp = memcmp(VARDATA_ANY(arg1), VARDATA_ANY(arg2), Min(len1, len2));
-	result = ((cmp < 0) || ((cmp == 0) && (len1 < len2)) ? arg1 : arg2);
-
-	PG_RETURN_BYTEA_P(result);
-}
-
-Datum
-bytea_sortsupport(PG_FUNCTION_ARGS)
-{
-	SortSupport ssup = (SortSupport) PG_GETARG_POINTER(0);
-	MemoryContext oldcontext;
-
-	oldcontext = MemoryContextSwitchTo(ssup->ssup_cxt);
-
-	/* Use generic string SortSupport, forcing "C" collation */
-	varstr_sortsupport(ssup, BYTEAOID, C_COLLATION_OID);
-
-	MemoryContextSwitchTo(oldcontext);
-
-	PG_RETURN_VOID();
 }
 
 /*
@@ -4055,7 +3138,7 @@ replace_text(PG_FUNCTION_ARGS)
 
 		appendStringInfoText(&str, to_sub_text);
 
-		start_ptr = curr_ptr + from_sub_text_len;
+		start_ptr = curr_ptr + state.last_match_len;
 
 		found = text_position_next(&state);
 		if (found)
@@ -4445,7 +3528,7 @@ split_part(PG_FUNCTION_ARGS)
 		/* special case of last field does not require an extra pass */
 		if (fldnum == -1)
 		{
-			start_ptr = text_position_get_match_ptr(&state) + fldsep_len;
+			start_ptr = text_position_get_match_ptr(&state) + state.last_match_len;
 			end_ptr = VARDATA_ANY(inputstring) + inputstring_len;
 			text_position_cleanup(&state);
 			PG_RETURN_TEXT_P(cstring_to_text_with_len(start_ptr,
@@ -4475,7 +3558,7 @@ split_part(PG_FUNCTION_ARGS)
 	while (found && --fldnum > 0)
 	{
 		/* identify bounds of next field */
-		start_ptr = end_ptr + fldsep_len;
+		start_ptr = end_ptr + state.last_match_len;
 		found = text_position_next(&state);
 		if (found)
 			end_ptr = text_position_get_match_ptr(&state);
@@ -4691,7 +3774,7 @@ split_text(FunctionCallInfo fcinfo, SplitTextOutputData *tstate)
 			if (!found)
 				break;
 
-			start_ptr = end_ptr + fldsep_len;
+			start_ptr = end_ptr + state.last_match_len;
 		}
 
 		text_position_cleanup(&state);
@@ -6336,12 +5419,12 @@ unicode_assigned(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errmsg("Unicode categorization can only be performed if server encoding is UTF8")));
 
-	/* convert to pg_wchar */
+	/* convert to char32_t */
 	size = pg_mbstrlen_with_len(VARDATA_ANY(input), VARSIZE_ANY_EXHDR(input));
 	p = (unsigned char *) VARDATA_ANY(input);
 	for (int i = 0; i < size; i++)
 	{
-		pg_wchar	uchar = utf8_to_unicode(p);
+		char32_t	uchar = utf8_to_unicode(p);
 		int			category = unicode_category(uchar);
 
 		if (category == PG_U_UNASSIGNED)
@@ -6360,24 +5443,24 @@ unicode_normalize_func(PG_FUNCTION_ARGS)
 	char	   *formstr = text_to_cstring(PG_GETARG_TEXT_PP(1));
 	UnicodeNormalizationForm form;
 	int			size;
-	pg_wchar   *input_chars;
-	pg_wchar   *output_chars;
+	char32_t   *input_chars;
+	char32_t   *output_chars;
 	unsigned char *p;
 	text	   *result;
 	int			i;
 
 	form = unicode_norm_form_from_string(formstr);
 
-	/* convert to pg_wchar */
+	/* convert to char32_t */
 	size = pg_mbstrlen_with_len(VARDATA_ANY(input), VARSIZE_ANY_EXHDR(input));
-	input_chars = palloc((size + 1) * sizeof(pg_wchar));
+	input_chars = palloc((size + 1) * sizeof(char32_t));
 	p = (unsigned char *) VARDATA_ANY(input);
 	for (i = 0; i < size; i++)
 	{
 		input_chars[i] = utf8_to_unicode(p);
 		p += pg_utf_mblen(p);
 	}
-	input_chars[i] = (pg_wchar) '\0';
+	input_chars[i] = (char32_t) '\0';
 	Assert((char *) p == VARDATA_ANY(input) + VARSIZE_ANY_EXHDR(input));
 
 	/* action */
@@ -6385,7 +5468,7 @@ unicode_normalize_func(PG_FUNCTION_ARGS)
 
 	/* convert back to UTF-8 string */
 	size = 0;
-	for (pg_wchar *wp = output_chars; *wp; wp++)
+	for (char32_t *wp = output_chars; *wp; wp++)
 	{
 		unsigned char buf[4];
 
@@ -6397,7 +5480,7 @@ unicode_normalize_func(PG_FUNCTION_ARGS)
 	SET_VARSIZE(result, size + VARHDRSZ);
 
 	p = (unsigned char *) VARDATA_ANY(result);
-	for (pg_wchar *wp = output_chars; *wp; wp++)
+	for (char32_t *wp = output_chars; *wp; wp++)
 	{
 		unicode_to_utf8(*wp, p);
 		p += pg_utf_mblen(p);
@@ -6426,8 +5509,8 @@ unicode_is_normalized(PG_FUNCTION_ARGS)
 	char	   *formstr = text_to_cstring(PG_GETARG_TEXT_PP(1));
 	UnicodeNormalizationForm form;
 	int			size;
-	pg_wchar   *input_chars;
-	pg_wchar   *output_chars;
+	char32_t   *input_chars;
+	char32_t   *output_chars;
 	unsigned char *p;
 	int			i;
 	UnicodeNormalizationQC quickcheck;
@@ -6436,16 +5519,16 @@ unicode_is_normalized(PG_FUNCTION_ARGS)
 
 	form = unicode_norm_form_from_string(formstr);
 
-	/* convert to pg_wchar */
+	/* convert to char32_t */
 	size = pg_mbstrlen_with_len(VARDATA_ANY(input), VARSIZE_ANY_EXHDR(input));
-	input_chars = palloc((size + 1) * sizeof(pg_wchar));
+	input_chars = palloc((size + 1) * sizeof(char32_t));
 	p = (unsigned char *) VARDATA_ANY(input);
 	for (i = 0; i < size; i++)
 	{
 		input_chars[i] = utf8_to_unicode(p);
 		p += pg_utf_mblen(p);
 	}
-	input_chars[i] = (pg_wchar) '\0';
+	input_chars[i] = (char32_t) '\0';
 	Assert((char *) p == VARDATA_ANY(input) + VARSIZE_ANY_EXHDR(input));
 
 	/* quick check (see UAX #15) */
@@ -6459,11 +5542,11 @@ unicode_is_normalized(PG_FUNCTION_ARGS)
 	output_chars = unicode_normalize(form, input_chars);
 
 	output_size = 0;
-	for (pg_wchar *wp = output_chars; *wp; wp++)
+	for (char32_t *wp = output_chars; *wp; wp++)
 		output_size++;
 
 	result = (size == output_size) &&
-		(memcmp(input_chars, output_chars, size * sizeof(pg_wchar)) == 0);
+		(memcmp(input_chars, output_chars, size * sizeof(char32_t)) == 0);
 
 	PG_RETURN_BOOL(result);
 }
@@ -6519,7 +5602,7 @@ unistr(PG_FUNCTION_ARGS)
 	int			len;
 	StringInfoData str;
 	text	   *result;
-	pg_wchar	pair_first = 0;
+	char16_t	pair_first = 0;
 	char		cbuf[MAX_UNICODE_EQUIVALENT_STRING + 1];
 
 	instr = VARDATA_ANY(input_text);
@@ -6543,7 +5626,7 @@ unistr(PG_FUNCTION_ARGS)
 			else if ((len >= 5 && isxdigits_n(instr + 1, 4)) ||
 					 (len >= 6 && instr[1] == 'u' && isxdigits_n(instr + 2, 4)))
 			{
-				pg_wchar	unicode;
+				char32_t	unicode;
 				int			offset = instr[1] == 'u' ? 2 : 1;
 
 				unicode = hexval_n(instr + offset, 4);
@@ -6579,7 +5662,7 @@ unistr(PG_FUNCTION_ARGS)
 			}
 			else if (len >= 8 && instr[1] == '+' && isxdigits_n(instr + 2, 6))
 			{
-				pg_wchar	unicode;
+				char32_t	unicode;
 
 				unicode = hexval_n(instr + 2, 6);
 
@@ -6614,7 +5697,7 @@ unistr(PG_FUNCTION_ARGS)
 			}
 			else if (len >= 10 && instr[1] == 'U' && isxdigits_n(instr + 2, 8))
 			{
-				pg_wchar	unicode;
+				char32_t	unicode;
 
 				unicode = hexval_n(instr + 2, 8);
 

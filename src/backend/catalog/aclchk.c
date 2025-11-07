@@ -3,7 +3,7 @@
  * aclchk.c
  *	  Routines to check access control permissions.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -64,7 +64,6 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_type.h"
-#include "commands/dbcommands.h"
 #include "commands/defrem.h"
 #include "commands/event_trigger.h"
 #include "commands/extension.h"
@@ -659,6 +658,20 @@ ExecGrantStmt_oids(InternalGrant *istmt)
  * objectNamesToOids
  *
  * Turn a list of object names of a given type into an Oid list.
+ *
+ * XXX This function intentionally takes only an AccessShareLock.  In the face
+ * of concurrent DDL, we might easily latch onto an old version of an object,
+ * causing the GRANT or REVOKE statement to fail.  But it does prevent the
+ * object from disappearing altogether.  To do better, we would need to use a
+ * self-exclusive lock, perhaps ShareUpdateExclusiveLock, here and before
+ * *every* CatalogTupleUpdate() of a row that GRANT/REVOKE can affect.
+ * Besides that additional work, this could have operational costs.  For
+ * example, it would make GRANT ALL TABLES IN SCHEMA terminate every
+ * autovacuum running in the schema and consume a shared lock table entry per
+ * table in the schema.  The user-visible benefit of that additional work is
+ * just changing "ERROR: tuple concurrently updated" to blocking.  That's not
+ * nothing, but it might not outweigh autovacuum termination and lock table
+ * consumption spikes.
  */
 static List *
 objectNamesToOids(ObjectType objtype, List *objnames, bool is_grant)
@@ -1005,6 +1018,10 @@ ExecAlterDefaultPrivilegesStmt(ParseState *pstate, AlterDefaultPrivilegesStmt *s
 			all_privileges = ACL_ALL_RIGHTS_SCHEMA;
 			errormsg = gettext_noop("invalid privilege type %s for schema");
 			break;
+		case OBJECT_LARGEOBJECT:
+			all_privileges = ACL_ALL_RIGHTS_LARGEOBJECT;
+			errormsg = gettext_noop("invalid privilege type %s for large object");
+			break;
 		default:
 			elog(ERROR, "unrecognized GrantStmt.objtype: %d",
 				 (int) action->objtype);
@@ -1194,6 +1211,16 @@ SetDefaultACL(InternalDefaultACL *iacls)
 			objtype = DEFACLOBJ_NAMESPACE;
 			if (iacls->all_privs && this_privileges == ACL_NO_RIGHTS)
 				this_privileges = ACL_ALL_RIGHTS_SCHEMA;
+			break;
+
+		case OBJECT_LARGEOBJECT:
+			if (OidIsValid(iacls->nspid))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_GRANT_OPERATION),
+						 errmsg("cannot use IN SCHEMA clause when using GRANT/REVOKE ON LARGE OBJECTS")));
+			objtype = DEFACLOBJ_LARGEOBJECT;
+			if (iacls->all_privs && this_privileges == ACL_NO_RIGHTS)
+				this_privileges = ACL_ALL_RIGHTS_LARGEOBJECT;
 			break;
 
 		default:
@@ -1438,6 +1465,9 @@ RemoveRoleFromObjectACL(Oid roleid, Oid classid, Oid objid)
 				break;
 			case DEFACLOBJ_NAMESPACE:
 				iacls.objtype = OBJECT_SCHEMA;
+				break;
+			case DEFACLOBJ_LARGEOBJECT:
+				iacls.objtype = OBJECT_LARGEOBJECT;
 				break;
 			default:
 				/* Shouldn't get here */
@@ -3004,10 +3034,6 @@ pg_aclmask(ObjectType objtype, Oid object_oid, AttrNumber attnum, Oid roleid,
  * Exported routines for examining a user's privileges for various objects
  *
  * See aclmask() for a description of the common API for these functions.
- *
- * Note: we give lookup failure the full ereport treatment because the
- * has_xxx_privilege() family of functions allow users to pass any random
- * OID to these functions.
  * ****************************************************************
  */
 
@@ -3074,10 +3100,8 @@ object_aclmask_ext(Oid classid, Oid objectid, Oid roleid,
 			return 0;
 		}
 		else
-			ereport(ERROR,
-					(errcode(ERRCODE_UNDEFINED_OBJECT),
-					 errmsg("%s with OID %u does not exist",
-							get_object_class_descr(classid), objectid)));
+			elog(ERROR, "cache lookup failed for %s %u",
+				 get_object_class_descr(classid), objectid);
 	}
 
 	ownerId = DatumGetObjectId(SysCacheGetAttrNotNull(cacheid,
@@ -4082,9 +4106,8 @@ object_ownercheck(Oid classid, Oid objectid, Oid roleid)
 
 		tuple = SearchSysCache1(cacheid, ObjectIdGetDatum(objectid));
 		if (!HeapTupleIsValid(tuple))
-			ereport(ERROR,
-					(errcode(ERRCODE_UNDEFINED_OBJECT),
-					 errmsg("%s with OID %u does not exist", get_object_class_descr(classid), objectid)));
+			elog(ERROR, "cache lookup failed for %s %u",
+				 get_object_class_descr(classid), objectid);
 
 		ownerId = DatumGetObjectId(SysCacheGetAttrNotNull(cacheid,
 														  tuple,
@@ -4113,9 +4136,8 @@ object_ownercheck(Oid classid, Oid objectid, Oid roleid)
 
 		tuple = systable_getnext(scan);
 		if (!HeapTupleIsValid(tuple))
-			ereport(ERROR,
-					(errcode(ERRCODE_UNDEFINED_OBJECT),
-					 errmsg("%s with OID %u does not exist", get_object_class_descr(classid), objectid)));
+			elog(ERROR, "could not find tuple for %s %u",
+				 get_object_class_descr(classid), objectid);
 
 		ownerId = DatumGetObjectId(heap_getattr(tuple,
 												get_object_attnum_owner(classid),
@@ -4256,6 +4278,10 @@ get_user_default_acl(ObjectType objtype, Oid ownerId, Oid nsp_oid)
 
 		case OBJECT_SCHEMA:
 			defaclobjtype = DEFACLOBJ_NAMESPACE;
+			break;
+
+		case OBJECT_LARGEOBJECT:
+			defaclobjtype = DEFACLOBJ_LARGEOBJECT;
 			break;
 
 		default:

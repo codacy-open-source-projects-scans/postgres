@@ -21,7 +21,7 @@
  * The fields are separated by tabs. Lines beginning with # are comments, and
  * are ignored. Empty lines are also ignored.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/access/transam/timeline.c
@@ -154,7 +154,7 @@ readTimeLineHistory(TimeLineID targetTLI)
 		if (*ptr == '\0' || *ptr == '#')
 			continue;
 
-		nfields = sscanf(fline, "%u\t%X/%X", &tli, &switchpoint_hi, &switchpoint_lo);
+		nfields = sscanf(fline, "%u\t%X/%08X", &tli, &switchpoint_hi, &switchpoint_lo);
 
 		if (nfields < 1)
 		{
@@ -399,7 +399,7 @@ writeTimeLineHistory(TimeLineID newTLI, TimeLineID parentTLI,
 	 * parent file failed to end with one.
 	 */
 	snprintf(buffer, sizeof(buffer),
-			 "%s%u\t%X/%X\t%s\n",
+			 "%s%u\t%X/%08X\t%s\n",
 			 (srcfd < 0) ? "" : "\n",
 			 parentTLI,
 			 LSN_FORMAT_ARGS(switchpoint),
@@ -549,8 +549,8 @@ tliOfPointInHistory(XLogRecPtr ptr, List *history)
 	{
 		TimeLineHistoryEntry *tle = (TimeLineHistoryEntry *) lfirst(cell);
 
-		if ((XLogRecPtrIsInvalid(tle->begin) || tle->begin <= ptr) &&
-			(XLogRecPtrIsInvalid(tle->end) || ptr < tle->end))
+		if ((!XLogRecPtrIsValid(tle->begin) || tle->begin <= ptr) &&
+			(!XLogRecPtrIsValid(tle->end) || ptr < tle->end))
 		{
 			/* found it */
 			return tle->tli;

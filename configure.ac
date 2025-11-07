@@ -17,13 +17,13 @@ dnl Read the Autoconf manual for details.
 dnl
 m4_pattern_forbid(^PGAC_)dnl to catch undefined macros
 
-AC_INIT([PostgreSQL], [18devel], [pgsql-bugs@lists.postgresql.org], [], [https://www.postgresql.org/])
+AC_INIT([PostgreSQL], [19devel], [pgsql-bugs@lists.postgresql.org], [], [https://www.postgresql.org/])
 
 m4_if(m4_defn([m4_PACKAGE_VERSION]), [2.69], [], [m4_fatal([Autoconf version 2.69 is required.
 Untested combinations of 'autoconf' and PostgreSQL versions are not
 recommended.  You can remove the check from 'configure.ac' but it is then
 your responsibility whether the result works or not.])])
-AC_COPYRIGHT([Copyright (c) 1996-2024, PostgreSQL Global Development Group])
+AC_COPYRIGHT([Copyright (c) 1996-2025, PostgreSQL Global Development Group])
 AC_CONFIG_SRCDIR([src/backend/access/common/heaptuple.c])
 AC_CONFIG_AUX_DIR(config)
 AC_PREFIX_DEFAULT(/usr/local/pgsql)
@@ -94,12 +94,6 @@ AC_MSG_RESULT([$template])
 
 PORTNAME=$template
 AC_SUBST(PORTNAME)
-
-# Initialize default assumption that we do not need separate assembly code
-# for TAS (test-and-set).  This can be overridden by the template file
-# when it's executed.
-need_tas=no
-tas_file=dummy.s
 
 # Default, works for most platforms, override in template file if needed
 DLSUFFIX=".so"
@@ -364,13 +358,32 @@ pgac_cc_list="gcc cc"
 pgac_cxx_list="g++ c++"
 
 AC_PROG_CC([$pgac_cc_list])
-AC_PROG_CC_C99()
 
-# Error out if the compiler does not support C99, as the codebase
-# relies on that.
-if test "$ac_cv_prog_cc_c99" = no; then
-    AC_MSG_ERROR([C compiler "$CC" does not support C99])
+# Detect option needed for C11
+# loosely modeled after code in later Autoconf versions
+AC_MSG_CHECKING([for $CC option to accept ISO C11])
+AC_CACHE_VAL([pgac_cv_prog_cc_c11],
+[pgac_cv_prog_cc_c11=no
+pgac_save_CC=$CC
+for pgac_arg in '' '-std=gnu11' '-std=c11'; do
+  CC="$pgac_save_CC $pgac_arg"
+  AC_COMPILE_IFELSE([AC_LANG_SOURCE([[#if !defined __STDC_VERSION__ || __STDC_VERSION__ < 201112L
+# error "Compiler does not advertise C11 conformance"
+#endif]])], [[pgac_cv_prog_cc_c11=$pgac_arg]])
+  test x"$pgac_cv_prog_cc_c11" != x"no" && break
+done
+CC=$pgac_save_CC])
+
+if test x"$pgac_cv_prog_cc_c11" = x"no"; then
+  AC_MSG_RESULT([unsupported])
+  AC_MSG_ERROR([C compiler "$CC" does not support C11])
+elif test x"$pgac_cv_prog_cc_c11" = x""; then
+  AC_MSG_RESULT([none needed])
+else
+  AC_MSG_RESULT([$pgac_cv_prog_cc_c11])
+  CC="$CC $pgac_cv_prog_cc_c11"
 fi
+
 
 AC_PROG_CXX([$pgac_cxx_list])
 
@@ -380,14 +393,6 @@ AC_PROG_CXX([$pgac_cxx_list])
 AC_COMPILE_IFELSE([AC_LANG_PROGRAM([], [@%:@ifndef __INTEL_COMPILER
 choke me
 @%:@endif])], [ICC=yes], [ICC=no])
-
-# Check if it's Sun Studio compiler. We assume that
-# __SUNPRO_C will be defined for Sun Studio compilers
-AC_COMPILE_IFELSE([AC_LANG_PROGRAM([], [@%:@ifndef __SUNPRO_C
-choke me
-@%:@endif])], [SUN_STUDIO_CC=yes], [SUN_STUDIO_CC=no])
-
-AC_SUBST(SUN_STUDIO_CC)
 
 
 #
@@ -599,7 +604,7 @@ fi
 # __attribute__((visibility("hidden"))) is supported, if we encounter a
 # compiler that supports one of the supported variants of -fvisibility=hidden
 # but uses a different syntax to mark a symbol as exported.
-if test "$GCC" = yes -o "$SUN_STUDIO_CC" = yes ; then
+if test "$GCC" = yes; then
   PGAC_PROG_CC_VAR_OPT(CFLAGS_SL_MODULE, [-fvisibility=hidden])
   # For C++ we additionally want -fvisibility-inlines-hidden
   PGAC_PROG_VARCXX_VARFLAGS_OPT(CXX, CXXFLAGS_SL_MODULE, [-fvisibility=hidden])
@@ -754,19 +759,6 @@ fi
 AC_PROG_CPP
 AC_SUBST(GCC)
 
-
-#
-# Set up TAS assembly code if needed; the template file has now had its
-# chance to request this.
-#
-AC_CONFIG_LINKS([src/backend/port/tas.s:src/backend/port/tas/${tas_file}])
-
-if test "$need_tas" = yes ; then
-  TAS=tas.o
-else
-  TAS=""
-fi
-AC_SUBST(TAS)
 
 AC_SUBST(DLSUFFIX)dnl
 AC_DEFINE_UNQUOTED([DLSUFFIX], ["$DLSUFFIX"],
@@ -975,6 +967,18 @@ AC_SUBST(with_readline)
 PGAC_ARG_BOOL(with, libedit-preferred, no,
               [prefer BSD Libedit over GNU Readline])
 
+#
+# liburing
+#
+AC_MSG_CHECKING([whether to build with liburing support])
+PGAC_ARG_BOOL(with, liburing, no, [build with io_uring support, for asynchronous I/O],
+              [AC_DEFINE([USE_LIBURING], 1, [Define to build with io_uring support. (--with-liburing)])])
+AC_MSG_RESULT([$with_liburing])
+AC_SUBST(with_liburing)
+
+if test "$with_liburing" = yes; then
+  PKG_CHECK_MODULES(LIBURING, liburing)
+fi
 
 #
 # UUID library
@@ -1008,6 +1012,62 @@ AC_SUBST(with_uuid)
 
 
 #
+# libcurl
+#
+AC_MSG_CHECKING([whether to build with libcurl support])
+PGAC_ARG_BOOL(with, libcurl, no, [build with libcurl support],
+              [AC_DEFINE([USE_LIBCURL], 1, [Define to 1 to build with libcurl support. (--with-libcurl)])])
+AC_MSG_RESULT([$with_libcurl])
+AC_SUBST(with_libcurl)
+
+if test "$with_libcurl" = yes ; then
+  # Check for libcurl 7.61.0 or higher (corresponding to RHEL8 and the ability
+  # to explicitly set TLS 1.3 ciphersuites).
+  PKG_CHECK_MODULES(LIBCURL, [libcurl >= 7.61.0])
+
+  # Curl's flags are kept separate from the standard CPPFLAGS/LDFLAGS. We use
+  # them only for libpq-oauth.
+  LIBCURL_CPPFLAGS=
+  LIBCURL_LDFLAGS=
+
+  # We only care about -I, -D, and -L switches. Note that -lcurl will be added
+  # to LIBCURL_LDLIBS by PGAC_CHECK_LIBCURL, below.
+  for pgac_option in $LIBCURL_CFLAGS; do
+    case $pgac_option in
+      -I*|-D*) LIBCURL_CPPFLAGS="$LIBCURL_CPPFLAGS $pgac_option";;
+    esac
+  done
+  for pgac_option in $LIBCURL_LIBS; do
+    case $pgac_option in
+      -L*) LIBCURL_LDFLAGS="$LIBCURL_LDFLAGS $pgac_option";;
+    esac
+  done
+
+  AC_SUBST(LIBCURL_CPPFLAGS)
+  AC_SUBST(LIBCURL_LDFLAGS)
+
+  # OAuth requires python for testing
+  if test "$with_python" != yes; then
+    AC_MSG_WARN([*** OAuth support tests require --with-python to run])
+  fi
+fi
+
+
+#
+# libnuma
+#
+AC_MSG_CHECKING([whether to build with libnuma support])
+PGAC_ARG_BOOL(with, libnuma, no, [build with libnuma support],
+              [AC_DEFINE([USE_LIBNUMA], 1, [Define to build with NUMA support. (--with-libnuma)])])
+AC_MSG_RESULT([$with_libnuma])
+AC_SUBST(with_libnuma)
+
+if test "$with_libnuma" = yes ; then
+  AC_CHECK_LIB(numa,    numa_available, [], [AC_MSG_ERROR([library 'libnuma' is required for NUMA support])])
+  PKG_CHECK_MODULES(LIBNUMA, numa)
+fi
+
+#
 # XML
 #
 AC_MSG_CHECKING([whether to build with XML support])
@@ -1035,12 +1095,12 @@ if test "$with_libxml" = yes ; then
   # Note the user could also set XML2_CFLAGS/XML2_LIBS directly
   for pgac_option in $XML2_CFLAGS; do
     case $pgac_option in
-      -I*|-D*) CPPFLAGS="$CPPFLAGS $pgac_option";;
+      -I*|-D*) INCLUDES="$INCLUDES $pgac_option";;
     esac
   done
   for pgac_option in $XML2_LIBS; do
     case $pgac_option in
-      -L*) LDFLAGS="$LDFLAGS $pgac_option";;
+      -L*) LIBDIRS="$LIBDIRS $pgac_option";;
     esac
   done
 fi
@@ -1084,12 +1144,12 @@ if test "$with_lz4" = yes; then
   # note that -llz4 will be added by AC_CHECK_LIB below.
   for pgac_option in $LZ4_CFLAGS; do
     case $pgac_option in
-      -I*|-D*) CPPFLAGS="$CPPFLAGS $pgac_option";;
+      -I*|-D*) INCLUDES="$INCLUDES $pgac_option";;
     esac
   done
   for pgac_option in $LZ4_LIBS; do
     case $pgac_option in
-      -L*) LDFLAGS="$LDFLAGS $pgac_option";;
+      -L*) LIBDIRS="$LIBDIRS $pgac_option";;
     esac
   done
 fi
@@ -1109,12 +1169,12 @@ if test "$with_zstd" = yes; then
   # note that -lzstd will be added by AC_CHECK_LIB below.
   for pgac_option in $ZSTD_CFLAGS; do
     case $pgac_option in
-      -I*|-D*) CPPFLAGS="$CPPFLAGS $pgac_option";;
+      -I*|-D*) INCLUDES="$INCLUDES $pgac_option";;
     esac
   done
   for pgac_option in $ZSTD_LIBS; do
     case $pgac_option in
-      -L*) LDFLAGS="$LDFLAGS $pgac_option";;
+      -L*) LIBDIRS="$LIBDIRS $pgac_option";;
     esac
   done
 fi
@@ -1294,6 +1354,10 @@ failure.  It is possible the compiler isn't looking in the proper directory.
 Use --without-zlib to disable zlib support.])])
 fi
 
+if test "$with_libcurl" = yes ; then
+  PGAC_CHECK_LIBCURL
+fi
+
 if test "$with_gssapi" = yes ; then
   if test "$PORTNAME" != "win32"; then
     AC_SEARCH_LIBS(gss_store_cred_into, [gssapi_krb5 gss 'gssapi -lkrb5 -lcrypto'], [],
@@ -1322,19 +1386,14 @@ if test "$with_ssl" = openssl ; then
   # Minimum required OpenSSL version is 1.1.1
   AC_DEFINE(OPENSSL_API_COMPAT, [0x10101000L],
             [Define to the OpenSSL API version in use. This avoids deprecation warnings from newer OpenSSL versions.])
-  if test "$PORTNAME" != "win32"; then
-     AC_CHECK_LIB(crypto, CRYPTO_new_ex_data, [], [AC_MSG_ERROR([library 'crypto' is required for OpenSSL])])
-     AC_CHECK_LIB(ssl,    SSL_new, [], [AC_MSG_ERROR([library 'ssl' is required for OpenSSL])])
-  else
-     AC_SEARCH_LIBS(CRYPTO_new_ex_data, [eay32 crypto], [], [AC_MSG_ERROR([library 'eay32' or 'crypto' is required for OpenSSL])])
-     AC_SEARCH_LIBS(SSL_new, [ssleay32 ssl], [], [AC_MSG_ERROR([library 'ssleay32' or 'ssl' is required for OpenSSL])])
-  fi
+  AC_CHECK_LIB(crypto, CRYPTO_new_ex_data, [], [AC_MSG_ERROR([library 'crypto' is required for OpenSSL])])
+  AC_CHECK_LIB(ssl,    SSL_new, [], [AC_MSG_ERROR([library 'ssl' is required for OpenSSL])])
   # Functions introduced in OpenSSL 1.1.1.
   AC_CHECK_FUNCS([SSL_CTX_set_ciphersuites], [], [AC_MSG_ERROR([OpenSSL version >= 1.1.1 is required for SSL support])])
   # Function introduced in OpenSSL 1.0.2, not in LibreSSL.
   AC_CHECK_FUNCS([SSL_CTX_set_cert_cb])
   # Function introduced in OpenSSL 1.1.1, not in LibreSSL.
-  AC_CHECK_FUNCS([X509_get_signature_info SSL_CTX_set_num_tickets])
+  AC_CHECK_FUNCS([X509_get_signature_info SSL_CTX_set_num_tickets SSL_CTX_set_keylog_callback])
   AC_DEFINE([USE_OPENSSL], 1, [Define to 1 to build with OpenSSL support. (--with-ssl=openssl)])
 elif test "$with_ssl" != no ; then
   AC_MSG_ERROR([--with-ssl must specify openssl])
@@ -1351,6 +1410,13 @@ fi
 
 if test "$with_libxslt" = yes ; then
   AC_CHECK_LIB(xslt, xsltCleanupGlobals, [], [AC_MSG_ERROR([library 'xslt' is required for XSLT support])])
+fi
+
+if test "$with_liburing" = yes; then
+  _LIBS="$LIBS"
+  LIBS="$LIBURING_LIBS $LIBS"
+  AC_CHECK_FUNCS([io_uring_queue_init_mem])
+  LIBS="$_LIBS"
 fi
 
 if test "$with_lz4" = yes ; then
@@ -1447,6 +1513,7 @@ AC_CHECK_HEADERS(m4_normalize([
 	sys/signalfd.h
 	sys/ucred.h
 	termios.h
+	uchar.h
 	ucred.h
 	xlocale.h
 ]))
@@ -1592,6 +1659,13 @@ if test "$PORTNAME" = "win32" ; then
    AC_CHECK_HEADERS(crtdefs.h)
 fi
 
+if test "$with_libcurl" = yes ; then
+  # Error out early if this platform can't support libpq-oauth.
+  if test "$ac_cv_header_sys_event_h" != yes -a "$ac_cv_header_sys_epoll_h" != yes; then
+    AC_MSG_ERROR([client-side OAuth is not supported on this platform])
+  fi
+fi
+
 ##
 ## Types, structures, compiler characteristics
 ##
@@ -1612,19 +1686,11 @@ PGAC_UNION_SEMUN
 AC_CHECK_TYPES(socklen_t, [], [], [#include <sys/socket.h>])
 PGAC_STRUCT_SOCKADDR_SA_LEN
 
-# MSVC doesn't cope well with defining restrict to __restrict, the
-# spelling it understands, because it conflicts with
-# __declspec(restrict). Therefore we define pg_restrict to the
-# appropriate definition, which presumably won't conflict.
+# Even though restrict is in C99 and should be supported by all
+# supported compilers, this test is useful because it will prefer a
+# spelling that also works in C++ (often __restrict).  (restrict is
+# not part of the C++ standard.)
 AC_C_RESTRICT
-if test "$ac_cv_c_restrict" = "no"; then
-  pg_restrict=""
-else
-  pg_restrict="$ac_cv_c_restrict"
-fi
-AC_DEFINE_UNQUOTED([pg_restrict], [$pg_restrict],
-[Define to keyword to use for C99 restrict support, or to nothing if not
-supported])
 
 AC_CHECK_TYPES([struct option], [], [],
 [#ifdef HAVE_GETOPT_H
@@ -1687,7 +1753,7 @@ AC_CHECK_SIZEOF([off_t])
 
 # If we don't have largefile support, can't handle segment size >= 2GB.
 if test "$ac_cv_sizeof_off_t" -lt 8; then
-  if expr $RELSEG_SIZE '*' $blocksize '>=' 2 '*' 1024 '*' 1024; then
+  if expr $RELSEG_SIZE '*' $blocksize '>=' 2 '*' 1024 '*' 1024 >/dev/null; then
     AC_MSG_ERROR([Large file support is not enabled. Segment size cannot be larger than 1GB.])
   fi
 fi
@@ -1716,14 +1782,13 @@ AC_CHECK_FUNCS(m4_normalize([
 	getpeerucred
 	inet_pton
 	kqueue
+	localeconv_l
 	mbstowcs_l
-	memset_s
 	posix_fallocate
 	ppoll
 	pthread_is_threaded_np
 	setproctitle
 	setproctitle_fast
-	strchrnul
 	strsignal
 	syncfs
 	sync_file_range
@@ -1757,12 +1822,15 @@ AC_CHECK_DECLS(posix_fadvise, [], [], [#include <fcntl.h>])
 ]) # fi
 
 AC_CHECK_DECLS(fdatasync, [], [], [#include <unistd.h>])
-AC_CHECK_DECLS([strlcat, strlcpy, strnlen, strsep])
+AC_CHECK_DECLS([strlcat, strlcpy, strnlen, strsep, timingsafe_bcmp])
 
 # We can't use AC_CHECK_FUNCS to detect these functions, because it
 # won't handle deployment target restrictions on macOS
 AC_CHECK_DECLS([preadv], [], [], [#include <sys/uio.h>])
 AC_CHECK_DECLS([pwritev], [], [], [#include <sys/uio.h>])
+AC_CHECK_DECLS([strchrnul], [], [], [#include <string.h>])
+AC_CHECK_DECLS([memset_s], [], [], [#define __STDC_WANT_LIB_EXT1__ 1
+#include <string.h>])
 
 # This is probably only present on macOS, but may as well check always
 AC_CHECK_DECLS(F_FULLFSYNC, [], [], [#include <fcntl.h>])
@@ -1777,6 +1845,7 @@ AC_REPLACE_FUNCS(m4_normalize([
 	strlcpy
 	strnlen
 	strsep
+	timingsafe_bcmp
 ]))
 
 AC_REPLACE_FUNCS(pthread_barrier_wait)
@@ -1860,7 +1929,7 @@ fi
 
 if test "$with_icu" = yes; then
   ac_save_CPPFLAGS=$CPPFLAGS
-  CPPFLAGS="$ICU_CFLAGS $CPPFLAGS"
+  CPPFLAGS="$CPPFLAGS $ICU_CFLAGS"
 
   # Verify we have ICU's header files
   AC_CHECK_HEADER(unicode/ucol.h, [],
@@ -1960,7 +2029,7 @@ PGAC_HAVE_GCC__ATOMIC_INT32_CAS
 PGAC_HAVE_GCC__ATOMIC_INT64_CAS
 
 
-# Check for x86 cpuid instruction
+# Check for __get_cpuid() and __cpuid()
 AC_CACHE_CHECK([for __get_cpuid], [pgac_cv__get_cpuid],
 [AC_LINK_IFELSE([AC_LANG_PROGRAM([#include <cpuid.h>],
   [[unsigned int exx[4] = {0, 0, 0, 0};
@@ -1970,8 +2039,21 @@ AC_CACHE_CHECK([for __get_cpuid], [pgac_cv__get_cpuid],
   [pgac_cv__get_cpuid="no"])])
 if test x"$pgac_cv__get_cpuid" = x"yes"; then
   AC_DEFINE(HAVE__GET_CPUID, 1, [Define to 1 if you have __get_cpuid.])
+else
+  # __cpuid()
+  AC_CACHE_CHECK([for __cpuid], [pgac_cv__cpuid],
+  [AC_LINK_IFELSE([AC_LANG_PROGRAM([#include <intrin.h>],
+    [[unsigned int exx[4] = {0, 0, 0, 0};
+    __cpuid(exx, 1);
+    ]])],
+    [pgac_cv__cpuid="yes"],
+    [pgac_cv__cpuid="no"])])
+  if test x"$pgac_cv__cpuid" = x"yes"; then
+    AC_DEFINE(HAVE__CPUID, 1, [Define to 1 if you have __cpuid.])
+  fi
 fi
 
+# Check for __get_cpuid_count() and __cpuidex() in a similar fashion.
 AC_CACHE_CHECK([for __get_cpuid_count], [pgac_cv__get_cpuid_count],
 [AC_LINK_IFELSE([AC_LANG_PROGRAM([#include <cpuid.h>],
   [[unsigned int exx[4] = {0, 0, 0, 0};
@@ -1981,28 +2063,18 @@ AC_CACHE_CHECK([for __get_cpuid_count], [pgac_cv__get_cpuid_count],
   [pgac_cv__get_cpuid_count="no"])])
 if test x"$pgac_cv__get_cpuid_count" = x"yes"; then
   AC_DEFINE(HAVE__GET_CPUID_COUNT, 1, [Define to 1 if you have __get_cpuid_count.])
-fi
-
-AC_CACHE_CHECK([for __cpuid], [pgac_cv__cpuid],
-[AC_LINK_IFELSE([AC_LANG_PROGRAM([#include <intrin.h>],
-  [[unsigned int exx[4] = {0, 0, 0, 0};
-  __get_cpuid(exx[0], 1);
-  ]])],
-  [pgac_cv__cpuid="yes"],
-  [pgac_cv__cpuid="no"])])
-if test x"$pgac_cv__cpuid" = x"yes"; then
-  AC_DEFINE(HAVE__CPUID, 1, [Define to 1 if you have __cpuid.])
-fi
-
-AC_CACHE_CHECK([for __cpuidex], [pgac_cv__cpuidex],
-[AC_LINK_IFELSE([AC_LANG_PROGRAM([#include <intrin.h>],
-  [[unsigned int exx[4] = {0, 0, 0, 0};
-  __get_cpuidex(exx[0], 7, 0);
-  ]])],
-  [pgac_cv__cpuidex="yes"],
-  [pgac_cv__cpuidex="no"])])
-if test x"$pgac_cv__cpuidex" = x"yes"; then
-  AC_DEFINE(HAVE__CPUIDEX, 1, [Define to 1 if you have __cpuidex.])
+else
+  # __cpuidex()
+  AC_CACHE_CHECK([for __cpuidex], [pgac_cv__cpuidex],
+  [AC_LINK_IFELSE([AC_LANG_PROGRAM([#include <intrin.h>],
+    [[unsigned int exx[4] = {0, 0, 0, 0};
+    __cpuidex(exx, 7, 0);
+    ]])],
+    [pgac_cv__cpuidex="yes"],
+    [pgac_cv__cpuidex="no"])])
+  if test x"$pgac_cv__cpuidex" = x"yes"; then
+    AC_DEFINE(HAVE__CPUIDEX, 1, [Define to 1 if you have __cpuidex.])
+  fi
 fi
 
 # Check for XSAVE intrinsics
@@ -2018,6 +2090,15 @@ if test x"$host_cpu" = x"x86_64"; then
   PGAC_AVX512_POPCNT_INTRINSICS()
   if test x"$pgac_avx512_popcnt_intrinsics" = x"yes"; then
     AC_DEFINE(USE_AVX512_POPCNT_WITH_RUNTIME_CHECK, 1, [Define to 1 to use AVX-512 popcount instructions with a runtime check.])
+  fi
+fi
+
+# Check for SVE popcount intrinsics
+#
+if test x"$host_cpu" = x"aarch64"; then
+  PGAC_SVE_POPCNT_INTRINSICS()
+  if test x"$pgac_sve_popcnt_intrinsics" = x"yes"; then
+    AC_DEFINE(USE_SVE_POPCNT_WITH_RUNTIME_CHECK, 1, [Define to 1 to use SVE popcount instructions with a runtime check.])
   fi
 fi
 
@@ -2057,17 +2138,21 @@ AC_SUBST(CFLAGS_CRC)
 
 # Select CRC-32C implementation.
 #
-# If we are targeting a processor that has Intel SSE 4.2 instructions, we can
-# use the special CRC instructions for calculating CRC-32C. If we're not
-# targeting such a processor, but we can nevertheless produce code that uses
-# the SSE intrinsics, compile both implementations and select which one to use
-# at runtime, depending on whether SSE 4.2 is supported by the processor we're
-# running on.
+# There are three methods of calculating CRC, in order of increasing
+# performance:
 #
-# Similarly, if we are targeting an ARM processor that has the CRC
-# instructions that are part of the ARMv8 CRC Extension, use them. And if
-# we're not targeting such a processor, but can nevertheless produce code that
-# uses the CRC instructions, compile both, and select at runtime.
+# 1. The fallback using a lookup table, called slicing-by-8
+# 2. CRC-32C instructions (found in e.g. Intel SSE 4.2 and ARMv8 CRC Extension)
+# 3. Algorithms using carryless multiplication instructions
+#    (e.g. Intel PCLMUL and Arm PMULL)
+#
+# If we can produce code (via function attributes or additional compiler
+# flags) that uses #2 (and possibly #3), we compile all implementations
+# and select which one to use at runtime, depending on what is supported
+# by the processor we're running on.
+#
+# If we are targeting a processor that has #2, we can use that without
+# runtime selection.
 #
 # Note that we do not use __attribute__((target("..."))) for the ARM CRC
 # instructions because until clang 16, using the ARM intrinsics still requires
@@ -2115,7 +2200,7 @@ fi
 AC_MSG_CHECKING([which CRC-32C implementation to use])
 if test x"$USE_SSE42_CRC32C" = x"1"; then
   AC_DEFINE(USE_SSE42_CRC32C, 1, [Define to 1 use Intel SSE 4.2 CRC instructions.])
-  PG_CRC32C_OBJS="pg_crc32c_sse42.o"
+  PG_CRC32C_OBJS="pg_crc32c_sse42.o pg_crc32c_sse42_choose.o"
   AC_MSG_RESULT(SSE 4.2)
 else
   if test x"$USE_SSE42_CRC32C_WITH_RUNTIME_CHECK" = x"1"; then
@@ -2148,6 +2233,19 @@ else
 fi
 AC_SUBST(PG_CRC32C_OBJS)
 
+# Check for carryless multiplication intrinsics to do vectorized CRC calculations.
+#
+if test x"$host_cpu" = x"x86_64"; then
+  PGAC_AVX512_PCLMUL_INTRINSICS()
+fi
+
+AC_MSG_CHECKING([for vectorized CRC-32C])
+if test x"$pgac_avx512_pclmul_intrinsics" = x"yes"; then
+  AC_DEFINE(USE_AVX512_CRC32C_WITH_RUNTIME_CHECK, 1, [Define to 1 to use AVX-512 CRC algorithms with a runtime check.])
+  AC_MSG_RESULT(AVX-512 with runtime check)
+else
+  AC_MSG_RESULT(none)
+fi
 
 # Select semaphore implementation type.
 if test "$PORTNAME" != "win32"; then
@@ -2234,7 +2332,7 @@ Use --without-tcl to disable building PL/Tcl.])
     fi
     # now that we have TCL_INCLUDE_SPEC, we can check for <tcl.h>
     ac_save_CPPFLAGS=$CPPFLAGS
-    CPPFLAGS="$TCL_INCLUDE_SPEC $CPPFLAGS"
+    CPPFLAGS="$CPPFLAGS $TCL_INCLUDE_SPEC"
     AC_CHECK_HEADER(tcl.h, [], [AC_MSG_ERROR([header file <tcl.h> is required for Tcl])])
     CPPFLAGS=$ac_save_CPPFLAGS
 fi
@@ -2271,7 +2369,7 @@ fi
 # check for <Python.h>
 if test "$with_python" = yes; then
   ac_save_CPPFLAGS=$CPPFLAGS
-  CPPFLAGS="$python_includespec $CPPFLAGS"
+  CPPFLAGS="$CPPFLAGS $python_includespec"
   AC_CHECK_HEADER(Python.h, [], [AC_MSG_ERROR([header file <Python.h> is required for Python])])
   CPPFLAGS=$ac_save_CPPFLAGS
 fi
@@ -2346,8 +2444,6 @@ AC_SUBST(LDFLAGS_EX_BE)
 if test x"$GCC" = x"yes" ; then
   cc_string=`${CC} --version | sed q`
   case $cc_string in [[A-Za-z]]*) ;; *) cc_string="GCC $cc_string";; esac
-elif test x"$SUN_STUDIO_CC" = x"yes" ; then
-  cc_string=`${CC} -V 2>&1 | sed q`
 else
   cc_string=$CC
 fi

@@ -29,7 +29,7 @@
  * This code isn't concerned about the FSM at all. The caller is responsible
  * for initializing that.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -44,6 +44,7 @@
 #include "access/parallel.h"
 #include "access/relscan.h"
 #include "access/table.h"
+#include "access/tableam.h"
 #include "access/xact.h"
 #include "catalog/index.h"
 #include "commands/progress.h"
@@ -51,7 +52,7 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/bulk_write.h"
-#include "tcop/tcopprot.h"		/* pgrminclude ignore */
+#include "tcop/tcopprot.h"
 #include "utils/rel.h"
 #include "utils/sortsupport.h"
 #include "utils/tuplesort.h"
@@ -105,7 +106,7 @@ typedef struct BTShared
 	int			scantuplesortstates;
 
 	/* Query ID, for report in worker processes */
-	uint64		queryid;
+	int64		queryid;
 
 	/*
 	 * workersdonecv is used to monitor the progress of workers.  All parallel
@@ -256,8 +257,8 @@ typedef struct BTWriteState
 static double _bt_spools_heapscan(Relation heap, Relation index,
 								  BTBuildState *buildstate, IndexInfo *indexInfo);
 static void _bt_spooldestroy(BTSpool *btspool);
-static void _bt_spool(BTSpool *btspool, ItemPointer self,
-					  Datum *values, bool *isnull);
+static void _bt_spool(BTSpool *btspool, const ItemPointerData *self,
+					  const Datum *values, const bool *isnull);
 static void _bt_leafbuild(BTSpool *btspool, BTSpool *btspool2);
 static void _bt_build_callback(Relation index, ItemPointer tid, Datum *values,
 							   bool *isnull, bool tupleIsAlive, void *state);
@@ -265,7 +266,7 @@ static BulkWriteBuffer _bt_blnewpage(BTWriteState *wstate, uint32 level);
 static BTPageState *_bt_pagestate(BTWriteState *wstate, uint32 level);
 static void _bt_slideleft(Page rightmostpage);
 static void _bt_sortaddtup(Page page, Size itemsize,
-						   IndexTuple itup, OffsetNumber itup_off,
+						   const IndexTupleData *itup, OffsetNumber itup_off,
 						   bool newfirstdataitem);
 static void _bt_buildadd(BTWriteState *wstate, BTPageState *state,
 						 IndexTuple itup, Size truncextra);
@@ -524,7 +525,7 @@ _bt_spooldestroy(BTSpool *btspool)
  * spool an index entry into the sort file.
  */
 static void
-_bt_spool(BTSpool *btspool, ItemPointer self, Datum *values, bool *isnull)
+_bt_spool(BTSpool *btspool, const ItemPointerData *self, const Datum *values, const bool *isnull)
 {
 	tuplesort_putindextuplevalues(btspool->sortstate, btspool->index,
 								  self, values, isnull);
@@ -715,7 +716,7 @@ _bt_slideleft(Page rightmostpage)
 static void
 _bt_sortaddtup(Page page,
 			   Size itemsize,
-			   IndexTuple itup,
+			   const IndexTupleData *itup,
 			   OffsetNumber itup_off,
 			   bool newfirstdataitem)
 {
@@ -730,8 +731,7 @@ _bt_sortaddtup(Page page,
 		itemsize = sizeof(IndexTupleData);
 	}
 
-	if (PageAddItem(page, (Item) itup, itemsize, itup_off,
-					false, false) == InvalidOffsetNumber)
+	if (PageAddItem(page, itup, itemsize, itup_off, false, false) == InvalidOffsetNumber)
 		elog(ERROR, "failed to add item to the index page");
 }
 
@@ -829,7 +829,7 @@ _bt_buildadd(BTWriteState *wstate, BTPageState *state, IndexTuple itup,
 	 * make use of the reserved space.  This should never fail on internal
 	 * pages.
 	 */
-	if (unlikely(itupsz > BTMaxItemSize(npage)))
+	if (unlikely(itupsz > BTMaxItemSize))
 		_bt_check_third_page(wstate->index, wstate->heap, isleaf, npage,
 							 itup);
 
@@ -933,8 +933,7 @@ _bt_buildadd(BTWriteState *wstate, BTPageState *state, IndexTuple itup,
 			Assert(IndexTupleSize(oitup) > last_truncextra);
 			truncated = _bt_truncate(wstate->index, lastleft, oitup,
 									 wstate->inskey);
-			if (!PageIndexTupleOverwrite(opage, P_HIKEY, (Item) truncated,
-										 IndexTupleSize(truncated)))
+			if (!PageIndexTupleOverwrite(opage, P_HIKEY, truncated, IndexTupleSize(truncated)))
 				elog(ERROR, "failed to add high key to the index page");
 			pfree(truncated);
 
@@ -1171,7 +1170,7 @@ _bt_load(BTWriteState *wstate, BTSpool *btspool, BTSpool *btspool2)
 		{
 			SortSupport sortKey = sortKeys + i;
 			ScanKey		scanKey = wstate->inskey->scankeys + i;
-			int16		strategy;
+			bool		reverse;
 
 			sortKey->ssup_cxt = CurrentMemoryContext;
 			sortKey->ssup_collation = scanKey->sk_collation;
@@ -1183,10 +1182,9 @@ _bt_load(BTWriteState *wstate, BTSpool *btspool, BTSpool *btspool2)
 
 			Assert(sortKey->ssup_attno != 0);
 
-			strategy = (scanKey->sk_flags & SK_BT_DESC) != 0 ?
-				BTGreaterStrategyNumber : BTLessStrategyNumber;
+			reverse = (scanKey->sk_flags & SK_BT_DESC) != 0;
 
-			PrepareSortSupportFromIndexRel(wstate->index, strategy, sortKey);
+			PrepareSortSupportFromIndexRel(wstate->index, reverse, sortKey);
 		}
 
 		for (;;)
@@ -1305,7 +1303,7 @@ _bt_load(BTWriteState *wstate, BTSpool *btspool, BTSpool *btspool2)
 				 */
 				dstate->maxpostingsize = MAXALIGN_DOWN((BLCKSZ * 10 / 100)) -
 					sizeof(ItemIdData);
-				Assert(dstate->maxpostingsize <= BTMaxItemSize((Page) state->btps_buf) &&
+				Assert(dstate->maxpostingsize <= BTMaxItemSize &&
 					   dstate->maxpostingsize <= INDEX_SIZE_MASK);
 				dstate->htids = palloc(dstate->maxpostingsize);
 

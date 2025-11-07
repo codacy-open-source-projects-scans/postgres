@@ -4,7 +4,7 @@
  *	  POSTGRES relation descriptor (a/k/a relcache entry) definitions.
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/rel.h
@@ -284,6 +284,9 @@ typedef struct ForeignKeyCacheInfo
 	/* number of columns in the foreign key */
 	int			nkeys;
 
+	/* Is enforced ? */
+	bool		conenforced;
+
 	/*
 	 * these arrays each have nkeys valid entries:
 	 */
@@ -309,6 +312,7 @@ typedef struct AutoVacOpts
 {
 	bool		enabled;
 	int			vacuum_threshold;
+	int			vacuum_max_threshold;
 	int			vacuum_ins_threshold;
 	int			analyze_threshold;
 	int			vacuum_cost_limit;
@@ -318,7 +322,8 @@ typedef struct AutoVacOpts
 	int			multixact_freeze_min_age;
 	int			multixact_freeze_max_age;
 	int			multixact_freeze_table_age;
-	int			log_min_duration;
+	int			log_vacuum_min_duration;
+	int			log_analyze_min_duration;
 	float8		vacuum_cost_delay;
 	float8		vacuum_scale_factor;
 	float8		vacuum_ins_scale_factor;
@@ -343,6 +348,13 @@ typedef struct StdRdOptions
 	int			parallel_workers;	/* max number of parallel workers */
 	StdRdOptIndexCleanup vacuum_index_cleanup;	/* controls index vacuuming */
 	bool		vacuum_truncate;	/* enables vacuum to truncate a relation */
+	bool		vacuum_truncate_set;	/* whether vacuum_truncate is set */
+
+	/*
+	 * Fraction of pages in a relation that vacuum can eagerly scan and fail
+	 * to freeze. 0 if disabled, -1 if unspecified.
+	 */
+	double		vacuum_max_eager_freeze_failure_rate;
 } StdRdOptions;
 
 #define HEAP_MIN_FILLFACTOR			10
@@ -475,9 +487,7 @@ typedef struct ViewOptions
  * RelationIsValid
  *		True iff relation descriptor is valid.
  */
-#define RelationIsValid(relation) PointerIsValid(relation)
-
-#define InvalidRelation ((Relation) NULL)
+#define RelationIsValid(relation) ((relation) != NULL)
 
 /*
  * RelationHasReferenceCountZero

@@ -3,7 +3,7 @@
  * reconstruct.c
  *		Reconstruct full file from incremental file and backup chain.
  *
- * Copyright (c) 2017-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2017-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/bin/pg_combinebackup/reconstruct.c
@@ -214,7 +214,7 @@ reconstruct_from_incremental_file(char *input_filename,
 			 * taking no action on those blocks that generated any WAL.
 			 *
 			 * Sadly, we have no way of validating that this is really what
-			 * happened, and neither does the server. From it's perspective,
+			 * happened, and neither does the server.  From its perspective,
 			 * an unmodified block that contains data looks exactly the same
 			 * as a zero-filled block that never had any data: either way,
 			 * it's not mentioned in any WAL summary and the server has no
@@ -370,6 +370,7 @@ reconstruct_from_incremental_file(char *input_filename,
 		if (s->relative_block_numbers != NULL)
 			pfree(s->relative_block_numbers);
 		pg_free(s->filename);
+		pg_free(s);
 	}
 	pfree(sourcemap);
 	pfree(offsetmap);
@@ -517,6 +518,7 @@ make_rfile(char *filename, bool missing_ok)
 	{
 		if (missing_ok && errno == ENOENT)
 		{
+			pg_free(rf->filename);
 			pg_free(rf);
 			return NULL;
 		}

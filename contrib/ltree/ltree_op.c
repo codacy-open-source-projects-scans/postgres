@@ -13,7 +13,10 @@
 #include "utils/selfuncs.h"
 #include "varatt.h"
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "ltree",
+					.version = PG_VERSION
+);
 
 /* compare functions */
 PG_FUNCTION_INFO_V1(ltree_cmp);
@@ -313,23 +316,15 @@ subpath(PG_FUNCTION_ARGS)
 	int32		end;
 	ltree	   *res;
 
-	end = start + len;
-
 	if (start < 0)
-	{
 		start = t->numlevel + start;
-		end = start + len;
-	}
-	if (start < 0)
-	{							/* start > t->numlevel */
-		start = t->numlevel + start;
-		end = start + len;
-	}
 
 	if (len < 0)
 		end = t->numlevel + len;
 	else if (len == 0)
-		end = (fcinfo->nargs == 3) ? start : 0xffff;
+		end = (fcinfo->nargs == 3) ? start : LTREE_MAX_LEVELS;
+	else
+		end = start + len;
 
 	res = inner_subltree(t, start, end);
 

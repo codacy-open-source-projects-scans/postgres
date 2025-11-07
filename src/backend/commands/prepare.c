@@ -7,7 +7,7 @@
  * accessed via the extended FE/BE query protocol.
  *
  *
- * Copyright (c) 2002-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2002-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/commands/prepare.c
@@ -21,6 +21,9 @@
 #include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "commands/createas.h"
+#include "commands/explain.h"
+#include "commands/explain_format.h"
+#include "commands/explain_state.h"
 #include "commands/prepare.h"
 #include "funcapi.h"
 #include "nodes/nodeFuncs.h"

@@ -22,7 +22,7 @@
  * tuples (unless buffering mode is disabled).
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -558,7 +558,7 @@ gist_indexsortbuild_levelstate_flush(GISTBuildState *state,
 		{
 			IndexTuple	thistup = (IndexTuple) data;
 
-			if (PageAddItem(target, (Item) data, IndexTupleSize(thistup), i + FirstOffsetNumber, false, false) == InvalidOffsetNumber)
+			if (PageAddItem(target, data, IndexTupleSize(thistup), i + FirstOffsetNumber, false, false) == InvalidOffsetNumber)
 				elog(ERROR, "failed to add item to index page in \"%s\"", RelationGetRelationName(state->indexrel));
 
 			data += IndexTupleSize(thistup);
@@ -657,10 +657,12 @@ gistInitBuffering(GISTBuildState *buildstate)
 	itupMinSize = (Size) MAXALIGN(sizeof(IndexTupleData));
 	for (i = 0; i < index->rd_att->natts; i++)
 	{
-		if (TupleDescAttr(index->rd_att, i)->attlen < 0)
+		CompactAttribute *attr = TupleDescCompactAttr(index->rd_att, i);
+
+		if (attr->attlen < 0)
 			itupMinSize += VARHDRSZ;
 		else
-			itupMinSize += TupleDescAttr(index->rd_att, i)->attlen;
+			itupMinSize += attr->attlen;
 	}
 
 	/* Calculate average and maximal number of index tuples which fit to page */
@@ -967,7 +969,7 @@ gistProcessItup(GISTBuildState *buildstate, IndexTuple itup,
 		buffer = ReadBuffer(indexrel, blkno);
 		LockBuffer(buffer, GIST_EXCLUSIVE);
 
-		page = (Page) BufferGetPage(buffer);
+		page = BufferGetPage(buffer);
 		childoffnum = gistchoose(indexrel, page, itup, giststate);
 		iid = PageGetItemId(page, childoffnum);
 		idxtuple = (IndexTuple) PageGetItem(page, iid);
@@ -1446,7 +1448,7 @@ gistGetMaxLevel(Relation index)
 		 * pro forma.
 		 */
 		LockBuffer(buffer, GIST_SHARE);
-		page = (Page) BufferGetPage(buffer);
+		page = BufferGetPage(buffer);
 
 		if (GistPageIsLeaf(page))
 		{

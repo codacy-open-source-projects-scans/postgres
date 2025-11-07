@@ -14,7 +14,7 @@
 #include "plpy_resultobject.h"
 #include "plpy_spi.h"
 #include "plpy_subxactobject.h"
-#include "plpython.h"
+#include "plpy_util.h"
 #include "utils/builtins.h"
 
 HTAB	   *PLy_spi_exceptions = NULL;
@@ -369,7 +369,7 @@ PLy_quote_ident(PyObject *self, PyObject *args)
 	return ret;
 }
 
-/* enforce cast of object to string */
+/* enforce cast of object to string (returns a palloc'd string or NULL) */
 static char *
 object_to_string(PyObject *obj)
 {
@@ -381,7 +381,7 @@ object_to_string(PyObject *obj)
 		{
 			char	   *str;
 
-			str = pstrdup(PLyUnicode_AsString(so));
+			str = PLyUnicode_AsString(so);
 			Py_DECREF(so);
 
 			return str;

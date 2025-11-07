@@ -3,7 +3,7 @@
  * dict_synonym.c
  *		Synonym dictionary: replace word by its synonym
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -199,6 +199,7 @@ skipline:
 	}
 
 	tsearch_readline_end(&trst);
+	pfree(filename);
 
 	d->len = cur;
 	qsort(d->syn, d->len, sizeof(Syn), compareSyn);

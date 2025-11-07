@@ -3,7 +3,7 @@
  * parse_agg.c
  *	  handle aggregates and window functions in parser
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -791,6 +791,32 @@ check_agg_arguments_walker(Node *node,
 					 parser_errposition(context->pstate,
 										((WindowFunc *) node)->location)));
 	}
+
+	if (IsA(node, RangeTblEntry))
+	{
+		/*
+		 * CTE references act similarly to Vars of the CTE's level.  Without
+		 * this we might conclude that the Agg can be evaluated above the CTE,
+		 * leading to trouble.
+		 */
+		RangeTblEntry *rte = (RangeTblEntry *) node;
+
+		if (rte->rtekind == RTE_CTE)
+		{
+			int			ctelevelsup = rte->ctelevelsup;
+
+			/* convert levelsup to frame of reference of original query */
+			ctelevelsup -= context->sublevels_up;
+			/* ignore local CTEs of subqueries */
+			if (ctelevelsup >= 0)
+			{
+				if (context->min_varlevel < 0 ||
+					context->min_varlevel > ctelevelsup)
+					context->min_varlevel = ctelevelsup;
+			}
+		}
+		return false;			/* allow range_table_walker to continue */
+	}
 	if (IsA(node, Query))
 	{
 		/* Recurse into subselects */
@@ -800,7 +826,7 @@ check_agg_arguments_walker(Node *node,
 		result = query_tree_walker((Query *) node,
 								   check_agg_arguments_walker,
 								   context,
-								   0);
+								   QTW_EXAMINE_RTES_BEFORE);
 		context->sublevels_up--;
 		return result;
 	}
@@ -2052,7 +2078,7 @@ resolve_aggregate_transtype(Oid aggfuncid,
 
 /*
  * agg_args_support_sendreceive
- *		Returns true if all non-byval of aggref's arg types have send and
+ *		Returns true if all non-byval types of aggref's args have send and
  *		receive functions.
  */
 bool
@@ -2066,6 +2092,15 @@ agg_args_support_sendreceive(Aggref *aggref)
 		Form_pg_type pt;
 		TargetEntry *tle = (TargetEntry *) lfirst(lc);
 		Oid			type = exprType((Node *) tle->expr);
+
+		/*
+		 * RECORD is a special case: it has typsend/typreceive functions, but
+		 * record_recv only works if passed the correct typmod to identify the
+		 * specific anonymous record type.  array_agg_deserialize cannot do
+		 * that, so we have to disclaim support for the case.
+		 */
+		if (type == RECORDOID)
+			return false;
 
 		typeTuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type));
 		if (!HeapTupleIsValid(typeTuple))

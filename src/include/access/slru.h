@@ -3,7 +3,7 @@
  * slru.h
  *		Simple LRU buffering for transaction status logfiles
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/slru.h
@@ -55,7 +55,7 @@ typedef enum
 /*
  * Shared-memory state
  *
- * ControlLock is used to protect access to the other fields, except
+ * SLRU bank locks are used to protect access to the other fields, except
  * latest_page_number, which uses atomics; see comment in slru.c.
  */
 typedef struct SlruSharedData
@@ -128,10 +128,8 @@ typedef struct SlruCtlData
 {
 	SlruShared	shared;
 
-	/*
-	 * Bitmask to determine bank number from page number.
-	 */
-	bits16		bank_mask;
+	/* Number of banks in this SLRU. */
+	uint16		nbanks;
 
 	/*
 	 * If true, use long segment file names.  Otherwise, use short file names.
@@ -163,7 +161,6 @@ typedef struct SlruCtlData
 	 * it's always the same, it doesn't need to be in shared memory.
 	 */
 	char		Dir[64];
-
 } SlruCtlData;
 
 typedef SlruCtlData *SlruCtl;
@@ -179,7 +176,7 @@ SimpleLruGetBankLock(SlruCtl ctl, int64 pageno)
 {
 	int			bankno;
 
-	bankno = pageno & ctl->bank_mask;
+	bankno = pageno % ctl->nbanks;
 	return &(ctl->shared->bank_locks[bankno].lock);
 }
 
@@ -190,6 +187,7 @@ extern void SimpleLruInit(SlruCtl ctl, const char *name, int nslots, int nlsns,
 						  int bank_tranche_id, SyncRequestHandler sync_handler,
 						  bool long_segment_names);
 extern int	SimpleLruZeroPage(SlruCtl ctl, int64 pageno);
+extern void SimpleLruZeroAndWritePage(SlruCtl ctl, int64 pageno);
 extern int	SimpleLruReadPage(SlruCtl ctl, int64 pageno, bool write_ok,
 							  TransactionId xid);
 extern int	SimpleLruReadPage_ReadOnly(SlruCtl ctl, int64 pageno,

@@ -39,7 +39,7 @@
  * empty and be returned to the free page manager, and whole segments can
  * become empty and be returned to the operating system.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -529,6 +529,21 @@ dsa_attach(dsa_handle handle)
 				  PointerGetDatum(dsm_segment_address(segment)));
 
 	return area;
+}
+
+/*
+ * Returns whether the area with the given handle was already attached by the
+ * current process.  The area must have been created with dsa_create (not
+ * dsa_create_in_place).
+ */
+bool
+dsa_is_attached(dsa_handle handle)
+{
+	/*
+	 * An area handle is really a DSM segment handle for the first segment, so
+	 * we can just search for that.
+	 */
+	return dsm_find_mapping(handle) != NULL;
 }
 
 /*

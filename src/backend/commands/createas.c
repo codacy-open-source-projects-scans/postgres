@@ -13,7 +13,7 @@
  * we must return a tuples-processed count in the QueryCompletion.  (We no
  * longer do that for CTAS ... WITH NO DATA, however.)
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -35,6 +35,8 @@
 #include "commands/prepare.h"
 #include "commands/tablecmds.h"
 #include "commands/view.h"
+#include "executor/execdesc.h"
+#include "executor/executor.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/queryjumble.h"
@@ -319,7 +321,7 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 
 		/* plan the query */
 		plan = pg_plan_query(query, pstate->p_sourcetext,
-							 CURSOR_OPT_PARALLEL_OK, params);
+							 CURSOR_OPT_PARALLEL_OK, params, NULL);
 
 		/*
 		 * Use a snapshot with an updated command ID to ensure this query sees

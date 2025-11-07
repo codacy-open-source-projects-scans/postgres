@@ -4,7 +4,7 @@
  *	  routines to support running postgres in 'bootstrap' mode
  *	bootstrap mode is used to create the initial template database
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -109,6 +109,8 @@ static const struct typinfo TypInfo[] = {
 	F_REGROLEIN, F_REGROLEOUT},
 	{"regnamespace", REGNAMESPACEOID, 0, 4, true, TYPALIGN_INT, TYPSTORAGE_PLAIN, InvalidOid,
 	F_REGNAMESPACEIN, F_REGNAMESPACEOUT},
+	{"regdatabase", REGDATABASEOID, 0, 4, true, TYPALIGN_INT, TYPSTORAGE_PLAIN, InvalidOid,
+	F_REGDATABASEIN, F_REGDATABASEOUT},
 	{"text", TEXTOID, 0, -1, false, TYPALIGN_INT, TYPSTORAGE_EXTENDED, DEFAULT_COLLATION_OID,
 	F_TEXTIN, F_TEXTOUT},
 	{"oid", OIDOID, 0, 4, true, TYPALIGN_INT, TYPSTORAGE_PLAIN, InvalidOid,
@@ -202,6 +204,7 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
 	int			flag;
 	char	   *userDoption = NULL;
 	uint32		bootstrap_data_checksum_version = 0;	/* No checksum */
+	yyscan_t	scanner;
 
 	Assert(!IsUnderPostmaster);
 
@@ -378,11 +381,14 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
 		Nulls[i] = false;
 	}
 
+	if (boot_yylex_init(&scanner) != 0)
+		elog(ERROR, "yylex_init() failed: %m");
+
 	/*
 	 * Process bootstrap input.
 	 */
 	StartTransactionCommand();
-	boot_yyparse();
+	boot_yyparse(scanner);
 	CommitTransactionCommand();
 
 	/*
@@ -459,8 +465,8 @@ boot_openrel(char *relname)
 	{
 		if (attrtypes[i] == NULL)
 			attrtypes[i] = AllocateAttribute();
-		memmove((char *) attrtypes[i],
-				(char *) TupleDescAttr(boot_reldesc->rd_att, i),
+		memmove(attrtypes[i],
+				TupleDescAttr(boot_reldesc->rd_att, i),
 				ATTRIBUTE_FIXED_PART_SIZE);
 
 		{
@@ -576,7 +582,6 @@ DefineAttr(char *name, char *type, int attnum, int nullness)
 	if (OidIsValid(attrtypes[attnum]->attcollation))
 		attrtypes[attnum]->attcollation = C_COLLATION_OID;
 
-	attrtypes[attnum]->attcacheoff = -1;
 	attrtypes[attnum]->atttypmod = -1;
 	attrtypes[attnum]->attislocal = true;
 

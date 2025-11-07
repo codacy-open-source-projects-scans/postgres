@@ -23,7 +23,7 @@
  * from LIKE to indexscan limits rather harder than one might think ...
  * but that's the basic idea.)
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -1495,13 +1495,8 @@ pattern_char_isalpha(char c, bool is_multibyte,
 {
 	if (locale->ctype_is_c)
 		return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
-	else if (is_multibyte && IS_HIGHBIT_SET(c))
-		return true;
-	else if (locale->provider != COLLPROVIDER_LIBC)
-		return IS_HIGHBIT_SET(c) ||
-			(c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
 	else
-		return isalpha_l((unsigned char) c, locale->info.lt);
+		return char_is_cased(c, locale);
 }
 
 

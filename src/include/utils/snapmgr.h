@@ -3,7 +3,7 @@
  * snapmgr.h
  *	  POSTGRES snapshot manager
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/snapmgr.h
@@ -28,7 +28,6 @@ extern PGDLLIMPORT TransactionId RecentXmin;
 extern PGDLLIMPORT SnapshotData SnapshotSelfData;
 extern PGDLLIMPORT SnapshotData SnapshotAnyData;
 extern PGDLLIMPORT SnapshotData SnapshotToastData;
-extern PGDLLIMPORT SnapshotData CatalogSnapshotData;
 
 #define SnapshotSelf		(&SnapshotSelfData)
 #define SnapshotAny			(&SnapshotAnyData)
@@ -56,6 +55,9 @@ extern PGDLLIMPORT SnapshotData CatalogSnapshotData;
 #define IsMVCCSnapshot(snapshot)  \
 	((snapshot)->snapshot_type == SNAPSHOT_MVCC || \
 	 (snapshot)->snapshot_type == SNAPSHOT_HISTORIC_MVCC)
+
+#define IsHistoricMVCCSnapshot(snapshot)  \
+	((snapshot)->snapshot_type == SNAPSHOT_HISTORIC_MVCC)
 
 extern Snapshot GetTransactionSnapshot(void);
 extern Snapshot GetLatestSnapshot(void);

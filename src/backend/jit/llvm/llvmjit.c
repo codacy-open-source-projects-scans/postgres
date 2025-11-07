@@ -3,7 +3,7 @@
  * llvmjit.c
  *	  Core part of the LLVM JIT provider.
  *
- * Copyright (c) 2016-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2016-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/jit/llvm/llvmjit.c
@@ -54,6 +54,7 @@ typedef struct LLVMJitHandle
 
 /* types & functions commonly needed for JITing */
 LLVMTypeRef TypeSizeT;
+LLVMTypeRef TypeDatum;
 LLVMTypeRef TypeParamBool;
 LLVMTypeRef TypeStorageBool;
 LLVMTypeRef TypePGFunction;
@@ -138,7 +139,10 @@ ResourceOwnerForgetJIT(ResourceOwner owner, LLVMJitContext *handle)
 	ResourceOwnerForget(owner, PointerGetDatum(handle), &jit_resowner_desc);
 }
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "llvmjit",
+					.version = PG_VERSION
+);
 
 
 /*
@@ -1008,6 +1012,7 @@ llvm_create_types(void)
 	LLVMDisposeMemoryBuffer(buf);
 
 	TypeSizeT = llvm_pg_var_type("TypeSizeT");
+	TypeDatum = llvm_pg_var_type("TypeDatum");
 	TypeParamBool = load_return_type(llvm_types_module, "FunctionReturningBool");
 	TypeStorageBool = llvm_pg_var_type("TypeStorageBool");
 	TypePGFunction = llvm_pg_var_type("TypePGFunction");

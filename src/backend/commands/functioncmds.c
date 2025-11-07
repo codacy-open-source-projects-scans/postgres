@@ -5,7 +5,7 @@
  *	  Routines for CREATE and DROP FUNCTION commands and CREATE and DROP
  *	  CAST commands.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -15,7 +15,7 @@
  * DESCRIPTION
  *	  These routines take the parse tree and pick out the
  *	  appropriate arguments/flags, and pass the results to the
- *	  corresponding "FooDefine" routines (in src/catalog) that do
+ *	  corresponding "FooCreate" routines (in src/backend/catalog) that do
  *	  the actual catalog-munging.  These routines also verify permission
  *	  of the user to execute the command.
  *
@@ -74,7 +74,7 @@
 
 /*
  *	 Examine the RETURNS clause of the CREATE FUNCTION statement
- *	 and return information about it as *prorettype_p and *returnsSet.
+ *	 and return information about it as *prorettype_p and *returnsSet_p.
  *
  * This is more complex than the average typename lookup because we want to
  * allow a shell type to be used, or even created if the specified return type
@@ -1046,6 +1046,7 @@ CreateFunction(ParseState *pstate, CreateFunctionStmt *stmt)
 	List	   *parameterDefaults;
 	Oid			variadicArgType;
 	List	   *trftypes_list = NIL;
+	List	   *trfoids_list = NIL;
 	ArrayType  *trftypes;
 	Oid			requiredResultType;
 	bool		isWindowFunc,
@@ -1157,11 +1158,12 @@ CreateFunction(ParseState *pstate, CreateFunctionStmt *stmt)
 			Oid			typeid = typenameTypeId(NULL,
 												lfirst_node(TypeName, lc));
 			Oid			elt = get_base_element_type(typeid);
+			Oid			transformid;
 
 			typeid = elt ? elt : typeid;
-
-			get_transform_oid(typeid, languageOid, false);
+			transformid = get_transform_oid(typeid, languageOid, false);
 			trftypes_list = lappend_oid(trftypes_list, typeid);
+			trfoids_list = lappend_oid(trfoids_list, transformid);
 		}
 	}
 
@@ -1292,6 +1294,7 @@ CreateFunction(ParseState *pstate, CreateFunctionStmt *stmt)
 						   PointerGetDatum(parameterNames),
 						   parameterDefaults,
 						   PointerGetDatum(trftypes),
+						   trfoids_list,
 						   PointerGetDatum(proconfig),
 						   prosupport,
 						   procost,

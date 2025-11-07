@@ -3,7 +3,7 @@
  * typecmds.c
  *	  Routines for SQL commands that manipulate types (and domains).
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -13,7 +13,7 @@
  * DESCRIPTION
  *	  The "DefineFoo" routines take the parse tree and pick out the
  *	  appropriate arguments/flags, passing the results to the
- *	  corresponding "FooDefine" routines (in src/catalog) that do
+ *	  corresponding "FooCreate" routines (in src/backend/catalog) that do
  *	  the actual catalog-munging.  These routines also verify permission
  *	  of the user to execute the command.
  *
@@ -126,7 +126,7 @@ static Oid	findTypeSubscriptingFunction(List *procname, Oid typeOid);
 static Oid	findRangeSubOpclass(List *opcname, Oid subtype);
 static Oid	findRangeCanonicalFunction(List *procname, Oid typeOid);
 static Oid	findRangeSubtypeDiffFunction(List *procname, Oid subtype);
-static void validateDomainCheckConstraint(Oid domainoid, const char *ccbin);
+static void validateDomainCheckConstraint(Oid domainoid, const char *ccbin, LOCKMODE lockmode);
 static void validateDomainNotNullConstraint(Oid domainoid);
 static List *get_rels_with_domain(Oid domainOid, LOCKMODE lockmode);
 static void checkEnumOwner(HeapTuple tup);
@@ -939,11 +939,19 @@ DefineDomain(ParseState *pstate, CreateDomainStmt *stmt)
 				break;
 
 			case CONSTR_NOTNULL:
-				if (nullDefined && !typNotNull)
+				if (nullDefined)
+				{
+					if (!typNotNull)
+						ereport(ERROR,
+								errcode(ERRCODE_SYNTAX_ERROR),
+								errmsg("conflicting NULL/NOT NULL constraints"),
+								parser_errposition(pstate, constr->location));
+
 					ereport(ERROR,
-							errcode(ERRCODE_SYNTAX_ERROR),
-							errmsg("conflicting NULL/NOT NULL constraints"),
+							errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+							errmsg("redundant NOT NULL constraint definition"),
 							parser_errposition(pstate, constr->location));
+				}
 				if (constr->is_no_inherit)
 					ereport(ERROR,
 							errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
@@ -1025,6 +1033,14 @@ DefineDomain(ParseState *pstate, CreateDomainStmt *stmt)
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("specifying GENERATED not supported for domains"),
+						 parser_errposition(pstate, constr->location)));
+				break;
+
+			case CONSTR_ATTR_ENFORCED:
+			case CONSTR_ATTR_NOT_ENFORCED:
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+						 errmsg("specifying constraint enforceability not supported for domains"),
 						 parser_errposition(pstate, constr->location)));
 				break;
 
@@ -1802,6 +1818,7 @@ makeRangeConstructors(const char *name, Oid namespace,
 								 PointerGetDatum(NULL), /* parameterNames */
 								 NIL,	/* parameterDefaults */
 								 PointerGetDatum(NULL), /* trftypes */
+								 NIL,	/* trfoids */
 								 PointerGetDatum(NULL), /* proconfig */
 								 InvalidOid,	/* prosupport */
 								 1.0,	/* procost */
@@ -1867,6 +1884,7 @@ makeMultirangeConstructors(const char *name, Oid namespace,
 							 PointerGetDatum(NULL), /* parameterNames */
 							 NIL,	/* parameterDefaults */
 							 PointerGetDatum(NULL), /* trftypes */
+							 NIL,	/* trfoids */
 							 PointerGetDatum(NULL), /* proconfig */
 							 InvalidOid,	/* prosupport */
 							 1.0,	/* procost */
@@ -1911,6 +1929,7 @@ makeMultirangeConstructors(const char *name, Oid namespace,
 							 PointerGetDatum(NULL), /* parameterNames */
 							 NIL,	/* parameterDefaults */
 							 PointerGetDatum(NULL), /* trftypes */
+							 NIL,	/* trfoids */
 							 PointerGetDatum(NULL), /* proconfig */
 							 InvalidOid,	/* prosupport */
 							 1.0,	/* procost */
@@ -1949,6 +1968,7 @@ makeMultirangeConstructors(const char *name, Oid namespace,
 							 PointerGetDatum(NULL), /* parameterNames */
 							 NIL,	/* parameterDefaults */
 							 PointerGetDatum(NULL), /* trftypes */
+							 NIL,	/* trfoids */
 							 PointerGetDatum(NULL), /* proconfig */
 							 InvalidOid,	/* prosupport */
 							 1.0,	/* procost */
@@ -2945,51 +2965,8 @@ AlterDomainAddConstraint(List *names, Node *newConstraint,
 
 	constr = (Constraint *) newConstraint;
 
-	switch (constr->contype)
-	{
-		case CONSTR_CHECK:
-		case CONSTR_NOTNULL:
-			/* processed below */
-			break;
-
-		case CONSTR_UNIQUE:
-			ereport(ERROR,
-					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("unique constraints not possible for domains")));
-			break;
-
-		case CONSTR_PRIMARY:
-			ereport(ERROR,
-					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("primary key constraints not possible for domains")));
-			break;
-
-		case CONSTR_EXCLUSION:
-			ereport(ERROR,
-					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("exclusion constraints not possible for domains")));
-			break;
-
-		case CONSTR_FOREIGN:
-			ereport(ERROR,
-					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("foreign key constraints not possible for domains")));
-			break;
-
-		case CONSTR_ATTR_DEFERRABLE:
-		case CONSTR_ATTR_NOT_DEFERRABLE:
-		case CONSTR_ATTR_DEFERRED:
-		case CONSTR_ATTR_IMMEDIATE:
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("specifying constraint deferrability not supported for domains")));
-			break;
-
-		default:
-			elog(ERROR, "unrecognized constraint subtype: %d",
-				 (int) constr->contype);
-			break;
-	}
+	/* enforced by parser */
+	Assert(constr->contype == CONSTR_CHECK || constr->contype == CONSTR_NOTNULL);
 
 	if (constr->contype == CONSTR_CHECK)
 	{
@@ -3009,7 +2986,7 @@ AlterDomainAddConstraint(List *names, Node *newConstraint,
 		 * to.
 		 */
 		if (!constr->skip_validation)
-			validateDomainCheckConstraint(domainoid, ccbin);
+			validateDomainCheckConstraint(domainoid, ccbin, ShareLock);
 
 		/*
 		 * We must send out an sinval message for the domain, to ensure that
@@ -3121,7 +3098,12 @@ AlterDomainValidateConstraint(List *names, const char *constrName)
 	val = SysCacheGetAttrNotNull(CONSTROID, tuple, Anum_pg_constraint_conbin);
 	conbin = TextDatumGetCString(val);
 
-	validateDomainCheckConstraint(domainoid, conbin);
+	/*
+	 * Locking related relations with ShareUpdateExclusiveLock is ok because
+	 * not-yet-valid constraints are still enforced against concurrent inserts
+	 * or updates.
+	 */
+	validateDomainCheckConstraint(domainoid, conbin, ShareUpdateExclusiveLock);
 
 	/*
 	 * Now update the catalog, while we have the door open.
@@ -3214,9 +3196,16 @@ validateDomainNotNullConstraint(Oid domainoid)
 /*
  * Verify that all columns currently using the domain satisfy the given check
  * constraint expression.
+ *
+ * It is used to validate existing constraints and to add newly created check
+ * constraints to a domain.
+ *
+ * The lockmode is used for relations using the domain.  It should be
+ * ShareLock when adding a new constraint to domain.  It can be
+ * ShareUpdateExclusiveLock when validating an existing constraint.
  */
 static void
-validateDomainCheckConstraint(Oid domainoid, const char *ccbin)
+validateDomainCheckConstraint(Oid domainoid, const char *ccbin, LOCKMODE lockmode)
 {
 	Expr	   *expr = (Expr *) stringToNode(ccbin);
 	List	   *rels;
@@ -3233,9 +3222,7 @@ validateDomainCheckConstraint(Oid domainoid, const char *ccbin)
 	exprstate = ExecPrepareExpr(expr, estate);
 
 	/* Fetch relation list with attributes based on this domain */
-	/* ShareLock is sufficient to prevent concurrent data changes */
-
-	rels = get_rels_with_domain(domainoid, ShareLock);
+	rels = get_rels_with_domain(domainoid, lockmode);
 
 	foreach(rt, rels)
 	{
@@ -3261,7 +3248,6 @@ validateDomainCheckConstraint(Oid domainoid, const char *ccbin)
 				Datum		d;
 				bool		isNull;
 				Datum		conResult;
-				Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
 
 				d = slot_getattr(slot, attnum, &isNull);
 
@@ -3274,6 +3260,8 @@ validateDomainCheckConstraint(Oid domainoid, const char *ccbin)
 
 				if (!isNull && !DatumGetBool(conResult))
 				{
+					Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
+
 					/*
 					 * In principle the auxiliary information for this error
 					 * should be errdomainconstraint(), but errtablecol()
@@ -3614,6 +3602,7 @@ domainAddCheckConstraint(Oid domainOid, Oid domainNamespace, Oid baseTypeOid,
 							  CONSTRAINT_CHECK, /* Constraint Type */
 							  false,	/* Is Deferrable */
 							  false,	/* Is Deferred */
+							  true, /* Is Enforced */
 							  !constr->skip_validation, /* Is Validated */
 							  InvalidOid,	/* no parent constraint */
 							  InvalidOid,	/* not a relation constraint */
@@ -3721,6 +3710,7 @@ domainAddNotNullConstraint(Oid domainOid, Oid domainNamespace, Oid baseTypeOid,
 							  CONSTRAINT_NOTNULL,	/* Constraint Type */
 							  false,	/* Is Deferrable */
 							  false,	/* Is Deferred */
+							  true, /* Is Enforced */
 							  !constr->skip_validation, /* Is Validated */
 							  InvalidOid,	/* no parent constraint */
 							  InvalidOid,	/* not a relation constraint */

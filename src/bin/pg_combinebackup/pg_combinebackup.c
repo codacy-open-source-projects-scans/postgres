@@ -3,7 +3,7 @@
  * pg_combinebackup.c
  *		Combine incremental backups with prior backups.
  *
- * Copyright (c) 2017-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2017-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/bin/pg_combinebackup/pg_combinebackup.c
@@ -24,6 +24,7 @@
 #include <linux/fs.h>
 #endif
 
+#include "access/xlog_internal.h"
 #include "backup_label.h"
 #include "common/checksum_helper.h"
 #include "common/controldata_utils.h"
@@ -33,6 +34,7 @@
 #include "common/relpath.h"
 #include "copy_file.h"
 #include "fe_utils/option_utils.h"
+#include "fe_utils/version.h"
 #include "getopt_long.h"
 #include "lib/stringinfo.h"
 #include "load_manifest.h"
@@ -116,7 +118,6 @@ static void process_directory_recursively(Oid tsoid,
 										  manifest_data **manifests,
 										  manifest_writer *mwriter,
 										  cb_options *opt);
-static int	read_pg_version_file(char *directory);
 static void remember_to_cleanup_directory(char *target_path, bool rmtopdir);
 static void reset_directory_cleanup_list(void);
 static cb_tablespace *scan_for_existing_tablespaces(char *pathname,
@@ -135,6 +136,7 @@ main(int argc, char *argv[])
 		{"no-sync", no_argument, NULL, 'N'},
 		{"output", required_argument, NULL, 'o'},
 		{"tablespace-mapping", required_argument, NULL, 'T'},
+		{"link", no_argument, NULL, 'k'},
 		{"manifest-checksums", required_argument, NULL, 1},
 		{"no-manifest", no_argument, NULL, 2},
 		{"sync-method", required_argument, NULL, 3},
@@ -151,7 +153,7 @@ main(int argc, char *argv[])
 	int			c;
 	int			n_backups;
 	int			n_prior_backups;
-	int			version;
+	uint32		version;
 	uint64		system_identifier;
 	char	  **prior_backup_dirs;
 	cb_options	opt;
@@ -160,6 +162,7 @@ main(int argc, char *argv[])
 	StringInfo	last_backup_label;
 	manifest_data **manifests;
 	manifest_writer *mwriter;
+	char	   *pgdata;
 
 	pg_logging_init(argv[0]);
 	progname = get_progname(argv[0]);
@@ -172,7 +175,7 @@ main(int argc, char *argv[])
 	opt.copy_method = COPY_METHOD_COPY;
 
 	/* process command-line options */
-	while ((c = getopt_long(argc, argv, "dnNo:T:",
+	while ((c = getopt_long(argc, argv, "dknNo:T:",
 							long_options, &optindex)) != -1)
 	{
 		switch (c)
@@ -180,6 +183,9 @@ main(int argc, char *argv[])
 			case 'd':
 				opt.debug = true;
 				pg_logging_increase_verbosity();
+				break;
+			case 'k':
+				opt.copy_method = COPY_METHOD_LINK;
 				break;
 			case 'n':
 				opt.dry_run = true;
@@ -266,7 +272,12 @@ main(int argc, char *argv[])
 	}
 
 	/* Read the server version from the final backup. */
-	version = read_pg_version_file(argv[argc - 1]);
+	pgdata = argv[argc - 1];
+	version = get_pg_version(pgdata, NULL);
+	if (GET_PG_MAJORVERSION_NUM(version) < 10)
+		pg_fatal("server version too old");
+	pg_log_debug("read server version %u from file \"%s/%s\"",
+				 GET_PG_MAJORVERSION_NUM(version), pgdata, "PG_VERSION");
 
 	/* Sanity-check control files. */
 	n_backups = argc - optind;
@@ -296,12 +307,12 @@ main(int argc, char *argv[])
 		{
 			char	   *controlpath;
 
-			controlpath = psprintf("%s/%s", prior_backup_dirs[i], "global/pg_control");
+			controlpath = psprintf("%s/%s", prior_backup_dirs[i], XLOG_CONTROL_FILE);
 
-			pg_fatal("%s: manifest system identifier is %llu, but control file has %llu",
+			pg_fatal("%s: manifest system identifier is %" PRIu64 ", but control file has %" PRIu64,
 					 controlpath,
-					 (unsigned long long) manifests[i]->system_identifier,
-					 (unsigned long long) system_identifier);
+					 manifests[i]->system_identifier,
+					 system_identifier);
 		}
 	}
 
@@ -420,9 +431,14 @@ main(int argc, char *argv[])
 		else
 		{
 			pg_log_debug("recursively fsyncing \"%s\"", opt.output);
-			sync_pgdata(opt.output, version * 10000, opt.sync_method);
+			sync_pgdata(opt.output, version, opt.sync_method, true);
 		}
 	}
+
+	/* Warn about the possibility of compromising the backups, when link mode */
+	if (opt.copy_method == COPY_METHOD_LINK)
+		pg_log_warning("--link mode was used; any modifications to the output "
+					   "directory might destructively modify input directories");
 
 	/* It's a success, so don't remove the output directories. */
 	reset_directory_cleanup_list();
@@ -559,7 +575,7 @@ check_backup_label_files(int n_backups, char **backup_dirs)
 			pg_fatal("backup at \"%s\" starts on timeline %u, but expected %u",
 					 backup_dirs[i], start_tli, check_tli);
 		if (i < n_backups - 1 && start_lsn != check_lsn)
-			pg_fatal("backup at \"%s\" starts at LSN %X/%X, but expected %X/%X",
+			pg_fatal("backup at \"%s\" starts at LSN %X/%08X, but expected %X/%08X",
 					 backup_dirs[i],
 					 LSN_FORMAT_ARGS(start_lsn),
 					 LSN_FORMAT_ARGS(check_lsn));
@@ -605,7 +621,7 @@ check_control_files(int n_backups, char **backup_dirs)
 		bool		crc_ok;
 		char	   *controlpath;
 
-		controlpath = psprintf("%s/%s", backup_dirs[i], "global/pg_control");
+		controlpath = psprintf("%s/%s", backup_dirs[i], XLOG_CONTROL_FILE);
 		pg_log_debug("reading \"%s\"", controlpath);
 		control_file = get_controlfile_by_exact_path(controlpath, &crc_ok);
 
@@ -622,9 +638,9 @@ check_control_files(int n_backups, char **backup_dirs)
 		if (i == n_backups - 1)
 			system_identifier = control_file->system_identifier;
 		else if (system_identifier != control_file->system_identifier)
-			pg_fatal("%s: expected system identifier %llu, but found %llu",
-					 controlpath, (unsigned long long) system_identifier,
-					 (unsigned long long) control_file->system_identifier);
+			pg_fatal("%s: expected system identifier %" PRIu64 ", but found %" PRIu64,
+					 controlpath, system_identifier,
+					 control_file->system_identifier);
 
 		/*
 		 * Detect checksum mismatches, but only if the last backup in the
@@ -645,8 +661,7 @@ check_control_files(int n_backups, char **backup_dirs)
 	 * If debug output is enabled, make a note of the system identifier that
 	 * we found in all of the relevant control files.
 	 */
-	pg_log_debug("system identifier is %llu",
-				 (unsigned long long) system_identifier);
+	pg_log_debug("system identifier is %" PRIu64, system_identifier);
 
 	/*
 	 * Warn the user if not all backups are in the same state with regards to
@@ -761,6 +776,7 @@ help(const char *progname)
 	printf(_("  %s [OPTION]... DIRECTORY...\n"), progname);
 	printf(_("\nOptions:\n"));
 	printf(_("  -d, --debug               generate lots of debugging output\n"));
+	printf(_("  -k, --link                link files instead of copying\n"));
 	printf(_("  -n, --dry-run             do not actually do anything\n"));
 	printf(_("  -N, --no-sync             do not wait for changes to be written safely to disk\n"));
 	printf(_("  -o, --output=DIRECTORY    output directory\n"));
@@ -804,7 +820,7 @@ parse_oid(char *s, Oid *result)
  * Copy files from the input directory to the output directory, reconstructing
  * full files from incremental files as required.
  *
- * If processing is a user-defined tablespace, the tsoid should be the OID
+ * If processing a user-defined tablespace, the tsoid should be the OID
  * of that tablespace and input_directory and output_directory should be the
  * toplevel input and output directories for that tablespace. Otherwise,
  * tsoid should be InvalidOid and input_directory and output_directory should
@@ -816,7 +832,7 @@ parse_oid(char *s, Oid *result)
  *
  * n_prior_backups is the number of prior backups that we have available.
  * This doesn't count the very last backup, which is referenced by
- * output_directory, just the older ones. prior_backup_dirs is an array of
+ * input_directory, just the older ones. prior_backup_dirs is an array of
  * the locations of those previous backups.
  */
 static void
@@ -1143,59 +1159,6 @@ process_directory_recursively(Oid tsoid,
 	}
 
 	closedir(dir);
-}
-
-/*
- * Read the version number from PG_VERSION and convert it to the usual server
- * version number format. (e.g. If PG_VERSION contains "14\n" this function
- * will return 140000)
- */
-static int
-read_pg_version_file(char *directory)
-{
-	char		filename[MAXPGPATH];
-	StringInfoData buf;
-	int			fd;
-	int			version;
-	char	   *ep;
-
-	/* Construct pathname. */
-	snprintf(filename, MAXPGPATH, "%s/PG_VERSION", directory);
-
-	/* Open file. */
-	if ((fd = open(filename, O_RDONLY, 0)) < 0)
-		pg_fatal("could not open file \"%s\": %m", filename);
-
-	/* Read into memory. Length limit of 128 should be more than generous. */
-	initStringInfo(&buf);
-	slurp_file(fd, filename, &buf, 128);
-
-	/* Close the file. */
-	if (close(fd) != 0)
-		pg_fatal("could not close file \"%s\": %m", filename);
-
-	/* Convert to integer. */
-	errno = 0;
-	version = strtoul(buf.data, &ep, 10);
-	if (errno != 0 || *ep != '\n')
-	{
-		/*
-		 * Incremental backup is not relevant to very old server versions that
-		 * used multi-part version number (e.g. 9.6, or 8.4). So if we see
-		 * what looks like the beginning of such a version number, just bail
-		 * out.
-		 */
-		if (version < 10 && *ep == '.')
-			pg_fatal("%s: server version too old", filename);
-		pg_fatal("%s: could not parse version number", filename);
-	}
-
-	/* Debugging output. */
-	pg_log_debug("read server version %d from file \"%s\"", version, filename);
-
-	/* Release memory and return result. */
-	pfree(buf.data);
-	return version * 10000;
 }
 
 /*

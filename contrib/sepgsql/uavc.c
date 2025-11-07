@@ -6,7 +6,7 @@
  * access control decisions recently used, and reduce number of kernel
  * invocations to avoid unnecessary performance hit.
  *
- * Copyright (c) 2011-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2011-2025, PostgreSQL Global Development Group
  *
  * -------------------------------------------------------------------------
  */
@@ -66,8 +66,8 @@ static char *avc_unlabeled;		/* system 'unlabeled' label */
 static uint32
 sepgsql_avc_hash(const char *scontext, const char *tcontext, uint16 tclass)
 {
-	return hash_any((const unsigned char *) scontext, strlen(scontext))
-		^ hash_any((const unsigned char *) tcontext, strlen(tcontext))
+	return hash_bytes((const unsigned char *) scontext, strlen(scontext))
+		^ hash_bytes((const unsigned char *) tcontext, strlen(tcontext))
 		^ tclass;
 }
 

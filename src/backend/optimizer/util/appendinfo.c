@@ -3,7 +3,7 @@
  * appendinfo.c
  *	  Routines for mapping between append parent(s) and children
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -253,6 +253,13 @@ adjust_appendrel_attrs_mutator(Node *node,
 		 * all non-Var outputs of such subqueries, and then we could look up
 		 * the pre-existing PHV here.  Or perhaps just wrap the translations
 		 * that way to begin with?
+		 *
+		 * If var->varreturningtype is not VAR_RETURNING_DEFAULT, then that
+		 * also needs to be copied to the translated Var.  That too would fail
+		 * if the translation wasn't a Var, but that should never happen since
+		 * a non-default var->varreturningtype is only used for Vars referring
+		 * to the result relation, which should never be a flattened UNION ALL
+		 * subquery.
 		 */
 
 		for (cnt = 0; cnt < nappinfos; cnt++)
@@ -283,9 +290,17 @@ adjust_appendrel_attrs_mutator(Node *node,
 					elog(ERROR, "attribute %d of relation \"%s\" does not exist",
 						 var->varattno, get_rel_name(appinfo->parent_reloid));
 				if (IsA(newnode, Var))
+				{
+					((Var *) newnode)->varreturningtype = var->varreturningtype;
 					((Var *) newnode)->varnullingrels = var->varnullingrels;
-				else if (var->varnullingrels != NULL)
-					elog(ERROR, "failed to apply nullingrels to a non-Var");
+				}
+				else
+				{
+					if (var->varreturningtype != VAR_RETURNING_DEFAULT)
+						elog(ERROR, "failed to apply returningtype to a non-Var");
+					if (var->varnullingrels != NULL)
+						elog(ERROR, "failed to apply nullingrels to a non-Var");
+				}
 				return newnode;
 			}
 			else if (var->varattno == 0)
@@ -339,6 +354,8 @@ adjust_appendrel_attrs_mutator(Node *node,
 					rowexpr->colnames = copyObject(rte->eref->colnames);
 					rowexpr->location = -1;
 
+					if (var->varreturningtype != VAR_RETURNING_DEFAULT)
+						elog(ERROR, "failed to apply returningtype to a non-Var");
 					if (var->varnullingrels != NULL)
 						elog(ERROR, "failed to apply nullingrels to a non-Var");
 
@@ -497,6 +514,57 @@ adjust_appendrel_attrs_mutator(Node *node,
 		newinfo->right_mcvfreq = -1;
 
 		return (Node *) newinfo;
+	}
+
+	/*
+	 * We have to process RelAggInfo nodes specially.
+	 */
+	if (IsA(node, RelAggInfo))
+	{
+		RelAggInfo *oldinfo = (RelAggInfo *) node;
+		RelAggInfo *newinfo = makeNode(RelAggInfo);
+
+		newinfo->target = (PathTarget *)
+			adjust_appendrel_attrs_mutator((Node *) oldinfo->target,
+										   context);
+
+		newinfo->agg_input = (PathTarget *)
+			adjust_appendrel_attrs_mutator((Node *) oldinfo->agg_input,
+										   context);
+
+		newinfo->group_clauses = oldinfo->group_clauses;
+
+		newinfo->group_exprs = (List *)
+			adjust_appendrel_attrs_mutator((Node *) oldinfo->group_exprs,
+										   context);
+
+		return (Node *) newinfo;
+	}
+
+	/*
+	 * We have to process PathTarget nodes specially.
+	 */
+	if (IsA(node, PathTarget))
+	{
+		PathTarget *oldtarget = (PathTarget *) node;
+		PathTarget *newtarget = makeNode(PathTarget);
+
+		/* Copy all flat-copiable fields */
+		memcpy(newtarget, oldtarget, sizeof(PathTarget));
+
+		newtarget->exprs = (List *)
+			adjust_appendrel_attrs_mutator((Node *) oldtarget->exprs,
+										   context);
+
+		if (oldtarget->sortgrouprefs)
+		{
+			Size		nbytes = list_length(oldtarget->exprs) * sizeof(Index);
+
+			newtarget->sortgrouprefs = (Index *) palloc(nbytes);
+			memcpy(newtarget->sortgrouprefs, oldtarget->sortgrouprefs, nbytes);
+		}
+
+		return (Node *) newtarget;
 	}
 
 	/*

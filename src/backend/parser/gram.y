@@ -6,7 +6,7 @@
  * gram.y
  *	  POSTGRESQL BISON rules/actions
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -120,6 +120,7 @@ typedef struct SelectLimit
 typedef struct GroupClause
 {
 	bool		distinct;
+	bool		all;
 	List	   *list;
 } GroupClause;
 
@@ -143,6 +144,8 @@ typedef struct KeyActions
 #define CAS_INITIALLY_DEFERRED		0x08
 #define CAS_NOT_VALID				0x10
 #define CAS_NO_INHERIT				0x20
+#define CAS_NOT_ENFORCED			0x40
+#define CAS_ENFORCED				0x80
 
 
 #define parser_yyerror(msg)  scanner_yyerror(msg, yyscanner)
@@ -152,7 +155,6 @@ static void base_yyerror(YYLTYPE *yylloc, core_yyscan_t yyscanner,
 						 const char *msg);
 static RawStmt *makeRawStmt(Node *stmt, int stmt_location);
 static void updateRawStmtEnd(RawStmt *rs, int end_location);
-static void updatePreparableStmtEnd(Node *n, int end_location);
 static Node *makeColumnRef(char *colname, List *indirection,
 						   int location, core_yyscan_t yyscanner);
 static Node *makeTypeCast(Node *arg, TypeName *typename, int location);
@@ -176,13 +178,13 @@ static void insertSelectOptions(SelectStmt *stmt,
 								SelectLimit *limitClause,
 								WithClause *withClause,
 								core_yyscan_t yyscanner);
-static Node *makeSetOp(SetOperation op, bool all, Node *larg, Node *rarg, int location);
+static Node *makeSetOp(SetOperation op, bool all, Node *larg, Node *rarg);
 static Node *doNegate(Node *n, int location);
 static void doNegateFloat(Float *v);
 static Node *makeAndExpr(Node *lexpr, Node *rexpr, int location);
 static Node *makeOrExpr(Node *lexpr, Node *rexpr, int location);
 static Node *makeNotExpr(Node *expr, int location);
-static Node *makeAArrayExpr(List *elements, int location);
+static Node *makeAArrayExpr(List *elements, int location, int end_location);
 static Node *makeSQLValueFunction(SQLValueFunctionOp op, int32 typmod,
 								  int location);
 static Node *makeXmlExpr(XmlExprOp op, char *name, List *named_args,
@@ -196,10 +198,14 @@ static void SplitColQualList(List *qualList,
 							 List **constraintList, CollateClause **collClause,
 							 core_yyscan_t yyscanner);
 static void processCASbits(int cas_bits, int location, const char *constrType,
-			   bool *deferrable, bool *initdeferred, bool *not_valid,
-			   bool *no_inherit, core_yyscan_t yyscanner);
+			   bool *deferrable, bool *initdeferred, bool *is_enforced,
+			   bool *not_valid, bool *no_inherit, core_yyscan_t yyscanner);
 static PartitionStrategy parsePartitionStrategy(char *strategy, int location,
 												core_yyscan_t yyscanner);
+static void preprocess_pub_all_objtype_list(List *all_objects_list,
+											bool *all_tables,
+											bool *all_sequences,
+											core_yyscan_t yyscanner);
 static void preprocess_pubobj_list(List *pubobjspec_list,
 								   core_yyscan_t yyscanner);
 static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
@@ -258,6 +264,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	PartitionBoundSpec *partboundspec;
 	RoleSpec   *rolespec;
 	PublicationObjSpec *publicationobjectspec;
+	PublicationAllObjSpec *publicationallobjectspec;
 	struct SelectLimit *selectlimit;
 	SetQuantifier setquantifier;
 	struct GroupClause *groupclause;
@@ -265,6 +272,8 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	MergeWhenClause *mergewhen;
 	struct KeyActions *keyactions;
 	struct KeyAction *keyaction;
+	ReturningClause *retclause;
+	ReturningOptionKind retoptionkind;
 }
 
 %type <node>	stmt toplevel_stmt schema_stmt routine_body_stmt
@@ -299,7 +308,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 		SecLabelStmt SelectStmt TransactionStmt TransactionStmtLegacy TruncateStmt
 		UnlistenStmt UpdateStmt VacuumStmt
 		VariableResetStmt VariableSetStmt VariableShowStmt
-		ViewStmt CheckPointStmt CreateConversionStmt
+		ViewStmt WaitStmt CheckPointStmt CreateConversionStmt
 		DeallocateStmt PrepareStmt ExecuteStmt
 		DropOwnedStmt ReassignOwnedStmt
 		AlterTSConfigurationStmt AlterTSDictionaryStmt
@@ -315,6 +324,12 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <list>		opt_qualified_name
 %type <boolean>		opt_concurrently
 %type <dbehavior>	opt_drop_behavior
+%type <list>		opt_utility_option_list
+%type <list>		opt_wait_with_clause
+%type <list>		utility_option_list
+%type <defelt>		utility_option_elem
+%type <str>			utility_option_name
+%type <node>		utility_option_arg
 
 %type <node>	alter_column_default opclass_item opclass_drop alter_using
 %type <ival>	add_drop opt_asc_desc opt_nulls_order
@@ -335,10 +350,6 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 				create_extension_opt_item alter_extension_opt_item
 
 %type <ival>	opt_lock lock_type cast_context
-%type <str>		utility_option_name
-%type <defelt>	utility_option_elem
-%type <list>	utility_option_list
-%type <node>	utility_option_arg
 %type <defelt>	drop_option
 %type <boolean>	opt_or_replace opt_no
 				opt_grant_grant_option
@@ -434,15 +445,19 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 				opclass_purpose opt_opfamily transaction_mode_list_or_empty
 				OptTableFuncElementList TableFuncElementList opt_type_modifiers
 				prep_type_clause
-				execute_param_clause using_clause returning_clause
+				execute_param_clause using_clause
+				returning_with_clause returning_options
 				opt_enum_val_list enum_val_list table_func_column_list
 				create_generic_options alter_generic_options
 				relation_expr_list dostmt_opt_list
 				transform_element_list transform_type_list
 				TriggerTransitions TriggerReferencing
 				vacuum_relation_list opt_vacuum_relation_list
-				drop_option_list pub_obj_list
+				drop_option_list pub_obj_list pub_obj_type_list
 
+%type <retclause> returning_clause
+%type <node>	returning_option
+%type <retoptionkind> returning_option_kind
 %type <node>	opt_routine_body
 %type <groupclause> group_clause
 %type <list>	group_by_list
@@ -515,7 +530,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <defelt>	def_elem reloption_elem old_aggr_elem operator_def_elem
 %type <node>	def_arg columnElem where_clause where_or_current_clause
 				a_expr b_expr c_expr AexprConst indirection_el opt_slice_bound
-				columnref in_expr having_clause func_table xmltable array_expr
+				columnref having_clause func_table xmltable array_expr
 				OptWhereClause operator_def_arg
 %type <list>	opt_column_and_period_list
 %type <list>	rowsfrom_item rowsfrom_list opt_col_def_list
@@ -549,7 +564,6 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <list>	generic_option_list alter_generic_option_list
 
 %type <ival>	reindex_target_relation reindex_target_all
-%type <list>	opt_reindex_option_list
 
 %type <node>	copy_generic_opt_arg copy_generic_opt_arg_list_item
 %type <defelt>	copy_generic_opt_elem
@@ -577,6 +591,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <node>	var_value zone_value
 %type <rolespec> auth_ident RoleSpec opt_granted_by
 %type <publicationobjectspec> PublicationObjSpec
+%type <publicationallobjectspec> PublicationAllObjSpec
 
 %type <keyword> unreserved_keyword type_func_name_keyword
 %type <keyword> col_name_keyword reserved_keyword
@@ -624,11 +639,11 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <list>	window_clause window_definition_list opt_partition_clause
 %type <windef>	window_definition over_clause window_specification
 				opt_frame_clause frame_extent frame_bound
-%type <ival>	opt_window_exclusion_clause
+%type <ival>	null_treatment opt_window_exclusion_clause
 %type <str>		opt_existing_window_name
 %type <boolean> opt_if_not_exists
 %type <boolean> opt_unique_null_treatment
-%type <ival>	generated_when override_kind
+%type <ival>	generated_when override_kind opt_virtual_or_stored
 %type <partspec>	PartitionSpec OptPartitionSpec
 %type <partelem>	part_elem
 %type <list>		part_params
@@ -663,7 +678,6 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <boolean>	json_key_uniqueness_constraint_opt
 				json_object_constructor_null_clause_opt
 				json_array_constructor_null_clause_opt
-
 
 /*
  * Non-keyword token types.  These are hard-wired into the "flex" lexer.
@@ -711,9 +725,9 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	DETACH DICTIONARY DISABLE_P DISCARD DISTINCT DO DOCUMENT_P DOMAIN_P
 	DOUBLE_P DROP
 
-	EACH ELSE EMPTY_P ENABLE_P ENCODING ENCRYPTED END_P ENUM_P ERROR_P ESCAPE
-	EVENT EXCEPT EXCLUDE EXCLUDING EXCLUSIVE EXECUTE EXISTS EXPLAIN EXPRESSION
-	EXTENSION EXTERNAL EXTRACT
+	EACH ELSE EMPTY_P ENABLE_P ENCODING ENCRYPTED END_P ENFORCED ENUM_P ERROR_P
+	ESCAPE EVENT EXCEPT EXCLUDE EXCLUDING EXCLUSIVE EXECUTE EXISTS EXPLAIN
+	EXPRESSION EXTENSION EXTERNAL EXTRACT
 
 	FALSE_P FAMILY FETCH FILTER FINALIZE FIRST_P FLOAT_P FOLLOWING FOR
 	FORCE FOREIGN FORMAT FORWARD FREEZE FROM FULL FUNCTION FUNCTIONS
@@ -722,7 +736,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 
 	HANDLER HAVING HEADER_P HOLD HOUR_P
 
-	IDENTITY_P IF_P ILIKE IMMEDIATE IMMUTABLE IMPLICIT_P IMPORT_P IN_P INCLUDE
+	IDENTITY_P IF_P IGNORE_P ILIKE IMMEDIATE IMMUTABLE IMPLICIT_P IMPORT_P IN_P INCLUDE
 	INCLUDING INCREMENT INDENT INDEX INDEXES INHERIT INHERITS INITIALLY INLINE_P
 	INNER_P INOUT INPUT_P INSENSITIVE INSERT INSTEAD INT_P INTEGER
 	INTERSECT INTERVAL INTO INVOKER IS ISNULL ISOLATION
@@ -734,7 +748,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 
 	LABEL LANGUAGE LARGE_P LAST_P LATERAL_P
 	LEADING LEAKPROOF LEAST LEFT LEVEL LIKE LIMIT LISTEN LOAD LOCAL
-	LOCALTIME LOCALTIMESTAMP LOCATION LOCK_P LOCKED LOGGED
+	LOCALTIME LOCALTIMESTAMP LOCATION LOCK_P LOCKED LOGGED LSN_P
 
 	MAPPING MATCH MATCHED MATERIALIZED MAXVALUE MERGE MERGE_ACTION METHOD
 	MINUTE_P MINVALUE MODE MONTH_P MOVE
@@ -744,7 +758,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	NOT NOTHING NOTIFY NOTNULL NOWAIT NULL_P NULLIF
 	NULLS_P NUMERIC
 
-	OBJECT_P OF OFF OFFSET OIDS OLD OMIT ON ONLY OPERATOR OPTION OPTIONS OR
+	OBJECT_P OBJECTS_P OF OFF OFFSET OIDS OLD OMIT ON ONLY OPERATOR OPTION OPTIONS OR
 	ORDER ORDINALITY OTHERS OUT_P OUTER_P
 	OVER OVERLAPS OVERLAY OVERRIDING OWNED OWNER
 
@@ -757,7 +771,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 
 	RANGE READ REAL REASSIGN RECURSIVE REF_P REFERENCES REFERENCING
 	REFRESH REINDEX RELATIVE_P RELEASE RENAME REPEATABLE REPLACE REPLICA
-	RESET RESTART RESTRICT RETURN RETURNING RETURNS REVOKE RIGHT ROLE ROLLBACK ROLLUP
+	RESET RESPECT_P RESTART RESTRICT RETURN RETURNING RETURNS REVOKE RIGHT ROLE ROLLBACK ROLLUP
 	ROUTINE ROUTINES ROW ROWS RULE
 
 	SAVEPOINT SCALAR SCHEMA SCHEMAS SCROLL SEARCH SECOND_P SECURITY SELECT
@@ -776,9 +790,9 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	UNLISTEN UNLOGGED UNTIL UPDATE USER USING
 
 	VACUUM VALID VALIDATE VALIDATOR VALUE_P VALUES VARCHAR VARIADIC VARYING
-	VERBOSE VERSION_P VIEW VIEWS VOLATILE
+	VERBOSE VERSION_P VIEW VIEWS VIRTUAL VOLATILE
 
-	WHEN WHERE WHITESPACE_P WINDOW WITH WITHIN WITHOUT WORK WRAPPER WRITE
+	WAIT WHEN WHERE WHITESPACE_P WINDOW WITH WITHIN WITHOUT WORK WRAPPER WRITE
 
 	XML_P XMLATTRIBUTES XMLCONCAT XMLELEMENT XMLEXISTS XMLFOREST XMLNAMESPACES
 	XMLPARSE XMLPI XMLROOT XMLSERIALIZE XMLTABLE
@@ -1106,6 +1120,7 @@ stmt:
 			| VariableSetStmt
 			| VariableShowStmt
 			| ViewStmt
+			| WaitStmt
 			| /*EMPTY*/
 				{ $$ = NULL; }
 		;
@@ -1132,6 +1147,41 @@ opt_drop_behavior:
 			CASCADE							{ $$ = DROP_CASCADE; }
 			| RESTRICT						{ $$ = DROP_RESTRICT; }
 			| /* EMPTY */					{ $$ = DROP_RESTRICT; /* default */ }
+		;
+
+opt_utility_option_list:
+			'(' utility_option_list ')'		{ $$ = $2; }
+			| /* EMPTY */					{ $$ = NULL; }
+		;
+
+utility_option_list:
+			utility_option_elem
+				{
+					$$ = list_make1($1);
+				}
+			| utility_option_list ',' utility_option_elem
+				{
+					$$ = lappend($1, $3);
+				}
+		;
+
+utility_option_elem:
+			utility_option_name utility_option_arg
+				{
+					$$ = makeDefElem($1, $2, @1);
+				}
+		;
+
+utility_option_name:
+			NonReservedWord					{ $$ = $1; }
+			| analyze_keyword				{ $$ = "analyze"; }
+			| FORMAT_LA						{ $$ = "format"; }
+		;
+
+utility_option_arg:
+			opt_boolean_or_string			{ $$ = (Node *) makeString($1); }
+			| NumericOnly					{ $$ = (Node *) $1; }
+			| /* EMPTY */					{ $$ = NULL; }
 		;
 
 /*****************************************************************************
@@ -1667,6 +1717,26 @@ generic_set:
 					n->location = @3;
 					$$ = n;
 				}
+			| var_name TO NULL_P
+				{
+					VariableSetStmt *n = makeNode(VariableSetStmt);
+
+					n->kind = VAR_SET_VALUE;
+					n->name = $1;
+					n->args = list_make1(makeNullAConst(@3));
+					n->location = @3;
+					$$ = n;
+				}
+			| var_name '=' NULL_P
+				{
+					VariableSetStmt *n = makeNode(VariableSetStmt);
+
+					n->kind = VAR_SET_VALUE;
+					n->name = $1;
+					n->args = list_make1(makeNullAConst(@3));
+					n->location = @3;
+					$$ = n;
+				}
 			| var_name TO DEFAULT
 				{
 					VariableSetStmt *n = makeNode(VariableSetStmt);
@@ -2021,11 +2091,12 @@ constraints_set_mode:
  * Checkpoint statement
  */
 CheckPointStmt:
-			CHECKPOINT
+			CHECKPOINT opt_utility_option_list
 				{
 					CheckPointStmt *n = makeNode(CheckPointStmt);
 
 					$$ = (Node *) n;
+					n->options = $2;
 				}
 		;
 
@@ -2649,16 +2720,45 @@ alter_table_cmd:
 			| ALTER CONSTRAINT name ConstraintAttributeSpec
 				{
 					AlterTableCmd *n = makeNode(AlterTableCmd);
-					Constraint *c = makeNode(Constraint);
+					ATAlterConstraint *c = makeNode(ATAlterConstraint);
 
 					n->subtype = AT_AlterConstraint;
 					n->def = (Node *) c;
-					c->contype = CONSTR_FOREIGN; /* others not supported, yet */
 					c->conname = $3;
-					processCASbits($4, @4, "ALTER CONSTRAINT statement",
+					if ($4 & (CAS_NOT_ENFORCED | CAS_ENFORCED))
+						c->alterEnforceability = true;
+					if ($4 & (CAS_DEFERRABLE | CAS_NOT_DEFERRABLE |
+							  CAS_INITIALLY_DEFERRED | CAS_INITIALLY_IMMEDIATE))
+						c->alterDeferrability = true;
+					if ($4 & CAS_NO_INHERIT)
+						c->alterInheritability = true;
+					/* handle unsupported case with specific error message */
+					if ($4 & CAS_NOT_VALID)
+						ereport(ERROR,
+								errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								errmsg("constraints cannot be altered to be NOT VALID"),
+								parser_errposition(@4));
+					processCASbits($4, @4, "FOREIGN KEY",
 									&c->deferrable,
 									&c->initdeferred,
-									NULL, NULL, yyscanner);
+									&c->is_enforced,
+									NULL,
+									&c->noinherit,
+									yyscanner);
+					$$ = (Node *) n;
+				}
+			/* ALTER TABLE <name> ALTER CONSTRAINT INHERIT */
+			| ALTER CONSTRAINT name INHERIT
+				{
+					AlterTableCmd *n = makeNode(AlterTableCmd);
+					ATAlterConstraint *c = makeNode(ATAlterConstraint);
+
+					n->subtype = AT_AlterConstraint;
+					n->def = (Node *) c;
+					c->conname = $3;
+					c->alterInheritability = true;
+					c->noinherit = false;
+
 					$$ = (Node *) n;
 				}
 			/* ALTER TABLE <name> VALIDATE CONSTRAINT ... */
@@ -3329,7 +3429,7 @@ ClosePortalStmt:
  *				COPY ( query ) TO file	[WITH] [(options)]
  *
  *				where 'query' can be one of:
- *				{ SELECT | UPDATE | INSERT | DELETE }
+ *				{ SELECT | UPDATE | INSERT | DELETE | MERGE }
  *
  *				and 'file' can be one of:
  *				{ PROGRAM 'command' | STDIN | STDOUT | 'filename' }
@@ -3370,6 +3470,7 @@ CopyStmt:	COPY opt_binary qualified_name opt_column_list
 						ereport(ERROR,
 								(errcode(ERRCODE_SYNTAX_ERROR),
 								 errmsg("WHERE clause not allowed with COPY TO"),
+								 errhint("Try the COPY (SELECT ... WHERE ...) TO variant."),
 								 parser_errposition(@11)));
 
 					n->options = NIL;
@@ -3386,7 +3487,6 @@ CopyStmt:	COPY opt_binary qualified_name opt_column_list
 				{
 					CopyStmt *n = makeNode(CopyStmt);
 
-					updatePreparableStmtEnd($3, @4);
 					n->relation = NULL;
 					n->query = $3;
 					n->attlist = NIL;
@@ -3915,6 +4015,7 @@ ColConstraintElem:
 					n->contype = CONSTR_NOTNULL;
 					n->location = @1;
 					n->is_no_inherit = $3;
+					n->is_enforced = true;
 					n->skip_validation = false;
 					n->initially_valid = true;
 					$$ = (Node *) n;
@@ -3961,6 +4062,7 @@ ColConstraintElem:
 					n->is_no_inherit = $5;
 					n->raw_expr = $3;
 					n->cooked_expr = NULL;
+					n->is_enforced = true;
 					n->skip_validation = false;
 					n->initially_valid = true;
 					$$ = (Node *) n;
@@ -3985,7 +4087,7 @@ ColConstraintElem:
 					n->location = @1;
 					$$ = (Node *) n;
 				}
-			| GENERATED generated_when AS '(' a_expr ')' STORED
+			| GENERATED generated_when AS '(' a_expr ')' opt_virtual_or_stored
 				{
 					Constraint *n = makeNode(Constraint);
 
@@ -3993,6 +4095,7 @@ ColConstraintElem:
 					n->generated_when = $2;
 					n->raw_expr = $5;
 					n->cooked_expr = NULL;
+					n->generated_kind = $7;
 					n->location = @1;
 
 					/*
@@ -4022,6 +4125,7 @@ ColConstraintElem:
 					n->fk_upd_action = ($5)->updateAction->action;
 					n->fk_del_action = ($5)->deleteAction->action;
 					n->fk_del_set_cols = ($5)->deleteAction->cols;
+					n->is_enforced = true;
 					n->skip_validation = false;
 					n->initially_valid = true;
 					$$ = (Node *) n;
@@ -4037,6 +4141,12 @@ opt_unique_null_treatment:
 generated_when:
 			ALWAYS			{ $$ = ATTRIBUTE_IDENTITY_ALWAYS; }
 			| BY DEFAULT	{ $$ = ATTRIBUTE_IDENTITY_BY_DEFAULT; }
+		;
+
+opt_virtual_or_stored:
+			STORED			{ $$ = ATTRIBUTE_GENERATED_STORED; }
+			| VIRTUAL		{ $$ = ATTRIBUTE_GENERATED_VIRTUAL; }
+			| /*EMPTY*/		{ $$ = ATTRIBUTE_GENERATED_VIRTUAL; }
 		;
 
 /*
@@ -4084,6 +4194,22 @@ ConstraintAttr:
 					Constraint *n = makeNode(Constraint);
 
 					n->contype = CONSTR_ATTR_IMMEDIATE;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+			| ENFORCED
+				{
+					Constraint *n = makeNode(Constraint);
+
+					n->contype = CONSTR_ATTR_ENFORCED;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+			| NOT ENFORCED
+				{
+					Constraint *n = makeNode(Constraint);
+
+					n->contype = CONSTR_ATTR_NOT_ENFORCED;
 					n->location = @1;
 					$$ = (Node *) n;
 				}
@@ -4148,7 +4274,7 @@ ConstraintElem:
 					n->raw_expr = $3;
 					n->cooked_expr = NULL;
 					processCASbits($5, @5, "CHECK",
-								   NULL, NULL, &n->skip_validation,
+								   NULL, NULL, &n->is_enforced, &n->skip_validation,
 								   &n->is_no_inherit, yyscanner);
 					n->initially_valid = !n->skip_validation;
 					$$ = (Node *) n;
@@ -4160,11 +4286,10 @@ ConstraintElem:
 					n->contype = CONSTR_NOTNULL;
 					n->location = @1;
 					n->keys = list_make1(makeString($3));
-					/* no NOT VALID support yet */
 					processCASbits($4, @4, "NOT NULL",
-								   NULL, NULL, NULL,
+								   NULL, NULL, NULL, &n->skip_validation,
 								   &n->is_no_inherit, yyscanner);
-					n->initially_valid = true;
+					n->initially_valid = !n->skip_validation;
 					$$ = (Node *) n;
 				}
 			| UNIQUE opt_unique_null_treatment '(' columnList opt_without_overlaps ')' opt_c_include opt_definition OptConsTableSpace
@@ -4183,7 +4308,7 @@ ConstraintElem:
 					n->indexspace = $9;
 					processCASbits($10, @10, "UNIQUE",
 								   &n->deferrable, &n->initdeferred, NULL,
-								   NULL, yyscanner);
+								   NULL, NULL, yyscanner);
 					$$ = (Node *) n;
 				}
 			| UNIQUE ExistingIndex ConstraintAttributeSpec
@@ -4199,7 +4324,7 @@ ConstraintElem:
 					n->indexspace = NULL;
 					processCASbits($3, @3, "UNIQUE",
 								   &n->deferrable, &n->initdeferred, NULL,
-								   NULL, yyscanner);
+								   NULL, NULL, yyscanner);
 					$$ = (Node *) n;
 				}
 			| PRIMARY KEY '(' columnList opt_without_overlaps ')' opt_c_include opt_definition OptConsTableSpace
@@ -4217,7 +4342,7 @@ ConstraintElem:
 					n->indexspace = $9;
 					processCASbits($10, @10, "PRIMARY KEY",
 								   &n->deferrable, &n->initdeferred, NULL,
-								   NULL, yyscanner);
+								   NULL, NULL, yyscanner);
 					$$ = (Node *) n;
 				}
 			| PRIMARY KEY ExistingIndex ConstraintAttributeSpec
@@ -4233,7 +4358,7 @@ ConstraintElem:
 					n->indexspace = NULL;
 					processCASbits($4, @4, "PRIMARY KEY",
 								   &n->deferrable, &n->initdeferred, NULL,
-								   NULL, yyscanner);
+								   NULL, NULL, yyscanner);
 					$$ = (Node *) n;
 				}
 			| EXCLUDE access_method_clause '(' ExclusionConstraintList ')'
@@ -4253,7 +4378,7 @@ ConstraintElem:
 					n->where_clause = $9;
 					processCASbits($10, @10, "EXCLUDE",
 								   &n->deferrable, &n->initdeferred, NULL,
-								   NULL, yyscanner);
+								   NULL, NULL, yyscanner);
 					$$ = (Node *) n;
 				}
 			| FOREIGN KEY '(' columnList optionalPeriodName ')' REFERENCES qualified_name
@@ -4282,7 +4407,7 @@ ConstraintElem:
 					n->fk_del_set_cols = ($11)->deleteAction->cols;
 					processCASbits($12, @12, "FOREIGN KEY",
 								   &n->deferrable, &n->initdeferred,
-								   &n->skip_validation, NULL,
+								   &n->is_enforced, &n->skip_validation, NULL,
 								   yyscanner);
 					n->initially_valid = !n->skip_validation;
 					$$ = (Node *) n;
@@ -4322,8 +4447,9 @@ DomainConstraintElem:
 					n->raw_expr = $3;
 					n->cooked_expr = NULL;
 					processCASbits($5, @5, "CHECK",
-								   NULL, NULL, &n->skip_validation,
+								   NULL, NULL, NULL, &n->skip_validation,
 								   &n->is_no_inherit, yyscanner);
+					n->is_enforced = true;
 					n->initially_valid = !n->skip_validation;
 					$$ = (Node *) n;
 				}
@@ -4337,7 +4463,7 @@ DomainConstraintElem:
 					/* no NOT VALID, NO INHERIT support */
 					processCASbits($3, @3, "NOT NULL",
 								   NULL, NULL, NULL,
-								   NULL, yyscanner);
+								   NULL, NULL, yyscanner);
 					n->initially_valid = true;
 					$$ = (Node *) n;
 				}
@@ -5980,6 +6106,26 @@ CreateTrigStmt:
 			EXECUTE FUNCTION_or_PROCEDURE func_name '(' TriggerFuncArgs ')'
 				{
 					CreateTrigStmt *n = makeNode(CreateTrigStmt);
+					bool		dummy;
+
+					if (($11 & CAS_NOT_VALID) != 0)
+						ereport(ERROR,
+								errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								errmsg("constraint triggers cannot be marked %s",
+									   "NOT VALID"),
+								parser_errposition(@11));
+					if (($11 & CAS_NO_INHERIT) != 0)
+						ereport(ERROR,
+								errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								errmsg("constraint triggers cannot be marked %s",
+									   "NO INHERIT"),
+								parser_errposition(@11));
+					if (($11 & CAS_NOT_ENFORCED) != 0)
+						ereport(ERROR,
+								errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								errmsg("constraint triggers cannot be marked %s",
+									   "NOT ENFORCED"),
+								parser_errposition(@11));
 
 					n->replace = $2;
 					if (n->replace) /* not supported, see CreateTrigger */
@@ -5999,8 +6145,8 @@ CreateTrigStmt:
 					n->whenClause = $15;
 					n->transitionRels = NIL;
 					processCASbits($11, @11, "TRIGGER",
-								   &n->deferrable, &n->initdeferred, NULL,
-								   NULL, yyscanner);
+								   &n->deferrable, &n->initdeferred, &dummy,
+								   NULL, NULL, yyscanner);
 					n->constrrel = $10;
 					$$ = (Node *) n;
 				}
@@ -6169,7 +6315,8 @@ ConstraintAttributeSpec:
 								 parser_errposition(@2)));
 					/* generic message for other conflicts */
 					if ((newspec & (CAS_NOT_DEFERRABLE | CAS_DEFERRABLE)) == (CAS_NOT_DEFERRABLE | CAS_DEFERRABLE) ||
-						(newspec & (CAS_INITIALLY_IMMEDIATE | CAS_INITIALLY_DEFERRED)) == (CAS_INITIALLY_IMMEDIATE | CAS_INITIALLY_DEFERRED))
+						(newspec & (CAS_INITIALLY_IMMEDIATE | CAS_INITIALLY_DEFERRED)) == (CAS_INITIALLY_IMMEDIATE | CAS_INITIALLY_DEFERRED) ||
+						(newspec & (CAS_NOT_ENFORCED | CAS_ENFORCED)) == (CAS_NOT_ENFORCED | CAS_ENFORCED))
 						ereport(ERROR,
 								(errcode(ERRCODE_SYNTAX_ERROR),
 								 errmsg("conflicting constraint properties"),
@@ -6185,6 +6332,8 @@ ConstraintAttributeElem:
 			| INITIALLY DEFERRED			{ $$ = CAS_INITIALLY_DEFERRED; }
 			| NOT VALID						{ $$ = CAS_NOT_VALID; }
 			| NO INHERIT					{ $$ = CAS_NO_INHERIT; }
+			| NOT ENFORCED					{ $$ = CAS_NOT_ENFORCED; }
+			| ENFORCED						{ $$ = CAS_ENFORCED; }
 		;
 
 
@@ -7419,6 +7568,8 @@ fetch_args:	cursor_name
 					n->portalname = $1;
 					n->direction = FETCH_FORWARD;
 					n->howMany = 1;
+					n->location = -1;
+					n->direction_keyword = FETCH_KEYWORD_NONE;
 					$$ = (Node *) n;
 				}
 			| from_in cursor_name
@@ -7428,60 +7579,8 @@ fetch_args:	cursor_name
 					n->portalname = $2;
 					n->direction = FETCH_FORWARD;
 					n->howMany = 1;
-					$$ = (Node *) n;
-				}
-			| NEXT opt_from_in cursor_name
-				{
-					FetchStmt *n = makeNode(FetchStmt);
-
-					n->portalname = $3;
-					n->direction = FETCH_FORWARD;
-					n->howMany = 1;
-					$$ = (Node *) n;
-				}
-			| PRIOR opt_from_in cursor_name
-				{
-					FetchStmt *n = makeNode(FetchStmt);
-
-					n->portalname = $3;
-					n->direction = FETCH_BACKWARD;
-					n->howMany = 1;
-					$$ = (Node *) n;
-				}
-			| FIRST_P opt_from_in cursor_name
-				{
-					FetchStmt *n = makeNode(FetchStmt);
-
-					n->portalname = $3;
-					n->direction = FETCH_ABSOLUTE;
-					n->howMany = 1;
-					$$ = (Node *) n;
-				}
-			| LAST_P opt_from_in cursor_name
-				{
-					FetchStmt *n = makeNode(FetchStmt);
-
-					n->portalname = $3;
-					n->direction = FETCH_ABSOLUTE;
-					n->howMany = -1;
-					$$ = (Node *) n;
-				}
-			| ABSOLUTE_P SignedIconst opt_from_in cursor_name
-				{
-					FetchStmt *n = makeNode(FetchStmt);
-
-					n->portalname = $4;
-					n->direction = FETCH_ABSOLUTE;
-					n->howMany = $2;
-					$$ = (Node *) n;
-				}
-			| RELATIVE_P SignedIconst opt_from_in cursor_name
-				{
-					FetchStmt *n = makeNode(FetchStmt);
-
-					n->portalname = $4;
-					n->direction = FETCH_RELATIVE;
-					n->howMany = $2;
+					n->location = -1;
+					n->direction_keyword = FETCH_KEYWORD_NONE;
 					$$ = (Node *) n;
 				}
 			| SignedIconst opt_from_in cursor_name
@@ -7491,6 +7590,74 @@ fetch_args:	cursor_name
 					n->portalname = $3;
 					n->direction = FETCH_FORWARD;
 					n->howMany = $1;
+					n->location = @1;
+					n->direction_keyword = FETCH_KEYWORD_NONE;
+					$$ = (Node *) n;
+				}
+			| NEXT opt_from_in cursor_name
+				{
+					FetchStmt *n = makeNode(FetchStmt);
+
+					n->portalname = $3;
+					n->direction = FETCH_FORWARD;
+					n->howMany = 1;
+					n->location = -1;
+					n->direction_keyword = FETCH_KEYWORD_NEXT;
+					$$ = (Node *) n;
+				}
+			| PRIOR opt_from_in cursor_name
+				{
+					FetchStmt *n = makeNode(FetchStmt);
+
+					n->portalname = $3;
+					n->direction = FETCH_BACKWARD;
+					n->howMany = 1;
+					n->location = -1;
+					n->direction_keyword = FETCH_KEYWORD_PRIOR;
+					$$ = (Node *) n;
+				}
+			| FIRST_P opt_from_in cursor_name
+				{
+					FetchStmt *n = makeNode(FetchStmt);
+
+					n->portalname = $3;
+					n->direction = FETCH_ABSOLUTE;
+					n->howMany = 1;
+					n->location = -1;
+					n->direction_keyword = FETCH_KEYWORD_FIRST;
+					$$ = (Node *) n;
+				}
+			| LAST_P opt_from_in cursor_name
+				{
+					FetchStmt *n = makeNode(FetchStmt);
+
+					n->portalname = $3;
+					n->direction = FETCH_ABSOLUTE;
+					n->howMany = -1;
+					n->location = -1;
+					n->direction_keyword = FETCH_KEYWORD_LAST;
+					$$ = (Node *) n;
+				}
+			| ABSOLUTE_P SignedIconst opt_from_in cursor_name
+				{
+					FetchStmt *n = makeNode(FetchStmt);
+
+					n->portalname = $4;
+					n->direction = FETCH_ABSOLUTE;
+					n->howMany = $2;
+					n->location = @2;
+					n->direction_keyword = FETCH_KEYWORD_ABSOLUTE;
+					$$ = (Node *) n;
+				}
+			| RELATIVE_P SignedIconst opt_from_in cursor_name
+				{
+					FetchStmt *n = makeNode(FetchStmt);
+
+					n->portalname = $4;
+					n->direction = FETCH_RELATIVE;
+					n->howMany = $2;
+					n->location = @2;
+					n->direction_keyword = FETCH_KEYWORD_RELATIVE;
 					$$ = (Node *) n;
 				}
 			| ALL opt_from_in cursor_name
@@ -7500,6 +7667,8 @@ fetch_args:	cursor_name
 					n->portalname = $3;
 					n->direction = FETCH_FORWARD;
 					n->howMany = FETCH_ALL;
+					n->location = -1;
+					n->direction_keyword = FETCH_KEYWORD_ALL;
 					$$ = (Node *) n;
 				}
 			| FORWARD opt_from_in cursor_name
@@ -7509,6 +7678,8 @@ fetch_args:	cursor_name
 					n->portalname = $3;
 					n->direction = FETCH_FORWARD;
 					n->howMany = 1;
+					n->location = -1;
+					n->direction_keyword = FETCH_KEYWORD_FORWARD;
 					$$ = (Node *) n;
 				}
 			| FORWARD SignedIconst opt_from_in cursor_name
@@ -7518,6 +7689,8 @@ fetch_args:	cursor_name
 					n->portalname = $4;
 					n->direction = FETCH_FORWARD;
 					n->howMany = $2;
+					n->location = @2;
+					n->direction_keyword = FETCH_KEYWORD_FORWARD;
 					$$ = (Node *) n;
 				}
 			| FORWARD ALL opt_from_in cursor_name
@@ -7527,6 +7700,8 @@ fetch_args:	cursor_name
 					n->portalname = $4;
 					n->direction = FETCH_FORWARD;
 					n->howMany = FETCH_ALL;
+					n->location = -1;
+					n->direction_keyword = FETCH_KEYWORD_FORWARD_ALL;
 					$$ = (Node *) n;
 				}
 			| BACKWARD opt_from_in cursor_name
@@ -7536,6 +7711,8 @@ fetch_args:	cursor_name
 					n->portalname = $3;
 					n->direction = FETCH_BACKWARD;
 					n->howMany = 1;
+					n->location = -1;
+					n->direction_keyword = FETCH_KEYWORD_BACKWARD;
 					$$ = (Node *) n;
 				}
 			| BACKWARD SignedIconst opt_from_in cursor_name
@@ -7545,6 +7722,8 @@ fetch_args:	cursor_name
 					n->portalname = $4;
 					n->direction = FETCH_BACKWARD;
 					n->howMany = $2;
+					n->location = @2;
+					n->direction_keyword = FETCH_KEYWORD_BACKWARD;
 					$$ = (Node *) n;
 				}
 			| BACKWARD ALL opt_from_in cursor_name
@@ -7554,6 +7733,8 @@ fetch_args:	cursor_name
 					n->portalname = $4;
 					n->direction = FETCH_BACKWARD;
 					n->howMany = FETCH_ALL;
+					n->location = -1;
+					n->direction_keyword = FETCH_KEYWORD_BACKWARD_ALL;
 					$$ = (Node *) n;
 				}
 		;
@@ -8116,6 +8297,7 @@ defacl_privilege_target:
 			| SEQUENCES		{ $$ = OBJECT_SEQUENCE; }
 			| TYPES_P		{ $$ = OBJECT_TYPE; }
 			| SCHEMAS		{ $$ = OBJECT_SCHEMA; }
+			| LARGE_P OBJECTS_P	{ $$ = OBJECT_LARGEOBJECT; }
 		;
 
 
@@ -9230,7 +9412,7 @@ DropTransformStmt: DROP TRANSFORM opt_if_exists FOR Typename LANGUAGE name opt_d
  *****************************************************************************/
 
 ReindexStmt:
-			REINDEX opt_reindex_option_list reindex_target_relation opt_concurrently qualified_name
+			REINDEX opt_utility_option_list reindex_target_relation opt_concurrently qualified_name
 				{
 					ReindexStmt *n = makeNode(ReindexStmt);
 
@@ -9243,7 +9425,7 @@ ReindexStmt:
 											makeDefElem("concurrently", NULL, @4));
 					$$ = (Node *) n;
 				}
-			| REINDEX opt_reindex_option_list SCHEMA opt_concurrently name
+			| REINDEX opt_utility_option_list SCHEMA opt_concurrently name
 				{
 					ReindexStmt *n = makeNode(ReindexStmt);
 
@@ -9256,7 +9438,7 @@ ReindexStmt:
 											makeDefElem("concurrently", NULL, @4));
 					$$ = (Node *) n;
 				}
-			| REINDEX opt_reindex_option_list reindex_target_all opt_concurrently opt_single_name
+			| REINDEX opt_utility_option_list reindex_target_all opt_concurrently opt_single_name
 				{
 					ReindexStmt *n = makeNode(ReindexStmt);
 
@@ -9277,10 +9459,6 @@ reindex_target_relation:
 reindex_target_all:
 			SYSTEM_P				{ $$ = REINDEX_OBJECT_SYSTEM; }
 			| DATABASE				{ $$ = REINDEX_OBJECT_DATABASE; }
-		;
-opt_reindex_option_list:
-			'(' utility_option_list ')'				{ $$ = $2; }
-			| /* EMPTY */							{ $$ = NULL; }
 		;
 
 /*****************************************************************************
@@ -10553,7 +10731,12 @@ AlterOwnerStmt: ALTER AGGREGATE aggregate_with_argtypes OWNER TO RoleSpec
  *
  * CREATE PUBLICATION name [WITH options]
  *
- * CREATE PUBLICATION FOR ALL TABLES [WITH options]
+ * CREATE PUBLICATION FOR ALL pub_obj_type [, ...] [WITH options]
+ *
+ * pub_obj_type is one of:
+ *
+ *		TABLES
+ *		SEQUENCES
  *
  * CREATE PUBLICATION FOR pub_obj [, ...] [WITH options]
  *
@@ -10573,13 +10756,16 @@ CreatePublicationStmt:
 					n->options = $4;
 					$$ = (Node *) n;
 				}
-			| CREATE PUBLICATION name FOR ALL TABLES opt_definition
+			| CREATE PUBLICATION name FOR pub_obj_type_list opt_definition
 				{
 					CreatePublicationStmt *n = makeNode(CreatePublicationStmt);
 
 					n->pubname = $3;
-					n->options = $7;
-					n->for_all_tables = true;
+					n->pubobjects = (List *) $5;
+					preprocess_pub_all_objtype_list($5, &n->for_all_tables,
+													&n->for_all_sequences,
+													yyscanner);
+					n->options = $6;
 					$$ = (Node *) n;
 				}
 			| CREATE PUBLICATION name FOR pub_obj_list opt_definition
@@ -10691,6 +10877,28 @@ pub_obj_list:	PublicationObjSpec
 					{ $$ = lappend($1, $3); }
 	;
 
+PublicationAllObjSpec:
+				ALL TABLES
+					{
+						$$ = makeNode(PublicationAllObjSpec);
+						$$->pubobjtype = PUBLICATION_ALL_TABLES;
+						$$->location = @1;
+					}
+				| ALL SEQUENCES
+					{
+						$$ = makeNode(PublicationAllObjSpec);
+						$$->pubobjtype = PUBLICATION_ALL_SEQUENCES;
+						$$->location = @1;
+					}
+					;
+
+pub_obj_type_list:	PublicationAllObjSpec
+					{ $$ = list_make1($1); }
+				| pub_obj_type_list ',' PublicationAllObjSpec
+					{ $$ = lappend($1, $3); }
+	;
+
+
 /*****************************************************************************
  *
  * ALTER PUBLICATION name SET ( options )
@@ -10800,9 +11008,18 @@ AlterSubscriptionStmt:
 					AlterSubscriptionStmt *n =
 						makeNode(AlterSubscriptionStmt);
 
-					n->kind = ALTER_SUBSCRIPTION_REFRESH;
+					n->kind = ALTER_SUBSCRIPTION_REFRESH_PUBLICATION;
 					n->subname = $3;
 					n->options = $6;
+					$$ = (Node *) n;
+				}
+			| ALTER SUBSCRIPTION name REFRESH SEQUENCES
+				{
+					AlterSubscriptionStmt *n =
+						makeNode(AlterSubscriptionStmt);
+
+					n->kind = ALTER_SUBSCRIPTION_REFRESH_SEQUENCES;
+					n->subname = $3;
 					$$ = (Node *) n;
 				}
 			| ALTER SUBSCRIPTION name ADD_P PUBLICATION name_list opt_definition
@@ -11568,7 +11785,7 @@ AlterDomainStmt:
 				{
 					AlterDomainStmt *n = makeNode(AlterDomainStmt);
 
-					n->subtype = 'T';
+					n->subtype = AD_AlterDefault;
 					n->typeName = $3;
 					n->def = $4;
 					$$ = (Node *) n;
@@ -11578,7 +11795,7 @@ AlterDomainStmt:
 				{
 					AlterDomainStmt *n = makeNode(AlterDomainStmt);
 
-					n->subtype = 'N';
+					n->subtype = AD_DropNotNull;
 					n->typeName = $3;
 					$$ = (Node *) n;
 				}
@@ -11587,7 +11804,7 @@ AlterDomainStmt:
 				{
 					AlterDomainStmt *n = makeNode(AlterDomainStmt);
 
-					n->subtype = 'O';
+					n->subtype = AD_SetNotNull;
 					n->typeName = $3;
 					$$ = (Node *) n;
 				}
@@ -11596,7 +11813,7 @@ AlterDomainStmt:
 				{
 					AlterDomainStmt *n = makeNode(AlterDomainStmt);
 
-					n->subtype = 'C';
+					n->subtype = AD_AddConstraint;
 					n->typeName = $3;
 					n->def = $5;
 					$$ = (Node *) n;
@@ -11606,7 +11823,7 @@ AlterDomainStmt:
 				{
 					AlterDomainStmt *n = makeNode(AlterDomainStmt);
 
-					n->subtype = 'X';
+					n->subtype = AD_DropConstraint;
 					n->typeName = $3;
 					n->name = $6;
 					n->behavior = $7;
@@ -11618,7 +11835,7 @@ AlterDomainStmt:
 				{
 					AlterDomainStmt *n = makeNode(AlterDomainStmt);
 
-					n->subtype = 'X';
+					n->subtype = AD_DropConstraint;
 					n->typeName = $3;
 					n->name = $8;
 					n->behavior = $9;
@@ -11630,7 +11847,7 @@ AlterDomainStmt:
 				{
 					AlterDomainStmt *n = makeNode(AlterDomainStmt);
 
-					n->subtype = 'V';
+					n->subtype = AD_ValidateConstraint;
 					n->typeName = $3;
 					n->name = $6;
 					$$ = (Node *) n;
@@ -11779,13 +11996,13 @@ ClusterStmt:
 					n->params = $3;
 					$$ = (Node *) n;
 				}
-			| CLUSTER '(' utility_option_list ')'
+			| CLUSTER opt_utility_option_list
 				{
 					ClusterStmt *n = makeNode(ClusterStmt);
 
 					n->relation = NULL;
 					n->indexname = NULL;
-					n->params = $3;
+					n->params = $2;
 					$$ = (Node *) n;
 				}
 			/* unparenthesized VERBOSE kept for pre-14 compatibility */
@@ -11795,21 +12012,18 @@ ClusterStmt:
 
 					n->relation = $3;
 					n->indexname = $4;
-					n->params = NIL;
 					if ($2)
-						n->params = lappend(n->params, makeDefElem("verbose", NULL, @2));
+						n->params = list_make1(makeDefElem("verbose", NULL, @2));
 					$$ = (Node *) n;
 				}
 			/* unparenthesized VERBOSE kept for pre-17 compatibility */
-			| CLUSTER opt_verbose
+			| CLUSTER VERBOSE
 				{
 					ClusterStmt *n = makeNode(ClusterStmt);
 
 					n->relation = NULL;
 					n->indexname = NULL;
-					n->params = NIL;
-					if ($2)
-						n->params = lappend(n->params, makeDefElem("verbose", NULL, @2));
+					n->params = list_make1(makeDefElem("verbose", NULL, @2));
 					$$ = (Node *) n;
 				}
 			/* kept for pre-8.3 compatibility */
@@ -11819,9 +12033,8 @@ ClusterStmt:
 
 					n->relation = $5;
 					n->indexname = $3;
-					n->params = NIL;
 					if ($2)
-						n->params = lappend(n->params, makeDefElem("verbose", NULL, @2));
+						n->params = list_make1(makeDefElem("verbose", NULL, @2));
 					$$ = (Node *) n;
 				}
 		;
@@ -11872,62 +12085,29 @@ VacuumStmt: VACUUM opt_full opt_freeze opt_verbose opt_analyze opt_vacuum_relati
 				}
 		;
 
-AnalyzeStmt: analyze_keyword opt_verbose opt_vacuum_relation_list
+AnalyzeStmt: analyze_keyword opt_utility_option_list opt_vacuum_relation_list
 				{
 					VacuumStmt *n = makeNode(VacuumStmt);
 
-					n->options = NIL;
-					if ($2)
-						n->options = lappend(n->options,
-											 makeDefElem("verbose", NULL, @2));
+					n->options = $2;
 					n->rels = $3;
 					n->is_vacuumcmd = false;
 					$$ = (Node *) n;
 				}
-			| analyze_keyword '(' utility_option_list ')' opt_vacuum_relation_list
+			| analyze_keyword VERBOSE opt_vacuum_relation_list
 				{
 					VacuumStmt *n = makeNode(VacuumStmt);
 
-					n->options = $3;
-					n->rels = $5;
+					n->options = list_make1(makeDefElem("verbose", NULL, @2));
+					n->rels = $3;
 					n->is_vacuumcmd = false;
 					$$ = (Node *) n;
-				}
-		;
-
-utility_option_list:
-			utility_option_elem
-				{
-					$$ = list_make1($1);
-				}
-			| utility_option_list ',' utility_option_elem
-				{
-					$$ = lappend($1, $3);
 				}
 		;
 
 analyze_keyword:
 			ANALYZE
 			| ANALYSE /* British */
-		;
-
-utility_option_elem:
-			utility_option_name utility_option_arg
-				{
-					$$ = makeDefElem($1, $2, @1);
-				}
-		;
-
-utility_option_name:
-			NonReservedWord							{ $$ = $1; }
-			| analyze_keyword						{ $$ = "analyze"; }
-			| FORMAT_LA								{ $$ = "format"; }
-		;
-
-utility_option_arg:
-			opt_boolean_or_string					{ $$ = (Node *) makeString($1); }
-			| NumericOnly							{ $$ = (Node *) $1; }
-			| /* EMPTY */							{ $$ = NULL; }
 		;
 
 opt_analyze:
@@ -12177,9 +12357,8 @@ InsertStmt:
 				{
 					$5->relation = $4;
 					$5->onConflictClause = $6;
-					$5->returningList = $7;
+					$5->returningClause = $7;
 					$5->withClause = $1;
-					$5->stmt_location = @$;
 					$$ = (Node *) $5;
 				}
 		;
@@ -12311,8 +12490,45 @@ opt_conf_expr:
 		;
 
 returning_clause:
-			RETURNING target_list		{ $$ = $2; }
-			| /* EMPTY */				{ $$ = NIL; }
+			RETURNING returning_with_clause target_list
+				{
+					ReturningClause *n = makeNode(ReturningClause);
+
+					n->options = $2;
+					n->exprs = $3;
+					$$ = n;
+				}
+			| /* EMPTY */
+				{
+					$$ = NULL;
+				}
+		;
+
+returning_with_clause:
+			WITH '(' returning_options ')'		{ $$ = $3; }
+			| /* EMPTY */						{ $$ = NIL; }
+		;
+
+returning_options:
+			returning_option							{ $$ = list_make1($1); }
+			| returning_options ',' returning_option	{ $$ = lappend($1, $3); }
+		;
+
+returning_option:
+			returning_option_kind AS ColId
+				{
+					ReturningOption *n = makeNode(ReturningOption);
+
+					n->option = $1;
+					n->value = $3;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+		;
+
+returning_option_kind:
+			OLD			{ $$ = RETURNING_OPTION_OLD; }
+			| NEW		{ $$ = RETURNING_OPTION_NEW; }
 		;
 
 
@@ -12331,9 +12547,8 @@ DeleteStmt: opt_with_clause DELETE_P FROM relation_expr_opt_alias
 					n->relation = $4;
 					n->usingClause = $5;
 					n->whereClause = $6;
-					n->returningList = $7;
+					n->returningClause = $7;
 					n->withClause = $1;
-					n->stmt_location = @$;
 					$$ = (Node *) n;
 				}
 		;
@@ -12406,9 +12621,8 @@ UpdateStmt: opt_with_clause UPDATE relation_expr_opt_alias
 					n->targetList = $5;
 					n->fromClause = $6;
 					n->whereClause = $7;
-					n->returningList = $8;
+					n->returningClause = $8;
 					n->withClause = $1;
-					n->stmt_location = @$;
 					$$ = (Node *) n;
 				}
 		;
@@ -12485,8 +12699,7 @@ MergeStmt:
 					m->sourceRelation = $6;
 					m->joinCondition = $8;
 					m->mergeWhenClauses = $9;
-					m->returningList = $10;
-					m->stmt_location = @$;
+					m->returningClause = $10;
 
 					$$ = (Node *) m;
 				}
@@ -12727,20 +12940,7 @@ SelectStmt: select_no_parens			%prec UMINUS
 		;
 
 select_with_parens:
-			'(' select_no_parens ')'
-				{
-					SelectStmt *n = (SelectStmt *) $2;
-
-					/*
-					 * As SelectStmt's location starts at the SELECT keyword,
-					 * we need to track the length of the SelectStmt within
-					 * parentheses to be able to extract the relevant part
-					 * of the query.  Without this, the RawStmt's length would
-					 * be used and would include the closing parenthesis.
-					 */
-					n->stmt_len = @3 - @2;
-					$$ = $2;
-				}
+			'(' select_no_parens ')'				{ $$ = $2; }
 			| '(' select_with_parens ')'			{ $$ = $2; }
 		;
 
@@ -12860,9 +13060,9 @@ simple_select:
 					n->whereClause = $6;
 					n->groupClause = ($7)->list;
 					n->groupDistinct = ($7)->distinct;
+					n->groupByAll = ($7)->all;
 					n->havingClause = $8;
 					n->windowClause = $9;
-					n->stmt_location = @1;
 					$$ = (Node *) n;
 				}
 			| SELECT distinct_clause target_list
@@ -12878,9 +13078,9 @@ simple_select:
 					n->whereClause = $6;
 					n->groupClause = ($7)->list;
 					n->groupDistinct = ($7)->distinct;
+					n->groupByAll = ($7)->all;
 					n->havingClause = $8;
 					n->windowClause = $9;
-					n->stmt_location = @1;
 					$$ = (Node *) n;
 				}
 			| values_clause							{ $$ = $1; }
@@ -12901,20 +13101,19 @@ simple_select:
 
 					n->targetList = list_make1(rt);
 					n->fromClause = list_make1($2);
-					n->stmt_location = @1;
 					$$ = (Node *) n;
 				}
 			| select_clause UNION set_quantifier select_clause
 				{
-					$$ = makeSetOp(SETOP_UNION, $3 == SET_QUANTIFIER_ALL, $1, $4, @1);
+					$$ = makeSetOp(SETOP_UNION, $3 == SET_QUANTIFIER_ALL, $1, $4);
 				}
 			| select_clause INTERSECT set_quantifier select_clause
 				{
-					$$ = makeSetOp(SETOP_INTERSECT, $3 == SET_QUANTIFIER_ALL, $1, $4, @1);
+					$$ = makeSetOp(SETOP_INTERSECT, $3 == SET_QUANTIFIER_ALL, $1, $4);
 				}
 			| select_clause EXCEPT set_quantifier select_clause
 				{
-					$$ = makeSetOp(SETOP_EXCEPT, $3 == SET_QUANTIFIER_ALL, $1, $4, @1);
+					$$ = makeSetOp(SETOP_EXCEPT, $3 == SET_QUANTIFIER_ALL, $1, $4);
 				}
 		;
 
@@ -13377,7 +13576,16 @@ group_clause:
 					GroupClause *n = (GroupClause *) palloc(sizeof(GroupClause));
 
 					n->distinct = $3 == SET_QUANTIFIER_DISTINCT;
+					n->all = false;
 					n->list = $4;
+					$$ = n;
+				}
+			| GROUP_P BY ALL
+				{
+					GroupClause *n = (GroupClause *) palloc(sizeof(GroupClause));
+					n->distinct = false;
+					n->all = true;
+					n->list = NIL;
 					$$ = n;
 				}
 			| /*EMPTY*/
@@ -13385,6 +13593,7 @@ group_clause:
 					GroupClause *n = (GroupClause *) palloc(sizeof(GroupClause));
 
 					n->distinct = false;
+					n->all = false;
 					n->list = NIL;
 					$$ = n;
 				}
@@ -13492,7 +13701,6 @@ values_clause:
 				{
 					SelectStmt *n = makeNode(SelectStmt);
 
-					n->stmt_location = @1;
 					n->valuesLists = list_make1($3);
 					$$ = (Node *) n;
 				}
@@ -14132,7 +14340,7 @@ xmltable_column_el:
 										 parser_errposition(defel->location)));
 							fc->colexpr = defel->arg;
 						}
-						else if (strcmp(defel->defname, "is_not_null") == 0)
+						else if (strcmp(defel->defname, "__pg__is_not_null") == 0)
 						{
 							if (nullability_seen)
 								ereport(ERROR,
@@ -14175,13 +14383,20 @@ xmltable_column_option_list:
 
 xmltable_column_option_el:
 			IDENT b_expr
-				{ $$ = makeDefElem($1, $2, @1); }
+				{
+					if (strcmp($1, "__pg__is_not_null") == 0)
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("option name \"%s\" cannot be used in XMLTABLE", $1),
+								 parser_errposition(@1)));
+					$$ = makeDefElem($1, $2, @1);
+				}
 			| DEFAULT b_expr
 				{ $$ = makeDefElem("default", $2, @1); }
 			| NOT NULL_P
-				{ $$ = makeDefElem("is_not_null", (Node *) makeBoolean(true), @1); }
+				{ $$ = makeDefElem("__pg__is_not_null", (Node *) makeBoolean(true), @1); }
 			| NULL_P
-				{ $$ = makeDefElem("is_not_null", (Node *) makeBoolean(false), @1); }
+				{ $$ = makeDefElem("__pg__is_not_null", (Node *) makeBoolean(false), @1); }
 			| PATH b_expr
 				{ $$ = makeDefElem("path", $2, @1); }
 		;
@@ -15182,49 +15397,50 @@ a_expr:		c_expr									{ $$ = $1; }
 												   (Node *) list_make2($5, $7),
 												   @2);
 				}
-			| a_expr IN_P in_expr
+			| a_expr IN_P select_with_parens
 				{
-					/* in_expr returns a SubLink or a list of a_exprs */
-					if (IsA($3, SubLink))
-					{
-						/* generate foo = ANY (subquery) */
-						SubLink	   *n = (SubLink *) $3;
+					/* generate foo = ANY (subquery) */
+					SubLink	   *n = makeNode(SubLink);
 
-						n->subLinkType = ANY_SUBLINK;
-						n->subLinkId = 0;
-						n->testexpr = $1;
-						n->operName = NIL;		/* show it's IN not = ANY */
-						n->location = @2;
-						$$ = (Node *) n;
-					}
-					else
-					{
-						/* generate scalar IN expression */
-						$$ = (Node *) makeSimpleA_Expr(AEXPR_IN, "=", $1, $3, @2);
-					}
+					n->subselect = $3;
+					n->subLinkType = ANY_SUBLINK;
+					n->subLinkId = 0;
+					n->testexpr = $1;
+					n->operName = NIL;		/* show it's IN not = ANY */
+					n->location = @2;
+					$$ = (Node *) n;
 				}
-			| a_expr NOT_LA IN_P in_expr						%prec NOT_LA
+			| a_expr IN_P '(' expr_list ')'
 				{
-					/* in_expr returns a SubLink or a list of a_exprs */
-					if (IsA($4, SubLink))
-					{
-						/* generate NOT (foo = ANY (subquery)) */
-						/* Make an = ANY node */
-						SubLink	   *n = (SubLink *) $4;
+					/* generate scalar IN expression */
+					A_Expr *n = makeSimpleA_Expr(AEXPR_IN, "=", $1, (Node *) $4, @2);
 
-						n->subLinkType = ANY_SUBLINK;
-						n->subLinkId = 0;
-						n->testexpr = $1;
-						n->operName = NIL;		/* show it's IN not = ANY */
-						n->location = @2;
-						/* Stick a NOT on top; must have same parse location */
-						$$ = makeNotExpr((Node *) n, @2);
-					}
-					else
-					{
-						/* generate scalar NOT IN expression */
-						$$ = (Node *) makeSimpleA_Expr(AEXPR_IN, "<>", $1, $4, @2);
-					}
+					n->rexpr_list_start = @3;
+					n->rexpr_list_end = @5;
+					$$ = (Node *) n;
+				}
+			| a_expr NOT_LA IN_P select_with_parens			%prec NOT_LA
+				{
+					/* generate NOT (foo = ANY (subquery)) */
+					SubLink	   *n = makeNode(SubLink);
+
+					n->subselect = $4;
+					n->subLinkType = ANY_SUBLINK;
+					n->subLinkId = 0;
+					n->testexpr = $1;
+					n->operName = NIL;		/* show it's IN not = ANY */
+					n->location = @2;
+					/* Stick a NOT on top; must have same parse location */
+					$$ = makeNotExpr((Node *) n, @2);
+				}
+			| a_expr NOT_LA IN_P '(' expr_list ')'
+				{
+					/* generate scalar NOT IN expression */
+					A_Expr *n = makeSimpleA_Expr(AEXPR_IN, "<>", $1, (Node *) $5, @2);
+
+					n->rexpr_list_start = @4;
+					n->rexpr_list_end = @6;
+					$$ = (Node *) n;
 				}
 			| a_expr subquery_Op sub_type select_with_parens	%prec Op
 				{
@@ -15655,7 +15871,7 @@ func_application: func_name '(' ')'
  * (Note that many of the special SQL functions wouldn't actually make any
  * sense as functional index entries, but we ignore that consideration here.)
  */
-func_expr: func_application within_group_clause filter_clause over_clause
+func_expr: func_application within_group_clause filter_clause null_treatment over_clause
 				{
 					FuncCall   *n = (FuncCall *) $1;
 
@@ -15688,7 +15904,8 @@ func_expr: func_application within_group_clause filter_clause over_clause
 						n->agg_within_group = true;
 					}
 					n->agg_filter = $3;
-					n->over = $4;
+					n->ignore_nulls = $4;
+					n->over = $5;
 					$$ = (Node *) n;
 				}
 			| json_aggregate_func filter_clause over_clause
@@ -16266,6 +16483,26 @@ xml_passing_mech:
 			| BY VALUE_P
 		;
 
+/*****************************************************************************
+ *
+ * WAIT FOR LSN
+ *
+ *****************************************************************************/
+
+WaitStmt:
+			WAIT FOR LSN_P Sconst opt_wait_with_clause
+				{
+					WaitStmt *n = makeNode(WaitStmt);
+					n->lsn_literal = $4;
+					n->options = $5;
+					$$ = (Node *) n;
+				}
+			;
+
+opt_wait_with_clause:
+			WITH '(' utility_option_list ')'		{ $$ = $3; }
+			| /*EMPTY*/								{ $$ = NIL; }
+			;
 
 /*
  * Aggregate decoration clauses
@@ -16284,6 +16521,12 @@ filter_clause:
 /*
  * Window Definitions
  */
+null_treatment:
+			IGNORE_P NULLS_P						{ $$ = PARSER_IGNORE_NULLS; }
+			| RESPECT_P NULLS_P						{ $$ = PARSER_RESPECT_NULLS; }
+			| /*EMPTY*/								{ $$ = NO_NULLTREATMENT; }
+		;
+
 window_clause:
 			WINDOW window_definition_list			{ $$ = $2; }
 			| /*EMPTY*/								{ $$ = NIL; }
@@ -16659,15 +16902,15 @@ type_list:	Typename								{ $$ = list_make1($1); }
 
 array_expr: '[' expr_list ']'
 				{
-					$$ = makeAArrayExpr($2, @1);
+					$$ = makeAArrayExpr($2, @1, @3);
 				}
 			| '[' array_expr_list ']'
 				{
-					$$ = makeAArrayExpr($2, @1);
+					$$ = makeAArrayExpr($2, @1, @3);
 				}
 			| '[' ']'
 				{
-					$$ = makeAArrayExpr(NIL, @1);
+					$$ = makeAArrayExpr(NIL, @1, @2);
 				}
 		;
 
@@ -16787,17 +17030,6 @@ substr_list:
 trim_list:	a_expr FROM expr_list					{ $$ = lappend($3, $1); }
 			| FROM expr_list						{ $$ = $2; }
 			| expr_list								{ $$ = $1; }
-		;
-
-in_expr:	select_with_parens
-				{
-					SubLink	   *n = makeNode(SubLink);
-
-					n->subselect = $1;
-					/* other fields will be filled later */
-					$$ = (Node *) n;
-				}
-			| '(' expr_list ')'						{ $$ = (Node *) $2; }
 		;
 
 /*
@@ -17492,6 +17724,7 @@ PLpgSQL_Expr: opt_distinct_clause opt_target_list
 					n->whereClause = $4;
 					n->groupClause = ($5)->list;
 					n->groupDistinct = ($5)->distinct;
+					n->groupByAll = ($5)->all;
 					n->havingClause = $6;
 					n->windowClause = $7;
 					n->sortClause = $8;
@@ -17688,6 +17921,7 @@ unreserved_keyword:
 			| ENABLE_P
 			| ENCODING
 			| ENCRYPTED
+			| ENFORCED
 			| ENUM_P
 			| ERROR_P
 			| ESCAPE
@@ -17720,6 +17954,7 @@ unreserved_keyword:
 			| HOUR_P
 			| IDENTITY_P
 			| IF_P
+			| IGNORE_P
 			| IMMEDIATE
 			| IMMUTABLE
 			| IMPLICIT_P
@@ -17755,6 +17990,7 @@ unreserved_keyword:
 			| LOCK_P
 			| LOCKED
 			| LOGGED
+			| LSN_P
 			| MAPPING
 			| MATCH
 			| MATCHED
@@ -17783,6 +18019,7 @@ unreserved_keyword:
 			| NOWAIT
 			| NULLS_P
 			| OBJECT_P
+			| OBJECTS_P
 			| OF
 			| OFF
 			| OIDS
@@ -17837,6 +18074,7 @@ unreserved_keyword:
 			| REPLACE
 			| REPLICA
 			| RESET
+			| RESPECT_P
 			| RESTART
 			| RESTRICT
 			| RETURN
@@ -17921,7 +18159,9 @@ unreserved_keyword:
 			| VERSION_P
 			| VIEW
 			| VIEWS
+			| VIRTUAL
 			| VOLATILE
+			| WAIT
 			| WHITESPACE_P
 			| WITHIN
 			| WITHOUT
@@ -18265,6 +18505,7 @@ bare_label_keyword:
 			| ENCODING
 			| ENCRYPTED
 			| END_P
+			| ENFORCED
 			| ENUM_P
 			| ERROR_P
 			| ESCAPE
@@ -18367,6 +18608,7 @@ bare_label_keyword:
 			| LOCK_P
 			| LOCKED
 			| LOGGED
+			| LSN_P
 			| MAPPING
 			| MATCH
 			| MATCHED
@@ -18403,6 +18645,7 @@ bare_label_keyword:
 			| NULLS_P
 			| NUMERIC
 			| OBJECT_P
+			| OBJECTS_P
 			| OF
 			| OFF
 			| OIDS
@@ -18575,7 +18818,9 @@ bare_label_keyword:
 			| VERSION_P
 			| VIEW
 			| VIEWS
+			| VIRTUAL
 			| VOLATILE
+			| WAIT
 			| WHEN
 			| WHITESPACE_P
 			| WORK
@@ -18637,56 +18882,15 @@ updateRawStmtEnd(RawStmt *rs, int end_location)
 	rs->stmt_len = end_location - rs->stmt_location;
 }
 
-/*
- * Adjust a PreparableStmt to reflect that it doesn't run to the end of the
- * string.
- */
-static void
-updatePreparableStmtEnd(Node *n, int end_location)
-{
-	if (IsA(n, SelectStmt))
-	{
-		SelectStmt *stmt = (SelectStmt *)n;
-
-		stmt->stmt_len = end_location - stmt->stmt_location;
-	}
-	else if (IsA(n, InsertStmt))
-	{
-		InsertStmt *stmt = (InsertStmt *)n;
-
-		stmt->stmt_len = end_location - stmt->stmt_location;
-	}
-	else if (IsA(n, UpdateStmt))
-	{
-		UpdateStmt *stmt = (UpdateStmt *)n;
-
-		stmt->stmt_len = end_location - stmt->stmt_location;
-	}
-	else if (IsA(n, DeleteStmt))
-	{
-		DeleteStmt *stmt = (DeleteStmt *)n;
-
-		stmt->stmt_len = end_location - stmt->stmt_location;
-	}
-	else if (IsA(n, MergeStmt))
-	{
-		MergeStmt *stmt = (MergeStmt *)n;
-
-		stmt->stmt_len = end_location - stmt->stmt_location;
-	}
-	else
-		elog(ERROR, "unexpected node type %d", (int) n->type);
-}
-
 static Node *
 makeColumnRef(char *colname, List *indirection,
 			  int location, core_yyscan_t yyscanner)
 {
 	/*
-	 * Generate a ColumnRef node, with an A_Indirection node added if there
-	 * is any subscripting in the specified indirection list.  However,
-	 * any field selection at the start of the indirection list must be
-	 * transposed into the "fields" part of the ColumnRef node.
+	 * Generate a ColumnRef node, with an A_Indirection node added if there is
+	 * any subscripting in the specified indirection list.  However, any field
+	 * selection at the start of the indirection list must be transposed into
+	 * the "fields" part of the ColumnRef node.
 	 */
 	ColumnRef  *c = makeNode(ColumnRef);
 	int			nfields = 0;
@@ -18752,55 +18956,55 @@ makeStringConstCast(char *str, int location, TypeName *typename)
 static Node *
 makeIntConst(int val, int location)
 {
-	A_Const	   *n = makeNode(A_Const);
+	A_Const    *n = makeNode(A_Const);
 
 	n->val.ival.type = T_Integer;
 	n->val.ival.ival = val;
 	n->location = location;
 
-   return (Node *) n;
+	return (Node *) n;
 }
 
 static Node *
 makeFloatConst(char *str, int location)
 {
-	A_Const	   *n = makeNode(A_Const);
+	A_Const    *n = makeNode(A_Const);
 
 	n->val.fval.type = T_Float;
 	n->val.fval.fval = str;
 	n->location = location;
 
-   return (Node *) n;
+	return (Node *) n;
 }
 
 static Node *
 makeBoolAConst(bool state, int location)
 {
-	A_Const	   *n = makeNode(A_Const);
+	A_Const    *n = makeNode(A_Const);
 
 	n->val.boolval.type = T_Boolean;
 	n->val.boolval.boolval = state;
 	n->location = location;
 
-   return (Node *) n;
+	return (Node *) n;
 }
 
 static Node *
 makeBitStringConst(char *str, int location)
 {
-	A_Const	   *n = makeNode(A_Const);
+	A_Const    *n = makeNode(A_Const);
 
 	n->val.bsval.type = T_BitString;
 	n->val.bsval.bsval = str;
 	n->location = location;
 
-   return (Node *) n;
+	return (Node *) n;
 }
 
 static Node *
 makeNullAConst(int location)
 {
-	A_Const	   *n = makeNode(A_Const);
+	A_Const    *n = makeNode(A_Const);
 
 	n->isnull = true;
 	n->location = location;
@@ -18889,7 +19093,7 @@ check_func_name(List *names, core_yyscan_t yyscanner)
 static List *
 check_indirection(List *indirection, core_yyscan_t yyscanner)
 {
-	ListCell *l;
+	ListCell   *l;
 
 	foreach(l, indirection)
 	{
@@ -18944,7 +19148,7 @@ makeOrderedSetArgs(List *directargs, List *orderedargs,
 				   core_yyscan_t yyscanner)
 {
 	FunctionParameter *lastd = (FunctionParameter *) llast(directargs);
-	Integer	   *ndirectargs;
+	Integer    *ndirectargs;
 
 	/* No restriction unless last direct arg is VARIADIC */
 	if (lastd->mode == FUNC_PARAM_VARIADIC)
@@ -18952,8 +19156,8 @@ makeOrderedSetArgs(List *directargs, List *orderedargs,
 		FunctionParameter *firsto = (FunctionParameter *) linitial(orderedargs);
 
 		/*
-		 * We ignore the names, though the aggr_arg production allows them;
-		 * it doesn't allow default values, so those need not be checked.
+		 * We ignore the names, though the aggr_arg production allows them; it
+		 * doesn't allow default values, so those need not be checked.
 		 */
 		if (list_length(orderedargs) != 1 ||
 			firsto->mode != FUNC_PARAM_VARIADIC ||
@@ -19056,14 +19260,11 @@ insertSelectOptions(SelectStmt *stmt,
 					 errmsg("multiple WITH clauses not allowed"),
 					 parser_errposition(exprLocation((Node *) withClause))));
 		stmt->withClause = withClause;
-
-		/* Update SelectStmt's location to the start of the WITH clause */
-		stmt->stmt_location = withClause->location;
 	}
 }
 
 static Node *
-makeSetOp(SetOperation op, bool all, Node *larg, Node *rarg, int location)
+makeSetOp(SetOperation op, bool all, Node *larg, Node *rarg)
 {
 	SelectStmt *n = makeNode(SelectStmt);
 
@@ -19071,7 +19272,6 @@ makeSetOp(SetOperation op, bool all, Node *larg, Node *rarg, int location)
 	n->all = all;
 	n->larg = (SelectStmt *) larg;
 	n->rarg = (SelectStmt *) rarg;
-	n->stmt_location = location;
 	return (Node *) n;
 }
 
@@ -19115,7 +19315,7 @@ doNegate(Node *n, int location)
 {
 	if (IsA(n, A_Const))
 	{
-		A_Const	   *con = (A_Const *) n;
+		A_Const    *con = (A_Const *) n;
 
 		/* report the constant's location as that of the '-' sign */
 		con->location = location;
@@ -19143,7 +19343,7 @@ doNegateFloat(Float *v)
 	if (*oldval == '+')
 		oldval++;
 	if (*oldval == '-')
-		v->fval = oldval+1;	/* just strip the '-' */
+		v->fval = oldval + 1;	/* just strip the '-' */
 	else
 		v->fval = psprintf("-%s", oldval);
 }
@@ -19189,12 +19389,14 @@ makeNotExpr(Node *expr, int location)
 }
 
 static Node *
-makeAArrayExpr(List *elements, int location)
+makeAArrayExpr(List *elements, int location, int location_end)
 {
 	A_ArrayExpr *n = makeNode(A_ArrayExpr);
 
 	n->elements = elements;
 	n->location = location;
+	n->list_start = location;
+	n->list_end = location_end;
 	return (Node *) n;
 }
 
@@ -19214,10 +19416,11 @@ static Node *
 makeXmlExpr(XmlExprOp op, char *name, List *named_args, List *args,
 			int location)
 {
-	XmlExpr		*x = makeNode(XmlExpr);
+	XmlExpr    *x = makeNode(XmlExpr);
 
 	x->op = op;
 	x->name = name;
+
 	/*
 	 * named_args is a list of ResTarget; it'll be split apart into separate
 	 * expression and name lists in transformXmlExpr().
@@ -19227,7 +19430,7 @@ makeXmlExpr(XmlExprOp op, char *name, List *named_args, List *args,
 	x->args = args;
 	/* xmloption, if relevant, must be filled in by caller */
 	/* type and typmod will be filled in during parse analysis */
-	x->type = InvalidOid;			/* marks the node as not analyzed */
+	x->type = InvalidOid;		/* marks the node as not analyzed */
 	x->location = location;
 	return (Node *) x;
 }
@@ -19352,7 +19555,7 @@ makeRangeVarFromQualifiedName(char *name, List *namelist, int location,
 					errcode(ERRCODE_SYNTAX_ERROR),
 					errmsg("improper qualified name (too many dotted names): %s",
 						   NameListToString(lcons(makeString(name), namelist))),
-						   parser_errposition(location));
+					parser_errposition(location));
 			break;
 	}
 
@@ -19403,8 +19606,8 @@ SplitColQualList(List *qualList,
  */
 static void
 processCASbits(int cas_bits, int location, const char *constrType,
-			   bool *deferrable, bool *initdeferred, bool *not_valid,
-			   bool *no_inherit, core_yyscan_t yyscanner)
+			   bool *deferrable, bool *initdeferred, bool *is_enforced,
+			   bool *not_valid, bool *no_inherit, core_yyscan_t yyscanner)
 {
 	/* defaults */
 	if (deferrable)
@@ -19413,6 +19616,8 @@ processCASbits(int cas_bits, int location, const char *constrType,
 		*initdeferred = false;
 	if (not_valid)
 		*not_valid = false;
+	if (is_enforced)
+		*is_enforced = true;
 
 	if (cas_bits & (CAS_DEFERRABLE | CAS_INITIALLY_DEFERRED))
 	{
@@ -19421,7 +19626,7 @@ processCASbits(int cas_bits, int location, const char *constrType,
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 /* translator: %s is CHECK, UNIQUE, or similar */
+			/* translator: %s is CHECK, UNIQUE, or similar */
 					 errmsg("%s constraints cannot be marked DEFERRABLE",
 							constrType),
 					 parser_errposition(location)));
@@ -19434,7 +19639,7 @@ processCASbits(int cas_bits, int location, const char *constrType,
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 /* translator: %s is CHECK, UNIQUE, or similar */
+			/* translator: %s is CHECK, UNIQUE, or similar */
 					 errmsg("%s constraints cannot be marked DEFERRABLE",
 							constrType),
 					 parser_errposition(location)));
@@ -19447,7 +19652,7 @@ processCASbits(int cas_bits, int location, const char *constrType,
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 /* translator: %s is CHECK, UNIQUE, or similar */
+			/* translator: %s is CHECK, UNIQUE, or similar */
 					 errmsg("%s constraints cannot be marked NOT VALID",
 							constrType),
 					 parser_errposition(location)));
@@ -19460,8 +19665,43 @@ processCASbits(int cas_bits, int location, const char *constrType,
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 /* translator: %s is CHECK, UNIQUE, or similar */
+			/* translator: %s is CHECK, UNIQUE, or similar */
 					 errmsg("%s constraints cannot be marked NO INHERIT",
+							constrType),
+					 parser_errposition(location)));
+	}
+
+	if (cas_bits & CAS_NOT_ENFORCED)
+	{
+		if (is_enforced)
+			*is_enforced = false;
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 /* translator: %s is CHECK, UNIQUE, or similar */
+					 errmsg("%s constraints cannot be marked NOT ENFORCED",
+							constrType),
+					 parser_errposition(location)));
+
+		/*
+		 * NB: The validated status is irrelevant when the constraint is set to
+		 * NOT ENFORCED, but for consistency, it should be set accordingly.
+		 * This ensures that if the constraint is later changed to ENFORCED, it
+		 * will automatically be in the correct NOT VALIDATED state.
+		 */
+		if (not_valid)
+			*not_valid = true;
+	}
+
+	if (cas_bits & CAS_ENFORCED)
+	{
+		if (is_enforced)
+			*is_enforced = true;
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 /* translator: %s is CHECK, UNIQUE, or similar */
+					 errmsg("%s constraints cannot be marked ENFORCED",
 							constrType),
 					 parser_errposition(location)));
 	}
@@ -19485,8 +19725,49 @@ parsePartitionStrategy(char *strategy, int location, core_yyscan_t yyscanner)
 			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 			 errmsg("unrecognized partitioning strategy \"%s\"", strategy),
 			 parser_errposition(location)));
-	return PARTITION_STRATEGY_LIST;		/* keep compiler quiet */
+	return PARTITION_STRATEGY_LIST; /* keep compiler quiet */
 
+}
+
+/*
+ * Process all_objects_list to set all_tables and/or all_sequences.
+ * Also, checks if the pub_object_type has been specified more than once.
+ */
+static void
+preprocess_pub_all_objtype_list(List *all_objects_list, bool *all_tables,
+								bool *all_sequences, core_yyscan_t yyscanner)
+{
+	if (!all_objects_list)
+		return;
+
+	*all_tables = false;
+	*all_sequences = false;
+
+	foreach_ptr(PublicationAllObjSpec, obj, all_objects_list)
+	{
+		if (obj->pubobjtype == PUBLICATION_ALL_TABLES)
+		{
+			if (*all_tables)
+				ereport(ERROR,
+						errcode(ERRCODE_SYNTAX_ERROR),
+						errmsg("invalid publication object list"),
+						errdetail("ALL TABLES can be specified only once."),
+						parser_errposition(obj->location));
+
+			*all_tables = true;
+		}
+		else if (obj->pubobjtype == PUBLICATION_ALL_SEQUENCES)
+		{
+			if (*all_sequences)
+				ereport(ERROR,
+					errcode(ERRCODE_SYNTAX_ERROR),
+						errmsg("invalid publication object list"),
+						errdetail("ALL SEQUENCES can be specified only once."),
+						parser_errposition(obj->location));
+
+			*all_sequences = true;
+		}
+	}
 }
 
 /*
@@ -19556,8 +19837,8 @@ preprocess_pubobj_list(List *pubobjspec_list, core_yyscan_t yyscanner)
 						parser_errposition(pubobj->location));
 
 			/*
-			 * We can distinguish between the different type of schema
-			 * objects based on whether name and pubtable is set.
+			 * We can distinguish between the different type of schema objects
+			 * based on whether name and pubtable is set.
 			 */
 			if (pubobj->name)
 				pubobj->pubobjtype = PUBLICATIONOBJ_TABLES_IN_SCHEMA;
@@ -19612,11 +19893,13 @@ makeRecursiveViewSelect(char *relname, List *aliases, Node *query)
 	w->ctes = list_make1(cte);
 	w->location = -1;
 
-	/* create target list for the new SELECT from the alias list of the
-	 * recursive view specification */
-	foreach (lc, aliases)
+	/*
+	 * create target list for the new SELECT from the alias list of the
+	 * recursive view specification
+	 */
+	foreach(lc, aliases)
 	{
-		ResTarget *rt = makeNode(ResTarget);
+		ResTarget  *rt = makeNode(ResTarget);
 
 		rt->name = NULL;
 		rt->indirection = NIL;
@@ -19626,8 +19909,10 @@ makeRecursiveViewSelect(char *relname, List *aliases, Node *query)
 		tl = lappend(tl, rt);
 	}
 
-	/* create new SELECT combining WITH clause, target list, and fake FROM
-	 * clause */
+	/*
+	 * create new SELECT combining WITH clause, target list, and fake FROM
+	 * clause
+	 */
 	s->withClause = w;
 	s->targetList = tl;
 	s->fromClause = list_make1(makeRangeVar(NULL, relname, -1));

@@ -9,7 +9,7 @@
  * of XLogRecData structs by a call to XLogRecordAssemble(). See
  * access/transam/README for details.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/access/transam/xloginsert.c
@@ -33,12 +33,14 @@
 #include "access/xloginsert.h"
 #include "catalog/pg_control.h"
 #include "common/pg_lzcompress.h"
+#include "executor/instrument.h"
 #include "miscadmin.h"
 #include "pg_trace.h"
 #include "replication/origin.h"
 #include "storage/bufmgr.h"
 #include "storage/proc.h"
 #include "utils/memutils.h"
+#include "utils/pgstat_internal.h"
 
 /*
  * Guess the maximum buffer size required to store a compressed version of
@@ -72,7 +74,7 @@ typedef struct
 	RelFileLocator rlocator;	/* identifies the relation and block */
 	ForkNumber	forkno;
 	BlockNumber block;
-	const char *page;			/* page content */
+	const PageData *page;		/* page content */
 	uint32		rdata_len;		/* total length of data in rdata chain */
 	XLogRecData *rdata_head;	/* head of the chain of data registered with
 								 * this block */
@@ -137,9 +139,10 @@ static MemoryContext xloginsert_cxt;
 static XLogRecData *XLogRecordAssemble(RmgrId rmid, uint8 info,
 									   XLogRecPtr RedoRecPtr, bool doPageWrites,
 									   XLogRecPtr *fpw_lsn, int *num_fpi,
+									   uint64 *fpi_bytes,
 									   bool *topxid_included);
-static bool XLogCompressBackupBlock(const char *page, uint16 hole_offset,
-									uint16 hole_length, char *dest, uint16 *dlen);
+static bool XLogCompressBackupBlock(const PageData *page, uint16 hole_offset,
+									uint16 hole_length, void *dest, uint16 *dlen);
 
 /*
  * Begin constructing a WAL record. This must be called before the
@@ -258,7 +261,8 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
 	 */
 #ifdef USE_ASSERT_CHECKING
 	if (!(flags & REGBUF_NO_CHANGE))
-		Assert(BufferIsExclusiveLocked(buffer) && BufferIsDirty(buffer));
+		Assert(BufferIsLockedByMeInMode(buffer, BUFFER_LOCK_EXCLUSIVE) &&
+			   BufferIsDirty(buffer));
 #endif
 
 	if (block_id >= max_registered_block_id)
@@ -307,7 +311,7 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
  */
 void
 XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator, ForkNumber forknum,
-				  BlockNumber blknum, const char *page, uint8 flags)
+				  BlockNumber blknum, const PageData *page, uint8 flags)
 {
 	registered_buffer *regbuf;
 
@@ -361,7 +365,7 @@ XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator, ForkNumber forknum,
  * XLogRecGetData().
  */
 void
-XLogRegisterData(const char *data, uint32 len)
+XLogRegisterData(const void *data, uint32 len)
 {
 	XLogRecData *rdata;
 
@@ -402,7 +406,7 @@ XLogRegisterData(const char *data, uint32 len)
  * limited)
  */
 void
-XLogRegisterBufData(uint8 block_id, const char *data, uint32 len)
+XLogRegisterBufData(uint8 block_id, const void *data, uint32 len)
 {
 	registered_buffer *regbuf;
 	XLogRecData *rdata;
@@ -509,6 +513,7 @@ XLogInsert(RmgrId rmid, uint8 info)
 		XLogRecPtr	fpw_lsn;
 		XLogRecData *rdt;
 		int			num_fpi = 0;
+		uint64		fpi_bytes = 0;
 
 		/*
 		 * Get values needed to decide whether to do full-page writes. Since
@@ -518,15 +523,28 @@ XLogInsert(RmgrId rmid, uint8 info)
 		GetFullPageWriteInfo(&RedoRecPtr, &doPageWrites);
 
 		rdt = XLogRecordAssemble(rmid, info, RedoRecPtr, doPageWrites,
-								 &fpw_lsn, &num_fpi, &topxid_included);
+								 &fpw_lsn, &num_fpi, &fpi_bytes,
+								 &topxid_included);
 
 		EndPos = XLogInsertRecord(rdt, fpw_lsn, curinsert_flags, num_fpi,
-								  topxid_included);
-	} while (EndPos == InvalidXLogRecPtr);
+								  fpi_bytes, topxid_included);
+	} while (!XLogRecPtrIsValid(EndPos));
 
 	XLogResetInsertion();
 
 	return EndPos;
+}
+
+/*
+ * Simple wrapper to XLogInsert to insert a WAL record with elementary
+ * contents (only an int64 is supported as value currently).
+ */
+XLogRecPtr
+XLogSimpleInsertInt64(RmgrId rmid, uint8 info, int64 value)
+{
+	XLogBeginInsert();
+	XLogRegisterData(&value, sizeof(value));
+	return XLogInsert(rmid, info);
 }
 
 /*
@@ -547,7 +565,8 @@ XLogInsert(RmgrId rmid, uint8 info)
 static XLogRecData *
 XLogRecordAssemble(RmgrId rmid, uint8 info,
 				   XLogRecPtr RedoRecPtr, bool doPageWrites,
-				   XLogRecPtr *fpw_lsn, int *num_fpi, bool *topxid_included)
+				   XLogRecPtr *fpw_lsn, int *num_fpi, uint64 *fpi_bytes,
+				   bool *topxid_included)
 {
 	XLogRecData *rdt;
 	uint64		total_len = 0;
@@ -620,7 +639,7 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 			needs_backup = (page_lsn <= RedoRecPtr);
 			if (!needs_backup)
 			{
-				if (*fpw_lsn == InvalidXLogRecPtr || page_lsn < *fpw_lsn)
+				if (!XLogRecPtrIsValid(*fpw_lsn) || page_lsn < *fpw_lsn)
 					*fpw_lsn = page_lsn;
 			}
 		}
@@ -648,7 +667,7 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 
 		if (include_image)
 		{
-			const char *page = regbuf->page;
+			const PageData *page = regbuf->page;
 			uint16		compressed_len = 0;
 
 			/*
@@ -783,6 +802,9 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 			}
 
 			total_len += bimg.length;
+
+			/* Track the WAL full page images in bytes */
+			*fpi_bytes += bimg.length;
 		}
 
 		if (needs_data)
@@ -869,8 +891,8 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 			if (mainrdata_len > PG_UINT32_MAX)
 				ereport(ERROR,
 						(errmsg_internal("too much WAL data"),
-						 errdetail_internal("Main data length is %llu bytes for a maximum of %u bytes.",
-											(unsigned long long) mainrdata_len,
+						 errdetail_internal("Main data length is %" PRIu64 " bytes for a maximum of %u bytes.",
+											mainrdata_len,
 											PG_UINT32_MAX)));
 
 			mainrdata_len_4b = (uint32) mainrdata_len;
@@ -915,8 +937,8 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 	if (total_len > XLogRecordMaxSize)
 		ereport(ERROR,
 				(errmsg_internal("oversized WAL record"),
-				 errdetail_internal("WAL record would be %llu bytes (of maximum %u bytes); rmid %u flags %u.",
-									(unsigned long long) total_len, XLogRecordMaxSize, rmid, info)));
+				 errdetail_internal("WAL record would be %" PRIu64 " bytes (of maximum %u bytes); rmid %u flags %u.",
+									total_len, XLogRecordMaxSize, rmid, info)));
 
 	/*
 	 * Fill in the fields in the record header. Prev-link is filled in later,
@@ -941,13 +963,13 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
  * the length of compressed block image.
  */
 static bool
-XLogCompressBackupBlock(const char *page, uint16 hole_offset, uint16 hole_length,
-						char *dest, uint16 *dlen)
+XLogCompressBackupBlock(const PageData *page, uint16 hole_offset, uint16 hole_length,
+						void *dest, uint16 *dlen)
 {
 	int32		orig_len = BLCKSZ - hole_length;
 	int32		len = -1;
 	int32		extra_bytes = 0;
-	const char *source;
+	const void *source;
 	PGAlignedBlock tmp;
 
 	if (hole_length != 0)

@@ -13,7 +13,7 @@
  * come from different tuples. In theory, the standard scalar selectivity
  * functions could be used with the combined histogram.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -167,7 +167,7 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 					upper;
 		float8		length;
 
-		vacuum_delay_point();
+		vacuum_delay_point(true);
 
 		value = fetchfunc(stats, range_no, &isnull);
 		if (isnull)
@@ -397,7 +397,7 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 		stats->numvalues[slot_idx] = num_hist;
 		stats->statypid[slot_idx] = FLOAT8OID;
 		stats->statyplen[slot_idx] = sizeof(float8);
-		stats->statypbyval[slot_idx] = FLOAT8PASSBYVAL;
+		stats->statypbyval[slot_idx] = true;
 		stats->statypalign[slot_idx] = 'd';
 
 		/* Store the fraction of empty ranges */

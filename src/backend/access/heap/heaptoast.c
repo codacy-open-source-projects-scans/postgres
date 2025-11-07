@@ -4,7 +4,7 @@
  *	  Heap-specific definitions for external and compressed storage
  *	  of variable size attributes.
  *
- * Copyright (c) 2000-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2025, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -369,7 +369,7 @@ toast_flatten_tuple(HeapTuple tup, TupleDesc tupleDesc)
 		/*
 		 * Look at non-null varlena attributes
 		 */
-		if (!toast_isnull[i] && TupleDescAttr(tupleDesc, i)->attlen == -1)
+		if (!toast_isnull[i] && TupleDescCompactAttr(tupleDesc, i)->attlen == -1)
 		{
 			struct varlena *new_value;
 
@@ -483,7 +483,7 @@ toast_flatten_tuple_to_datum(HeapTupleHeader tup,
 		 */
 		if (toast_isnull[i])
 			has_nulls = true;
-		else if (TupleDescAttr(tupleDesc, i)->attlen == -1)
+		else if (TupleDescCompactAttr(tupleDesc, i)->attlen == -1)
 		{
 			struct varlena *new_value;
 
@@ -561,8 +561,8 @@ toast_flatten_tuple_to_datum(HeapTupleHeader tup,
  */
 HeapTuple
 toast_build_flattened_tuple(TupleDesc tupleDesc,
-							Datum *values,
-							bool *isnull)
+							const Datum *values,
+							const bool *isnull)
 {
 	HeapTuple	new_tuple;
 	int			numAttrs = tupleDesc->natts;
@@ -584,7 +584,7 @@ toast_build_flattened_tuple(TupleDesc tupleDesc,
 		/*
 		 * Look at non-null varlena attributes
 		 */
-		if (!isnull[i] && TupleDescAttr(tupleDesc, i)->attlen == -1)
+		if (!isnull[i] && TupleDescCompactAttr(tupleDesc, i)->attlen == -1)
 		{
 			struct varlena *new_value;
 

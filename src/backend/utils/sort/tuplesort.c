@@ -88,7 +88,7 @@
  * produce exactly one output run from their partial input.
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -202,7 +202,7 @@ struct Tuplesortstate
 	int64		maxSpace;		/* maximum amount of space occupied among sort
 								 * of groups, either in-memory or on-disk */
 	bool		isMaxSpaceDisk; /* true when maxSpace is value for on-disk
-								 * space, false when it's value for in-memory
+								 * space, false when its value for in-memory
 								 * space */
 	TupSortStatus maxSpaceStatus;	/* sort status when maxSpace was reached */
 	LogicalTapeSet *tapeset;	/* logtape.c object for tapes in a temp file */
@@ -512,7 +512,6 @@ qsort_tuple_unsigned_compare(SortTuple *a, SortTuple *b, Tuplesortstate *state)
 	return state->base.comparetup_tiebreak(a, b, state);
 }
 
-#if SIZEOF_DATUM >= 8
 /* Used if first key's comparator is ssup_datum_signed_cmp */
 static pg_attribute_always_inline int
 qsort_tuple_signed_compare(SortTuple *a, SortTuple *b, Tuplesortstate *state)
@@ -535,7 +534,6 @@ qsort_tuple_signed_compare(SortTuple *a, SortTuple *b, Tuplesortstate *state)
 
 	return state->base.comparetup_tiebreak(a, b, state);
 }
-#endif
 
 /* Used if first key's comparator is ssup_datum_int32_cmp */
 static pg_attribute_always_inline int
@@ -578,7 +576,6 @@ qsort_tuple_int32_compare(SortTuple *a, SortTuple *b, Tuplesortstate *state)
 #define ST_DEFINE
 #include "lib/sort_template.h"
 
-#if SIZEOF_DATUM >= 8
 #define ST_SORT qsort_tuple_signed
 #define ST_ELEMENT_TYPE SortTuple
 #define ST_COMPARE(a, b, state) qsort_tuple_signed_compare(a, b, state)
@@ -587,7 +584,6 @@ qsort_tuple_int32_compare(SortTuple *a, SortTuple *b, Tuplesortstate *state)
 #define ST_SCOPE static
 #define ST_DEFINE
 #include "lib/sort_template.h"
-#endif
 
 #define ST_SORT qsort_tuple_int32
 #define ST_ELEMENT_TYPE SortTuple
@@ -918,13 +914,13 @@ tuplesort_free(Tuplesortstate *state)
 	if (trace_sort)
 	{
 		if (state->tapeset)
-			elog(LOG, "%s of worker %d ended, %lld disk blocks used: %s",
+			elog(LOG, "%s of worker %d ended, %" PRId64 " disk blocks used: %s",
 				 SERIAL(state) ? "external sort" : "parallel external sort",
-				 state->worker, (long long) spaceUsed, pg_rusage_show(&state->ru_start));
+				 state->worker, spaceUsed, pg_rusage_show(&state->ru_start));
 		else
-			elog(LOG, "%s of worker %d ended, %lld KB used: %s",
+			elog(LOG, "%s of worker %d ended, %" PRId64 " KB used: %s",
 				 SERIAL(state) ? "internal sort" : "unperformed parallel sort",
-				 state->worker, (long long) spaceUsed, pg_rusage_show(&state->ru_start));
+				 state->worker, spaceUsed, pg_rusage_show(&state->ru_start));
 	}
 
 	TRACE_POSTGRESQL_SORT_DONE(state->tapeset != NULL, spaceUsed);
@@ -2692,7 +2688,6 @@ tuplesort_sort_memtuples(Tuplesortstate *state)
 									 state);
 				return;
 			}
-#if SIZEOF_DATUM >= 8
 			else if (state->base.sortKeys[0].comparator == ssup_datum_signed_cmp)
 			{
 				qsort_tuple_signed(state->memtuples,
@@ -2700,7 +2695,6 @@ tuplesort_sort_memtuples(Tuplesortstate *state)
 								   state);
 				return;
 			}
-#endif
 			else if (state->base.sortKeys[0].comparator == ssup_datum_int32_cmp)
 			{
 				qsort_tuple_int32(state->memtuples,
@@ -3146,7 +3140,6 @@ ssup_datum_unsigned_cmp(Datum x, Datum y, SortSupport ssup)
 		return 0;
 }
 
-#if SIZEOF_DATUM >= 8
 int
 ssup_datum_signed_cmp(Datum x, Datum y, SortSupport ssup)
 {
@@ -3160,7 +3153,6 @@ ssup_datum_signed_cmp(Datum x, Datum y, SortSupport ssup)
 	else
 		return 0;
 }
-#endif
 
 int
 ssup_datum_int32_cmp(Datum x, Datum y, SortSupport ssup)

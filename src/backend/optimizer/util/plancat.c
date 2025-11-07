@@ -4,7 +4,7 @@
  *	   routines for accessing the system catalogs
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -42,6 +42,7 @@
 #include "parser/parse_relation.h"
 #include "parser/parsetree.h"
 #include "partitioning/partdesc.h"
+#include "rewrite/rewriteHandler.h"
 #include "rewrite/rewriteManip.h"
 #include "statistics/statistics.h"
 #include "storage/bufmgr.h"
@@ -59,6 +60,12 @@ int			constraint_exclusion = CONSTRAINT_EXCLUSION_PARTITION;
 /* Hook for plugins to get control in get_relation_info() */
 get_relation_info_hook_type get_relation_info_hook = NULL;
 
+typedef struct NotnullHashEntry
+{
+	Oid			relid;			/* OID of the relation */
+	Bitmapset  *notnullattnums; /* attnums of NOT NULL columns */
+} NotnullHashEntry;
+
 
 static void get_relation_foreign_keys(PlannerInfo *root, RelOptInfo *rel,
 									  Relation relation, bool inhparent);
@@ -71,7 +78,8 @@ static List *get_relation_constraints(PlannerInfo *root,
 									  bool include_partition);
 static List *build_index_tlist(PlannerInfo *root, IndexOptInfo *index,
 							   Relation heapRelation);
-static List *get_relation_statistics(RelOptInfo *rel, Relation relation);
+static List *get_relation_statistics(PlannerInfo *root, RelOptInfo *rel,
+									 Relation relation);
 static void set_relation_partition_info(PlannerInfo *root, RelOptInfo *rel,
 										Relation relation);
 static PartitionScheme find_partition_scheme(PlannerInfo *root,
@@ -172,25 +180,7 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 	 * RangeTblEntry does get populated.
 	 */
 	if (!inhparent || relation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
-	{
-		for (int i = 0; i < relation->rd_att->natts; i++)
-		{
-			Form_pg_attribute attr = TupleDescAttr(relation->rd_att, i);
-
-			if (attr->attnotnull)
-			{
-				rel->notnullattnums = bms_add_member(rel->notnullattnums,
-													 attr->attnum);
-
-				/*
-				 * Per RemoveAttributeById(), dropped columns will have their
-				 * attnotnull unset, so we needn't check for dropped columns
-				 * in the above condition.
-				 */
-				Assert(!attr->attisdropped);
-			}
-		}
-	}
+		rel->notnullattnums = find_relation_notnullatts(root, relationObjectId);
 
 	/*
 	 * Estimate relation size --- unless it's an inheritance parent, in which
@@ -325,7 +315,7 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 				info->amcanparallel = amroutine->amcanparallel;
 				info->amhasgettuple = (amroutine->amgettuple != NULL);
 				info->amhasgetbitmap = amroutine->amgetbitmap != NULL &&
-					relation->rd_tableam->scan_bitmap_next_block != NULL;
+					relation->rd_tableam->scan_bitmap_next_tuple != NULL;
 				info->amcanmarkpos = (amroutine->ammarkpos != NULL &&
 									  amroutine->amrestrpos != NULL);
 				info->amcostestimate = amroutine->amcostestimate;
@@ -365,14 +355,10 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 					 * Since "<" uniquely defines the behavior of a sort
 					 * order, this is a sufficient test.
 					 *
-					 * XXX This method is rather slow and also requires the
-					 * undesirable assumption that the other index AM numbers
-					 * its strategies the same as btree.  It'd be better to
-					 * have a way to explicitly declare the corresponding
-					 * btree opfamily for each opfamily of the other index
-					 * type.  But given the lack of current or foreseeable
-					 * amcanorder index types, it's not worth expending more
-					 * effort on now.
+					 * XXX This method is rather slow and complicated.  It'd
+					 * be better to have a way to explicitly declare the
+					 * corresponding btree opfamily for each opfamily of the
+					 * other index type.
 					 */
 					info->sortopfamily = (Oid *) palloc(sizeof(Oid) * nkeycolumns);
 					info->reverse_sort = (bool *) palloc(sizeof(bool) * nkeycolumns);
@@ -382,27 +368,27 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 					{
 						int16		opt = indexRelation->rd_indoption[i];
 						Oid			ltopr;
-						Oid			btopfamily;
-						Oid			btopcintype;
-						int16		btstrategy;
+						Oid			opfamily;
+						Oid			opcintype;
+						CompareType cmptype;
 
 						info->reverse_sort[i] = (opt & INDOPTION_DESC) != 0;
 						info->nulls_first[i] = (opt & INDOPTION_NULLS_FIRST) != 0;
 
-						ltopr = get_opfamily_member(info->opfamily[i],
-													info->opcintype[i],
-													info->opcintype[i],
-													BTLessStrategyNumber);
+						ltopr = get_opfamily_member_for_cmptype(info->opfamily[i],
+																info->opcintype[i],
+																info->opcintype[i],
+																COMPARE_LT);
 						if (OidIsValid(ltopr) &&
 							get_ordering_op_properties(ltopr,
-													   &btopfamily,
-													   &btopcintype,
-													   &btstrategy) &&
-							btopcintype == info->opcintype[i] &&
-							btstrategy == BTLessStrategyNumber)
+													   &opfamily,
+													   &opcintype,
+													   &cmptype) &&
+							opcintype == info->opcintype[i] &&
+							cmptype == COMPARE_LT)
 						{
 							/* Successful mapping */
-							info->sortopfamily[i] = btopfamily;
+							info->sortopfamily[i] = opfamily;
 						}
 						else
 						{
@@ -524,7 +510,7 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 
 	rel->indexlist = indexinfos;
 
-	rel->statlist = get_relation_statistics(rel, relation);
+	rel->statlist = get_relation_statistics(root, rel, relation);
 
 	/* Grab foreign-table info using the relcache, while we have it */
 	if (relation->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
@@ -640,6 +626,10 @@ get_relation_foreign_keys(PlannerInfo *root, RelOptInfo *rel,
 		/* conrelid should always be that of the table we're considering */
 		Assert(cachedfk->conrelid == RelationGetRelid(relation));
 
+		/* skip constraints currently not enforced */
+		if (!cachedfk->conenforced)
+			continue;
+
 		/* Scan to find other RTEs matching confrelid */
 		rti = 0;
 		foreach(lc2, rtable)
@@ -682,6 +672,105 @@ get_relation_foreign_keys(PlannerInfo *root, RelOptInfo *rel,
 }
 
 /*
+ * get_relation_notnullatts -
+ *	  Retrieves column not-null constraint information for a given relation.
+ *
+ * We do this while we have the relcache entry open, and store the column
+ * not-null constraint information in a hash table based on the relation OID.
+ */
+void
+get_relation_notnullatts(PlannerInfo *root, Relation relation)
+{
+	Oid			relid = RelationGetRelid(relation);
+	NotnullHashEntry *hentry;
+	bool		found;
+	Bitmapset  *notnullattnums = NULL;
+
+	/* bail out if the relation has no not-null constraints */
+	if (relation->rd_att->constr == NULL ||
+		!relation->rd_att->constr->has_not_null)
+		return;
+
+	/* create the hash table if it hasn't been created yet */
+	if (root->glob->rel_notnullatts_hash == NULL)
+	{
+		HTAB	   *hashtab;
+		HASHCTL		hash_ctl;
+
+		hash_ctl.keysize = sizeof(Oid);
+		hash_ctl.entrysize = sizeof(NotnullHashEntry);
+		hash_ctl.hcxt = CurrentMemoryContext;
+
+		hashtab = hash_create("Relation NOT NULL attnums",
+							  64L,	/* arbitrary initial size */
+							  &hash_ctl,
+							  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+		root->glob->rel_notnullatts_hash = hashtab;
+	}
+
+	/*
+	 * Create a hash entry for this relation OID, if we don't have one
+	 * already.
+	 */
+	hentry = (NotnullHashEntry *) hash_search(root->glob->rel_notnullatts_hash,
+											  &relid,
+											  HASH_ENTER,
+											  &found);
+
+	/* bail out if a hash entry already exists for this relation OID */
+	if (found)
+		return;
+
+	/* collect the column not-null constraint information for this relation */
+	for (int i = 0; i < relation->rd_att->natts; i++)
+	{
+		CompactAttribute *attr = TupleDescCompactAttr(relation->rd_att, i);
+
+		Assert(attr->attnullability != ATTNULLABLE_UNKNOWN);
+
+		if (attr->attnullability == ATTNULLABLE_VALID)
+		{
+			notnullattnums = bms_add_member(notnullattnums, i + 1);
+
+			/*
+			 * Per RemoveAttributeById(), dropped columns will have their
+			 * attnotnull unset, so we needn't check for dropped columns in
+			 * the above condition.
+			 */
+			Assert(!attr->attisdropped);
+		}
+	}
+
+	/* ... and initialize the new hash entry */
+	hentry->notnullattnums = notnullattnums;
+}
+
+/*
+ * find_relation_notnullatts -
+ *	  Searches the hash table and returns the column not-null constraint
+ *	  information for a given relation.
+ */
+Bitmapset *
+find_relation_notnullatts(PlannerInfo *root, Oid relid)
+{
+	NotnullHashEntry *hentry;
+	bool		found;
+
+	if (root->glob->rel_notnullatts_hash == NULL)
+		return NULL;
+
+	hentry = (NotnullHashEntry *) hash_search(root->glob->rel_notnullatts_hash,
+											  &relid,
+											  HASH_FIND,
+											  &found);
+	if (!found)
+		return NULL;
+
+	return hentry->notnullattnums;
+}
+
+/*
  * infer_arbiter_indexes -
  *	  Determine the unique indexes used to arbitrate speculative insertion.
  *
@@ -700,6 +789,11 @@ get_relation_foreign_keys(PlannerInfo *root, RelOptInfo *rel,
  * the purposes of inference.  If no opclass (or collation) is specified, then
  * all matching indexes (that may or may not match the default in terms of
  * each attribute opclass/collation) are used for inference.
+ *
+ * Note: during index CONCURRENTLY operations, different transactions may
+ * reference different sets of arbiter indexes. This can lead to false unique
+ * constraint violations that wouldn't occur during normal operations.  For
+ * more information, see insert.sgml.
  */
 List *
 infer_arbiter_indexes(PlannerInfo *root)
@@ -1251,6 +1345,7 @@ get_relation_data_width(Oid relid, int32 *attr_widths)
  * get_relation_constraints
  *
  * Retrieve the applicable constraint expressions of the given relation.
+ * Only constraints that have been validated are considered.
  *
  * Returns a List (possibly empty) of constraint expressions.  Each one
  * has been canonicalized, and its Vars are changed to have the varno
@@ -1299,15 +1394,32 @@ get_relation_constraints(PlannerInfo *root,
 
 			/*
 			 * If this constraint hasn't been fully validated yet, we must
-			 * ignore it here.  Also ignore if NO INHERIT and we weren't told
-			 * that that's safe.
+			 * ignore it here.
 			 */
 			if (!constr->check[i].ccvalid)
 				continue;
+
+			/*
+			 * NOT ENFORCED constraints are always marked as invalid, which
+			 * should have been ignored.
+			 */
+			Assert(constr->check[i].ccenforced);
+
+			/*
+			 * Also ignore if NO INHERIT and we weren't told that that's safe.
+			 */
 			if (constr->check[i].ccnoinherit && !include_noinherit)
 				continue;
 
 			cexpr = stringToNode(constr->check[i].ccbin);
+
+			/*
+			 * Fix Vars to have the desired varno.  This must be done before
+			 * const-simplification because eval_const_expressions reduces
+			 * NullTest for Vars based on varno.
+			 */
+			if (varno != 1)
+				ChangeVarNodes(cexpr, 1, varno, 0);
 
 			/*
 			 * Run each expression through const-simplification and
@@ -1322,10 +1434,6 @@ get_relation_constraints(PlannerInfo *root,
 			cexpr = eval_const_expressions(root, cexpr);
 
 			cexpr = (Node *) canonicalize_qual((Expr *) cexpr, true);
-
-			/* Fix Vars to have the desired varno */
-			if (varno != 1)
-				ChangeVarNodes(cexpr, 1, varno, 0);
 
 			/*
 			 * Finally, convert to implicit-AND format (that is, a List) and
@@ -1342,17 +1450,18 @@ get_relation_constraints(PlannerInfo *root,
 
 			for (i = 1; i <= natts; i++)
 			{
-				Form_pg_attribute att = TupleDescAttr(relation->rd_att, i - 1);
+				CompactAttribute *att = TupleDescCompactAttr(relation->rd_att, i - 1);
 
-				if (att->attnotnull && !att->attisdropped)
+				if (att->attnullability == ATTNULLABLE_VALID && !att->attisdropped)
 				{
+					Form_pg_attribute wholeatt = TupleDescAttr(relation->rd_att, i - 1);
 					NullTest   *ntest = makeNode(NullTest);
 
 					ntest->arg = (Expr *) makeVar(varno,
 												  i,
-												  att->atttypid,
-												  att->atttypmod,
-												  att->attcollation,
+												  wholeatt->atttypid,
+												  wholeatt->atttypmod,
+												  wholeatt->attcollation,
 												  0);
 					ntest->nulltesttype = IS_NOT_NULL;
 
@@ -1378,6 +1487,14 @@ get_relation_constraints(PlannerInfo *root,
 		set_baserel_partition_constraint(relation, rel);
 		result = list_concat(result, rel->partition_qual);
 	}
+
+	/*
+	 * Expand virtual generated columns in the constraint expressions.
+	 */
+	if (result)
+		result = (List *) expand_generated_columns_in_expr((Node *) result,
+														   relation,
+														   varno);
 
 	table_close(relation, NoLock);
 
@@ -1474,7 +1591,8 @@ get_relation_statistics_worker(List **stainfos, RelOptInfo *rel,
  * just the identifying metadata.  Only stats actually built are considered.
  */
 static List *
-get_relation_statistics(RelOptInfo *rel, Relation relation)
+get_relation_statistics(PlannerInfo *root, RelOptInfo *rel,
+						Relation relation)
 {
 	Index		varno = rel->relid;
 	List	   *statoidlist;
@@ -1506,8 +1624,8 @@ get_relation_statistics(RelOptInfo *rel, Relation relation)
 			keys = bms_add_member(keys, staForm->stxkeys.values[i]);
 
 		/*
-		 * Preprocess expressions (if any). We read the expressions, run them
-		 * through eval_const_expressions, and fix the varnos.
+		 * Preprocess expressions (if any). We read the expressions, fix the
+		 * varnos, and run them through eval_const_expressions.
 		 *
 		 * XXX We don't know yet if there are any data for this stats object,
 		 * with either stxdinherit value. But it's reasonable to assume there
@@ -1531,6 +1649,18 @@ get_relation_statistics(RelOptInfo *rel, Relation relation)
 				pfree(exprsString);
 
 				/*
+				 * Modify the copies we obtain from the relcache to have the
+				 * correct varno for the parent relation, so that they match
+				 * up correctly against qual clauses.
+				 *
+				 * This must be done before const-simplification because
+				 * eval_const_expressions reduces NullTest for Vars based on
+				 * varno.
+				 */
+				if (varno != 1)
+					ChangeVarNodes((Node *) exprs, 1, varno, 0);
+
+				/*
 				 * Run the expressions through eval_const_expressions. This is
 				 * not just an optimization, but is necessary, because the
 				 * planner will be comparing them to similarly-processed qual
@@ -1538,18 +1668,10 @@ get_relation_statistics(RelOptInfo *rel, Relation relation)
 				 * We must not use canonicalize_qual, however, since these
 				 * aren't qual expressions.
 				 */
-				exprs = (List *) eval_const_expressions(NULL, (Node *) exprs);
+				exprs = (List *) eval_const_expressions(root, (Node *) exprs);
 
 				/* May as well fix opfuncids too */
 				fix_opfuncids((Node *) exprs);
-
-				/*
-				 * Modify the copies we obtain from the relcache to have the
-				 * correct varno for the parent relation, so that they match
-				 * up correctly against qual clauses.
-				 */
-				if (varno != 1)
-					ChangeVarNodes((Node *) exprs, 1, varno, 0);
 			}
 		}
 
@@ -1846,8 +1968,8 @@ build_physical_tlist(PlannerInfo *root, RelOptInfo *rel)
 		case RTE_NAMEDTUPLESTORE:
 		case RTE_RESULT:
 			/* Not all of these can have dropped cols, but share code anyway */
-			expandRTE(rte, varno, 0, -1, true /* include dropped */ ,
-					  NULL, &colvars);
+			expandRTE(rte, varno, 0, VAR_RETURNING_DEFAULT, -1,
+					  true /* include dropped */ , NULL, &colvars);
 			foreach(l, colvars)
 			{
 				var = (Var *) lfirst(l);
@@ -2026,9 +2148,8 @@ join_selectivity(PlannerInfo *root,
 /*
  * function_selectivity
  *
- * Returns the selectivity of a specified boolean function clause.
- * This code executes registered procedures stored in the
- * pg_proc relation, by calling the function manager.
+ * Attempt to estimate the selectivity of a specified boolean function clause
+ * by asking its support function.  If the function lacks support, return -1.
  *
  * See clause_selectivity() for the meaning of the additional parameters.
  */
@@ -2046,15 +2167,8 @@ function_selectivity(PlannerInfo *root,
 	SupportRequestSelectivity req;
 	SupportRequestSelectivity *sresult;
 
-	/*
-	 * If no support function is provided, use our historical default
-	 * estimate, 0.3333333.  This seems a pretty unprincipled choice, but
-	 * Postgres has been using that estimate for function calls since 1992.
-	 * The hoariness of this behavior suggests that we should not be in too
-	 * much hurry to use another value.
-	 */
 	if (!prosupport)
-		return (Selectivity) 0.3333333;
+		return (Selectivity) -1;	/* no support function */
 
 	req.type = T_SupportRequestSelectivity;
 	req.root = root;
@@ -2071,9 +2185,8 @@ function_selectivity(PlannerInfo *root,
 		DatumGetPointer(OidFunctionCall1(prosupport,
 										 PointerGetDatum(&req)));
 
-	/* If support function fails, use default */
 	if (sresult != &req)
-		return (Selectivity) 0.3333333;
+		return (Selectivity) -1;	/* function did not honor request */
 
 	if (req.selectivity < 0.0 || req.selectivity > 1.0)
 		elog(ERROR, "invalid function selectivity: %f", req.selectivity);
@@ -2291,6 +2404,60 @@ has_row_triggers(PlannerInfo *root, Index rti, CmdType event)
 }
 
 /*
+ * has_transition_tables
+ *
+ * Detect whether the specified relation has any transition tables for event.
+ */
+bool
+has_transition_tables(PlannerInfo *root, Index rti, CmdType event)
+{
+	RangeTblEntry *rte = planner_rt_fetch(rti, root);
+	Relation	relation;
+	TriggerDesc *trigDesc;
+	bool		result = false;
+
+	Assert(rte->rtekind == RTE_RELATION);
+
+	/* Currently foreign tables cannot have transition tables */
+	if (rte->relkind == RELKIND_FOREIGN_TABLE)
+		return result;
+
+	/* Assume we already have adequate lock */
+	relation = table_open(rte->relid, NoLock);
+
+	trigDesc = relation->trigdesc;
+	switch (event)
+	{
+		case CMD_INSERT:
+			if (trigDesc &&
+				trigDesc->trig_insert_new_table)
+				result = true;
+			break;
+		case CMD_UPDATE:
+			if (trigDesc &&
+				(trigDesc->trig_update_old_table ||
+				 trigDesc->trig_update_new_table))
+				result = true;
+			break;
+		case CMD_DELETE:
+			if (trigDesc &&
+				trigDesc->trig_delete_old_table)
+				result = true;
+			break;
+			/* There is no separate event for MERGE, only INSERT/UPDATE/DELETE */
+		case CMD_MERGE:
+			result = false;
+			break;
+		default:
+			elog(ERROR, "unrecognized CmdType: %d", (int) event);
+			break;
+	}
+
+	table_close(relation, NoLock);
+	return result;
+}
+
+/*
  * has_stored_generated_columns
  *
  * Does table identified by RTI have any STORED GENERATED columns?
@@ -2347,7 +2514,7 @@ get_dependent_generated_columns(PlannerInfo *root, Index rti,
 			Bitmapset  *attrs_used = NULL;
 
 			/* skip if not generated column */
-			if (!TupleDescAttr(tupdesc, defval->adnum - 1)->attgenerated)
+			if (!TupleDescCompactAttr(tupdesc, defval->adnum - 1)->attgenerated)
 				continue;
 
 			/* identify columns this generated column depends on */

@@ -3,7 +3,7 @@
  * acl.c
  *	  Basic access control list data structures manipulation routines.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -31,7 +31,6 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_type.h"
-#include "commands/dbcommands.h"
 #include "commands/proclang.h"
 #include "commands/tablespace.h"
 #include "common/hashfn.h"
@@ -127,12 +126,28 @@ static AclMode convert_tablespace_priv_string(text *priv_type_text);
 static Oid	convert_type_name(text *typename);
 static AclMode convert_type_priv_string(text *priv_type_text);
 static AclMode convert_parameter_priv_string(text *priv_text);
-static AclMode convert_largeobject_priv_string(text *priv_text);
+static AclMode convert_largeobject_priv_string(text *priv_type_text);
 static AclMode convert_role_priv_string(text *priv_type_text);
 static AclResult pg_role_aclcheck(Oid role_oid, Oid roleid, AclMode mode);
 
 static void RoleMembershipCacheCallback(Datum arg, int cacheid, uint32 hashvalue);
 
+
+/*
+ * Test whether an identifier char can be left unquoted in ACLs.
+ *
+ * Formerly, we used isalnum() even on non-ASCII characters, resulting in
+ * unportable behavior.  To ensure dump compatibility with old versions,
+ * we now treat high-bit-set characters as always requiring quoting during
+ * putid(), but getid() will always accept them without quotes.
+ */
+static inline bool
+is_safe_acl_char(unsigned char c, bool is_getid)
+{
+	if (IS_HIGHBIT_SET(c))
+		return is_getid;
+	return isalnum(c) || c == '_';
+}
 
 /*
  * getid
@@ -159,21 +174,22 @@ getid(const char *s, char *n, Node *escontext)
 
 	while (isspace((unsigned char) *s))
 		s++;
-	/* This code had better match what putid() does, below */
 	for (;
 		 *s != '\0' &&
-		 (isalnum((unsigned char) *s) ||
-		  *s == '_' ||
-		  *s == '"' ||
-		  in_quotes);
+		 (in_quotes || *s == '"' || is_safe_acl_char(*s, true));
 		 s++)
 	{
 		if (*s == '"')
 		{
+			if (!in_quotes)
+			{
+				in_quotes = true;
+				continue;
+			}
 			/* safe to look at next char (could be '\0' though) */
 			if (*(s + 1) != '"')
 			{
-				in_quotes = !in_quotes;
+				in_quotes = false;
 				continue;
 			}
 			/* it's an escaped double quote; skip the escaping char */
@@ -207,10 +223,10 @@ putid(char *p, const char *s)
 	const char *src;
 	bool		safe = true;
 
+	/* Detect whether we need to use double quotes */
 	for (src = s; *src; src++)
 	{
-		/* This test had better match what getid() does, above */
-		if (!isalnum((unsigned char) *src) && *src != '_')
+		if (!is_safe_acl_char(*src, false))
 		{
 			safe = false;
 			break;
@@ -5143,7 +5159,7 @@ roles_is_member_of(Oid roleid, enum RoleRecurseType type,
 	MemoryContext oldctx;
 	bloom_filter *bf = NULL;
 
-	Assert(OidIsValid(admin_of) == PointerIsValid(admin_role));
+	Assert(OidIsValid(admin_of) == (admin_role != NULL));
 	if (admin_role != NULL)
 		*admin_role = InvalidOid;
 
@@ -5432,24 +5448,6 @@ select_best_admin(Oid member, Oid role)
 	return admin_role;
 }
 
-
-/* does what it says ... */
-static int
-count_one_bits(AclMode mask)
-{
-	int			nbits = 0;
-
-	/* this code relies on AclMode being an unsigned type */
-	while (mask)
-	{
-		if (mask & 1)
-			nbits++;
-		mask >>= 1;
-	}
-	return nbits;
-}
-
-
 /*
  * Select the effective grantor ID for a GRANT or REVOKE operation.
  *
@@ -5532,7 +5530,7 @@ select_best_grantor(Oid roleId, AclMode privileges,
 		 */
 		if (otherprivs != ACL_NO_RIGHTS)
 		{
-			int			nnewrights = count_one_bits(otherprivs);
+			int			nnewrights = pg_popcount64(otherprivs);
 
 			if (nnewrights > nrights)
 			{

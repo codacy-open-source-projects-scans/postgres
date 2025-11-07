@@ -79,7 +79,7 @@
  *	instruction.  Equivalent OS-supplied mutex routines could be used too.
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *	  src/include/storage/s_lock.h
@@ -263,18 +263,24 @@ tas(volatile slock_t *lock)
 
 #define S_UNLOCK(lock) __sync_lock_release(lock)
 
-/*
- * Using an ISB instruction to delay in spinlock loops appears beneficial on
- * high-core-count ARM64 processors.  It seems mostly a wash for smaller gear,
- * and ISB doesn't exist at all on pre-v7 ARM chips.
- */
 #if defined(__aarch64__)
+
+/*
+ * On ARM64, it's a win to use a non-locking test before the TAS proper.  It
+ * may be a win on 32-bit ARM, too, but nobody's tested it yet.
+ */
+#define TAS_SPIN(lock)	(*(lock) ? 1 : TAS(lock))
 
 #define SPIN_DELAY() spin_delay()
 
 static __inline__ void
 spin_delay(void)
 {
+	/*
+	 * Using an ISB instruction to delay in spinlock loops appears beneficial
+	 * on high-core-count ARM64 processors.  It seems mostly a wash for smaller
+	 * gear, and ISB doesn't exist at all on pre-v7 ARM chips.
+	 */
 	__asm__ __volatile__(
 		" isb;				\n");
 }
@@ -327,9 +333,9 @@ tas(volatile slock_t *lock)
 	slock_t		_res;
 
 	/*
-	 *	See comment in src/backend/port/tas/sunstudio_sparc.s for why this
-	 *	uses "ldstub", and that file uses "cas".  gcc currently generates
-	 *	sparcv7-targeted binaries, so "cas" use isn't possible.
+	 * "cas" would be better than "ldstub", but it is only present on
+	 * sparcv8plus and later, while some platforms still support sparcv7 or
+	 * sparcv8.  Also, "cas" requires that the system be running in TSO mode.
 	 */
 	__asm__ __volatile__(
 		"	ldstub	[%2], %0	\n"
@@ -587,24 +593,6 @@ tas(volatile slock_t *lock)
  */
 
 #if !defined(HAS_TEST_AND_SET)	/* We didn't trigger above, let's try here */
-
-/* These are in sunstudio_(sparc|x86).s */
-
-#if defined(__SUNPRO_C) && (defined(__i386) || defined(__x86_64__) || defined(__sparc__) || defined(__sparc))
-#define HAS_TEST_AND_SET
-
-#if defined(__i386) || defined(__x86_64__) || defined(__sparcv9) || defined(__sparcv8plus)
-typedef unsigned int slock_t;
-#else
-typedef unsigned char slock_t;
-#endif
-
-extern slock_t pg_atomic_cas(volatile slock_t *lock, slock_t with,
-									  slock_t cmp);
-
-#define TAS(a) (pg_atomic_cas((a), 1, 0) != 0)
-#endif
-
 
 #ifdef _MSC_VER
 typedef LONG slock_t;

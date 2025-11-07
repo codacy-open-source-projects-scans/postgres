@@ -78,6 +78,17 @@ SELECT num_nonnulls();
 SELECT num_nulls();
 
 --
+-- error_on_null()
+--
+
+SELECT error_on_null(1);
+SELECT error_on_null(NULL::int);
+SELECT error_on_null(NULL::int[]);
+SELECT error_on_null('{1,2,NULL,3}'::int[]);
+SELECT error_on_null(ROW(1,NULL::int));
+SELECT error_on_null(ROW(NULL,NULL));
+
+--
 -- canonicalize_path()
 --
 
@@ -400,6 +411,17 @@ SELECT pg_column_toast_chunk_id(a) IS NULL,
 DROP TABLE test_chunk_id;
 DROP FUNCTION explain_mask_costs(text, bool, bool, bool, bool);
 
--- test stratnum support functions
-SELECT gist_stratnum_identity(3::smallint);
-SELECT gist_stratnum_identity(18::smallint);
+-- test stratnum translation support functions
+SELECT gist_translate_cmptype_common(7);
+SELECT gist_translate_cmptype_common(3);
+
+
+-- relpath tests
+CREATE FUNCTION test_relpath()
+    RETURNS void
+    AS :'regresslib'
+    LANGUAGE C;
+SELECT test_relpath();
+
+-- pg_replication_origin.roname limit
+SELECT pg_replication_origin_create('regress_' || repeat('a', 505));

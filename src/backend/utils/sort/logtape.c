@@ -66,7 +66,7 @@
  * There will always be the same number of runs as input tapes, and the same
  * number of input tapes as participants (worker Tuplesortstates).
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -263,8 +263,8 @@ ltsWriteBlock(LogicalTapeSet *lts, int64 blocknum, const void *buffer)
 	if (BufFileSeekBlock(lts->pfile, blocknum) != 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not seek to block %lld of temporary file",
-						(long long) blocknum)));
+				 errmsg("could not seek to block %" PRId64 " of temporary file",
+						blocknum)));
 	BufFileWrite(lts->pfile, buffer, BLCKSZ);
 
 	/* Update nBlocksWritten, if we extended the file */
@@ -284,8 +284,8 @@ ltsReadBlock(LogicalTapeSet *lts, int64 blocknum, void *buffer)
 	if (BufFileSeekBlock(lts->pfile, blocknum) != 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not seek to block %lld of temporary file",
-						(long long) blocknum)));
+				 errmsg("could not seek to block %" PRId64 " of temporary file",
+						blocknum)));
 	BufFileReadExact(lts->pfile, buffer, BLCKSZ);
 }
 
@@ -681,7 +681,7 @@ LogicalTapeCreate(LogicalTapeSet *lts)
 {
 	/*
 	 * The only thing that currently prevents creating new tapes in leader is
-	 * the fact that BufFiles opened using BufFileOpenShared() are read-only
+	 * the fact that BufFiles opened using BufFileOpenFileSet() are read-only
 	 * by definition, but that could be changed if it seemed worthwhile.  For
 	 * now, writing to the leader tape will raise a "Bad file descriptor"
 	 * error, so tuplesort must avoid writing to the leader tape altogether.
@@ -1100,10 +1100,10 @@ LogicalTapeBackspace(LogicalTape *lt, size_t size)
 		ltsReadBlock(lt->tapeSet, prev, lt->buffer);
 
 		if (TapeBlockGetTrailer(lt->buffer)->next != lt->curBlockNumber)
-			elog(ERROR, "broken tape, next of block %lld is %lld, expected %lld",
-				 (long long) prev,
-				 (long long) (TapeBlockGetTrailer(lt->buffer)->next),
-				 (long long) lt->curBlockNumber);
+			elog(ERROR, "broken tape, next of block %" PRId64 " is %" PRId64 ", expected %" PRId64,
+				 prev,
+				 TapeBlockGetTrailer(lt->buffer)->next,
+				 lt->curBlockNumber);
 
 		lt->nbytes = TapeBlockPayloadSize;
 		lt->curBlockNumber = prev;

@@ -3,7 +3,7 @@
  * arrayfuncs.c
  *	  Support functions for arrays.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -17,6 +17,7 @@
 #include <ctype.h>
 #include <math.h>
 
+#include "access/transam.h"
 #include "catalog/pg_type.h"
 #include "common/int.h"
 #include "funcapi.h"
@@ -959,8 +960,8 @@ ending_error:
  */
 void
 CopyArrayEls(ArrayType *array,
-			 Datum *values,
-			 bool *nulls,
+			 const Datum *values,
+			 const bool *nulls,
 			 int nitems,
 			 int typlen,
 			 bool typbyval,
@@ -3406,7 +3407,7 @@ construct_array_builtin(Datum *elems, int nelems, Oid elmtype)
 
 		case FLOAT8OID:
 			elmlen = sizeof(float8);
-			elmbyval = FLOAT8PASSBYVAL;
+			elmbyval = true;
 			elmalign = TYPALIGN_DOUBLE;
 			break;
 
@@ -3424,7 +3425,7 @@ construct_array_builtin(Datum *elems, int nelems, Oid elmtype)
 
 		case INT8OID:
 			elmlen = sizeof(int64);
-			elmbyval = FLOAT8PASSBYVAL;
+			elmbyval = true;
 			elmalign = TYPALIGN_DOUBLE;
 			break;
 
@@ -3628,7 +3629,7 @@ construct_empty_expanded_array(Oid element_type,
  * to hard-wire values if the element type is hard-wired.
  */
 void
-deconstruct_array(ArrayType *array,
+deconstruct_array(const ArrayType *array,
 				  Oid elmtype,
 				  int elmlen, bool elmbyval, char elmalign,
 				  Datum **elemsp, bool **nullsp, int *nelemsp)
@@ -3694,7 +3695,7 @@ deconstruct_array(ArrayType *array,
  * useful when manipulating arrays from/for system catalogs.
  */
 void
-deconstruct_array_builtin(ArrayType *array,
+deconstruct_array_builtin(const ArrayType *array,
 						  Oid elmtype,
 						  Datum **elemsp, bool **nullsp, int *nelemsp)
 {
@@ -3718,7 +3719,7 @@ deconstruct_array_builtin(ArrayType *array,
 
 		case FLOAT8OID:
 			elmlen = sizeof(float8);
-			elmbyval = FLOAT8PASSBYVAL;
+			elmbyval = true;
 			elmalign = TYPALIGN_DOUBLE;
 			break;
 
@@ -3764,7 +3765,7 @@ deconstruct_array_builtin(ArrayType *array,
  * if the array *might* contain a null.
  */
 bool
-array_contains_nulls(ArrayType *array)
+array_contains_nulls(const ArrayType *array)
 {
 	int			nelems;
 	bits8	   *bitmap;
@@ -4601,7 +4602,7 @@ array_create_iterator(ArrayType *arr, int slice_ndim, ArrayMetaState *mstate)
 	/*
 	 * Sanity-check inputs --- caller should have got this right already
 	 */
-	Assert(PointerIsValid(arr));
+	Assert(arr);
 	if (slice_ndim < 0 || slice_ndim > ARR_NDIM(arr))
 		elog(ERROR, "invalid arguments to array_create_iterator");
 
@@ -5782,9 +5783,14 @@ ArrayBuildStateAny *
 initArrayResultAny(Oid input_type, MemoryContext rcontext, bool subcontext)
 {
 	ArrayBuildStateAny *astate;
-	Oid			element_type = get_element_type(input_type);
 
-	if (OidIsValid(element_type))
+	/*
+	 * int2vector and oidvector will satisfy both get_element_type and
+	 * get_array_type.  We prefer to treat them as scalars, to be consistent
+	 * with get_promoted_array_type.  Hence, check get_array_type not
+	 * get_element_type.
+	 */
+	if (!OidIsValid(get_array_type(input_type)))
 	{
 		/* Array case */
 		ArrayBuildStateArr *arraystate;
@@ -5800,9 +5806,6 @@ initArrayResultAny(Oid input_type, MemoryContext rcontext, bool subcontext)
 	{
 		/* Scalar case */
 		ArrayBuildState *scalarstate;
-
-		/* Let's just check that we have a type that can be put into arrays */
-		Assert(OidIsValid(get_array_type(input_type)));
 
 		scalarstate = initArrayResult(input_type, rcontext, subcontext);
 		astate = (ArrayBuildStateAny *)

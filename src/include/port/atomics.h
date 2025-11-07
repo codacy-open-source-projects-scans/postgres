@@ -28,7 +28,7 @@
  * For an introduction to using memory barriers within the PostgreSQL backend,
  * see src/backend/storage/lmgr/README.barrier
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/port/atomics.h
@@ -88,8 +88,6 @@
 #include "port/atomics/generic-gcc.h"
 #elif defined(_MSC_VER)
 #include "port/atomics/generic-msvc.h"
-#elif defined(__SUNPRO_C) && !defined(__GNUC__)
-#include "port/atomics/generic-sunpro.h"
 #else
 /* Unknown compiler. */
 #endif

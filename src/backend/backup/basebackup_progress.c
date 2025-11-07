@@ -22,7 +22,7 @@
  * the logic directly into that file as it's fairly simple, but it seems
  * cleaner to have everything related to progress reporting in one place.)
  *
- * Portions Copyright (c) 2010-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/backup/basebackup_progress.c
@@ -56,7 +56,7 @@ static const bbsink_ops bbsink_progress_ops = {
  * forwards data to a successor sink.
  */
 bbsink *
-bbsink_progress_new(bbsink *next, bool estimate_backup_size)
+bbsink_progress_new(bbsink *next, bool estimate_backup_size, bool incremental)
 {
 	bbsink	   *sink;
 
@@ -69,10 +69,15 @@ bbsink_progress_new(bbsink *next, bool estimate_backup_size)
 	/*
 	 * Report that a base backup is in progress, and set the total size of the
 	 * backup to -1, which will get translated to NULL. If we're estimating
-	 * the backup size, we'll insert the real estimate when we have it.
+	 * the backup size, we'll insert the real estimate when we have it. Also,
+	 * the backup type is set.
 	 */
 	pgstat_progress_start_command(PROGRESS_COMMAND_BASEBACKUP, InvalidOid);
 	pgstat_progress_update_param(PROGRESS_BASEBACKUP_BACKUP_TOTAL, -1);
+	pgstat_progress_update_param(PROGRESS_BASEBACKUP_BACKUP_TYPE,
+								 incremental
+								 ? PROGRESS_BASEBACKUP_BACKUP_TYPE_INCREMENTAL
+								 : PROGRESS_BASEBACKUP_BACKUP_TYPE_FULL);
 
 	return sink;
 }

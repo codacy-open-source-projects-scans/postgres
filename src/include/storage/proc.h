@@ -4,7 +4,7 @@
  *	  per-process shared memory data structures
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/proc.h
@@ -86,9 +86,18 @@ struct XidCache
  */
 extern PGDLLIMPORT int FastPathLockGroupsPerBackend;
 
+/*
+ * Define the maximum number of fast-path locking groups per backend.
+ * This must be a power-of-two value.  The actual number of fast-path
+ * lock groups is calculated in InitializeFastPathLocks() based on
+ * max_locks_per_transaction.  1024 is an arbitrary upper limit (matching
+ * max_locks_per_transaction = 16k).  Values over 1024 are unlikely to be
+ * beneficial as there are bottlenecks we'll hit way before that.
+ */
 #define		FP_LOCK_GROUPS_PER_BACKEND_MAX	1024
 #define		FP_LOCK_SLOTS_PER_GROUP		16	/* don't change */
-#define		FP_LOCK_SLOTS_PER_BACKEND	(FP_LOCK_SLOTS_PER_GROUP * FastPathLockGroupsPerBackend)
+#define		FastPathLockSlotsPerBackend() \
+	(FP_LOCK_SLOTS_PER_GROUP * FastPathLockGroupsPerBackend)
 
 /*
  * Flags for PGPROC.delayChkptFlags
@@ -109,10 +118,10 @@ extern PGDLLIMPORT int FastPathLockGroupsPerBackend;
  * is inserted prior to the new redo point, the corresponding data changes will
  * also be flushed to disk before the checkpoint can complete. (In the
  * extremely common case where the data being modified is in shared buffers
- * and we acquire an exclusive content lock on the relevant buffers before
- * writing WAL, this mechanism is not needed, because phase 2 will block
- * until we release the content lock and then flush the modified data to
- * disk.)
+ * and we acquire an exclusive content lock and MarkBufferDirty() on the
+ * relevant buffers before writing WAL, this mechanism is not needed, because
+ * phase 2 will block until we release the content lock and then flush the
+ * modified data to disk.  See transam/README and SyncOneBuffer().)
  *
  * Setting DELAY_CHKPT_COMPLETE prevents the system from moving from phase 2
  * to phase 3. This is useful if we are performing a WAL-logged operation that
@@ -121,9 +130,17 @@ extern PGDLLIMPORT int FastPathLockGroupsPerBackend;
  * the checkpoint are actually destroyed on disk. Replay can cope with a file
  * or block that doesn't exist, but not with a block that has the wrong
  * contents.
+ *
+ * Setting DELAY_CHKPT_IN_COMMIT is similar to setting DELAY_CHKPT_START, but
+ * it explicitly indicates that the reason for delaying the checkpoint is due
+ * to a transaction being within a critical commit section. We need this new
+ * flag to ensure all the transactions that have acquired commit timestamp are
+ * finished before we allow the logical replication client to advance its xid
+ * which is used to hold back dead rows for conflict detection.
  */
 #define DELAY_CHKPT_START		(1<<0)
 #define DELAY_CHKPT_COMPLETE	(1<<1)
+#define DELAY_CHKPT_IN_COMMIT	(DELAY_CHKPT_START | 1<<2)
 
 typedef enum
 {
@@ -149,7 +166,7 @@ typedef enum
  * but its myProcLocks[] lists are valid.
  *
  * We allow many fields of this struct to be accessed without locks, such as
- * delayChkptFlags and isBackgroundWorker. However, keep in mind that writing
+ * delayChkptFlags and isRegularBackend. However, keep in mind that writing
  * mirrored ones (see below) requires holding ProcArrayLock or XidGenLock in
  * at least shared mode, so that pgxactoff does not change concurrently.
  *
@@ -216,7 +233,7 @@ struct PGPROC
 	Oid			tempNamespaceId;	/* OID of temp schema this backend is
 									 * using */
 
-	bool		isBackgroundWorker; /* true if background worker. */
+	bool		isRegularBackend;	/* true if it's a regular backend. */
 
 	/*
 	 * While in hot standby mode, shows that a conflict signal has been sent
@@ -317,19 +334,6 @@ struct PGPROC
 
 extern PGDLLIMPORT PGPROC *MyProc;
 
-/* Proc number of this backend. Equal to GetNumberFromPGProc(MyProc). */
-extern PGDLLIMPORT ProcNumber MyProcNumber;
-
-/* Our parallel session leader, or INVALID_PROC_NUMBER if none */
-extern PGDLLIMPORT ProcNumber ParallelLeaderProcNumber;
-
-/*
- * The proc number to use for our session's temp relations is normally our own,
- * but parallel workers should use their leader's ID.
- */
-#define ProcNumberForTempRelations() \
-	(ParallelLeaderProcNumber == INVALID_PROC_NUMBER ? MyProcNumber : ParallelLeaderProcNumber)
-
 /*
  * There is one ProcGlobal struct for the whole database cluster.
  *
@@ -408,7 +412,7 @@ typedef struct PROC_HDR
 	uint32		allProcCount;
 	/* Head of list of free PGPROC structures */
 	dlist_head	freeProcs;
-	/* Head of list of autovacuum's free PGPROC structures */
+	/* Head of list of autovacuum & special worker free PGPROC structures */
 	dlist_head	autovacFreeProcs;
 	/* Head of list of bgworker free PGPROC structures */
 	dlist_head	bgworkerFreeProcs;
@@ -443,15 +447,27 @@ extern PGDLLIMPORT PGPROC *PreparedXactProcs;
 #define GetNumberFromPGProc(proc) ((proc) - &ProcGlobal->allProcs[0])
 
 /*
+ * We set aside some extra PGPROC structures for "special worker" processes,
+ * which are full-fledged backends (they can run transactions)
+ * but are unique animals that there's never more than one of.
+ * Currently there are two such processes: the autovacuum launcher
+ * and the slotsync worker.
+ */
+#define NUM_SPECIAL_WORKER_PROCS	2
+
+/*
  * We set aside some extra PGPROC structures for auxiliary processes,
- * ie things that aren't full-fledged backends but need shmem access.
+ * ie things that aren't full-fledged backends (they cannot run transactions
+ * or take heavyweight locks) but need shmem access.
  *
  * Background writer, checkpointer, WAL writer, WAL summarizer, and archiver
  * run during normal operation.  Startup process and WAL receiver also consume
  * 2 slots, but WAL writer is launched only after startup has exited, so we
  * only need 6 slots.
  */
-#define NUM_AUXILIARY_PROCS		6
+#define MAX_IO_WORKERS          32
+#define NUM_AUXILIARY_PROCS		(6 + MAX_IO_WORKERS)
+
 
 /* configurable options */
 extern PGDLLIMPORT int DeadlockTimeout;
@@ -491,6 +507,10 @@ extern void ProcWakeup(PGPROC *proc, ProcWaitStatus waitStatus);
 extern void ProcLockWakeup(LockMethod lockMethodTable, LOCK *lock);
 extern void CheckDeadLockAlert(void);
 extern void LockErrorCleanup(void);
+extern void GetLockHoldersAndWaiters(LOCALLOCK *locallock,
+									 StringInfo lock_holders_sbuf,
+									 StringInfo lock_waiters_sbuf,
+									 int *lockHoldersNum);
 
 extern void ProcWaitForSignal(uint32 wait_event_info);
 extern void ProcSendSignal(ProcNumber procNumber);

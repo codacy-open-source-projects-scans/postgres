@@ -3,7 +3,7 @@
  * nodeGatherMerge.c
  *		Scan a plan in multiple workers, and do order-preserving merge.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -14,6 +14,7 @@
 
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "executor/executor.h"
 #include "executor/execParallel.h"
 #include "executor/nodeGatherMerge.h"
@@ -735,7 +736,7 @@ gm_readnext_tuple(GatherMergeState *gm_state, int nreader, bool nowait,
 	 * Since we'll be buffering these across multiple calls, we need to make a
 	 * copy.
 	 */
-	return tup ? heap_copy_minimal_tuple(tup) : NULL;
+	return tup ? heap_copy_minimal_tuple(tup, 0) : NULL;
 }
 
 /*

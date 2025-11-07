@@ -5,7 +5,7 @@
  *
  * Code supporting the direct manipulation of statistics.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -16,15 +16,22 @@
 
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "access/relation.h"
+#include "catalog/index.h"
+#include "catalog/namespace.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "statistics/stat_utils.h"
+#include "storage/lmgr.h"
 #include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/syscache.h"
 
 /*
  * Ensure that a given argument is not null.
@@ -37,7 +44,7 @@ stats_check_required_arg(FunctionCallInfo fcinfo,
 	if (PG_ARGISNULL(argnum))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("\"%s\" cannot be NULL",
+				 errmsg("argument \"%s\" must not be null",
 						arginfo[argnum].argname)));
 }
 
@@ -45,13 +52,13 @@ stats_check_required_arg(FunctionCallInfo fcinfo,
  * Check that argument is either NULL or a one dimensional array with no
  * NULLs.
  *
- * If a problem is found, emit at elevel, and return false. Otherwise return
+ * If a problem is found, emit a WARNING, and return false. Otherwise return
  * true.
  */
 bool
 stats_check_arg_array(FunctionCallInfo fcinfo,
 					  struct StatsArgInfo *arginfo,
-					  int argnum, int elevel)
+					  int argnum)
 {
 	ArrayType  *arr;
 
@@ -62,18 +69,18 @@ stats_check_arg_array(FunctionCallInfo fcinfo,
 
 	if (ARR_NDIM(arr) != 1)
 	{
-		ereport(elevel,
+		ereport(WARNING,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("\"%s\" cannot be a multidimensional array",
+				 errmsg("argument \"%s\" must not be a multidimensional array",
 						arginfo[argnum].argname)));
 		return false;
 	}
 
 	if (array_contains_nulls(arr))
 	{
-		ereport(elevel,
+		ereport(WARNING,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("\"%s\" array cannot contain NULL values",
+				 errmsg("argument \"%s\" array must not contain null values",
 						arginfo[argnum].argname)));
 		return false;
 	}
@@ -86,13 +93,13 @@ stats_check_arg_array(FunctionCallInfo fcinfo,
  * a particular stakind, such as most_common_vals and most_common_freqs for
  * STATISTIC_KIND_MCV.
  *
- * If a problem is found, emit at elevel, and return false. Otherwise return
+ * If a problem is found, emit a WARNING, and return false. Otherwise return
  * true.
  */
 bool
 stats_check_arg_pair(FunctionCallInfo fcinfo,
 					 struct StatsArgInfo *arginfo,
-					 int argnum1, int argnum2, int elevel)
+					 int argnum1, int argnum2)
 {
 	if (PG_ARGISNULL(argnum1) && PG_ARGISNULL(argnum2))
 		return true;
@@ -102,9 +109,9 @@ stats_check_arg_pair(FunctionCallInfo fcinfo,
 		int			nullarg = PG_ARGISNULL(argnum1) ? argnum1 : argnum2;
 		int			otherarg = PG_ARGISNULL(argnum1) ? argnum2 : argnum1;
 
-		ereport(elevel,
+		ereport(WARNING,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("\"%s\" must be specified when \"%s\" is specified",
+				 errmsg("argument \"%s\" must be specified when argument \"%s\" is specified",
 						arginfo[nullarg].argname,
 						arginfo[otherarg].argname)));
 
@@ -115,64 +122,133 @@ stats_check_arg_pair(FunctionCallInfo fcinfo,
 }
 
 /*
- * Lock relation in ShareUpdateExclusive mode, check privileges, and close the
- * relation (but retain the lock).
- *
  * A role has privileges to set statistics on the relation if any of the
  * following are true:
  *   - the role owns the current database and the relation is not shared
  *   - the role has the MAINTAIN privilege on the relation
  */
 void
-stats_lock_check_privileges(Oid reloid)
+RangeVarCallbackForStats(const RangeVar *relation,
+						 Oid relId, Oid oldRelId, void *arg)
 {
-	Relation	rel = relation_open(reloid, ShareUpdateExclusiveLock);
-	const char	relkind = rel->rd_rel->relkind;
+	Oid		   *locked_oid = (Oid *) arg;
+	Oid			table_oid = relId;
+	HeapTuple	tuple;
+	Form_pg_class form;
+	char		relkind;
 
-	/* All of the types that can be used with ANALYZE, plus indexes */
-	switch (relkind)
+	/*
+	 * If we previously locked some other index's heap, and the name we're
+	 * looking up no longer refers to that relation, release the now-useless
+	 * lock.
+	 */
+	if (relId != oldRelId && OidIsValid(*locked_oid))
+	{
+		UnlockRelationOid(*locked_oid, ShareUpdateExclusiveLock);
+		*locked_oid = InvalidOid;
+	}
+
+	/* If the relation does not exist, there's nothing more to do. */
+	if (!OidIsValid(relId))
+		return;
+
+	/* If the relation does exist, check whether it's an index. */
+	relkind = get_rel_relkind(relId);
+	if (relkind == RELKIND_INDEX ||
+		relkind == RELKIND_PARTITIONED_INDEX)
+		table_oid = IndexGetRelation(relId, false);
+
+	/*
+	 * If retrying yields the same OID, there are a couple of extremely
+	 * unlikely scenarios we need to handle.
+	 */
+	if (relId == oldRelId)
+	{
+		/*
+		 * If a previous lookup found an index, but the current lookup did
+		 * not, the index was dropped and the OID was reused for something
+		 * else between lookups.  In theory, we could simply drop our lock on
+		 * the index's parent table and proceed, but in the interest of
+		 * avoiding complexity, we just error.
+		 */
+		if (table_oid == relId && OidIsValid(*locked_oid))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("index \"%s\" was concurrently dropped",
+							relation->relname)));
+
+		/*
+		 * If the current lookup found an index but a previous lookup either
+		 * did not find an index or found one with a different parent
+		 * relation, the relation was dropped and the OID was reused for an
+		 * index between lookups.  RangeVarGetRelidExtended() will have
+		 * already locked the index at this point, so we can't just lock the
+		 * newly discovered parent table OID without risking deadlock.  As
+		 * above, we just error in this case.
+		 */
+		if (table_oid != relId && table_oid != *locked_oid)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("index \"%s\" was concurrently created",
+							relation->relname)));
+	}
+
+	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(table_oid));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for OID %u", table_oid);
+	form = (Form_pg_class) GETSTRUCT(tuple);
+
+	/* the relkinds that can be used with ANALYZE */
+	switch (form->relkind)
 	{
 		case RELKIND_RELATION:
-		case RELKIND_INDEX:
 		case RELKIND_MATVIEW:
 		case RELKIND_FOREIGN_TABLE:
 		case RELKIND_PARTITIONED_TABLE:
-		case RELKIND_PARTITIONED_INDEX:
 			break;
 		default:
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 					 errmsg("cannot modify statistics for relation \"%s\"",
-							RelationGetRelationName(rel)),
-					 errdetail_relkind_not_supported(rel->rd_rel->relkind)));
+							NameStr(form->relname)),
+					 errdetail_relkind_not_supported(form->relkind)));
 	}
 
-	if (rel->rd_rel->relisshared)
+	if (form->relisshared)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot modify statistics for shared relation")));
 
+	/* Check permissions */
 	if (!object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()))
 	{
-		AclResult	aclresult = pg_class_aclcheck(RelationGetRelid(rel),
+		AclResult	aclresult = pg_class_aclcheck(table_oid,
 												  GetUserId(),
 												  ACL_MAINTAIN);
 
 		if (aclresult != ACLCHECK_OK)
 			aclcheck_error(aclresult,
-						   get_relkind_objtype(rel->rd_rel->relkind),
-						   NameStr(rel->rd_rel->relname));
+						   get_relkind_objtype(form->relkind),
+						   NameStr(form->relname));
 	}
 
-	relation_close(rel, NoLock);
+	ReleaseSysCache(tuple);
+
+	/* Lock heap before index to avoid deadlock. */
+	if (relId != oldRelId && table_oid != relId)
+	{
+		LockRelationOid(table_oid, ShareUpdateExclusiveLock);
+		*locked_oid = table_oid;
+	}
 }
+
 
 /*
  * Find the argument number for the given argument name, returning -1 if not
  * found.
  */
 static int
-get_arg_by_name(const char *argname, struct StatsArgInfo *arginfo, int elevel)
+get_arg_by_name(const char *argname, struct StatsArgInfo *arginfo)
 {
 	int			argnum;
 
@@ -180,7 +256,7 @@ get_arg_by_name(const char *argname, struct StatsArgInfo *arginfo, int elevel)
 		if (pg_strcasecmp(argname, arginfo[argnum].argname) == 0)
 			return argnum;
 
-	ereport(elevel,
+	ereport(WARNING,
 			(errmsg("unrecognized argument name: \"%s\"", argname)));
 
 	return -1;
@@ -190,12 +266,12 @@ get_arg_by_name(const char *argname, struct StatsArgInfo *arginfo, int elevel)
  * Ensure that a given argument matched the expected type.
  */
 static bool
-stats_check_arg_type(const char *argname, Oid argtype, Oid expectedtype, int elevel)
+stats_check_arg_type(const char *argname, Oid argtype, Oid expectedtype)
 {
 	if (argtype != expectedtype)
 	{
-		ereport(elevel,
-				(errmsg("argument \"%s\" has type \"%s\", expected type \"%s\"",
+		ereport(WARNING,
+				(errmsg("argument \"%s\" has type %s, expected type %s",
 						argname, format_type_be(argtype),
 						format_type_be(expectedtype))));
 		return false;
@@ -216,8 +292,7 @@ stats_check_arg_type(const char *argname, Oid argtype, Oid expectedtype, int ele
 bool
 stats_fill_fcinfo_from_arg_pairs(FunctionCallInfo pairs_fcinfo,
 								 FunctionCallInfo positional_fcinfo,
-								 struct StatsArgInfo *arginfo,
-								 int elevel)
+								 struct StatsArgInfo *arginfo)
 {
 	Datum	   *args;
 	bool	   *argnulls;
@@ -243,7 +318,7 @@ stats_fill_fcinfo_from_arg_pairs(FunctionCallInfo pairs_fcinfo,
 	/*
 	 * For each argument name/value pair, find corresponding positional
 	 * argument for the argument name, and assign the argument value to
-	 * postitional_fcinfo.
+	 * positional_fcinfo.
 	 */
 	for (int i = 0; i < nargs; i += 2)
 	{
@@ -252,11 +327,11 @@ stats_fill_fcinfo_from_arg_pairs(FunctionCallInfo pairs_fcinfo,
 
 		if (argnulls[i])
 			ereport(ERROR,
-					(errmsg("name at variadic position %d is NULL", i + 1)));
+					(errmsg("name at variadic position %d is null", i + 1)));
 
 		if (types[i] != TEXTOID)
 			ereport(ERROR,
-					(errmsg("name at variadic position %d has type \"%s\", expected type \"%s\"",
+					(errmsg("name at variadic position %d has type %s, expected type %s",
 							i + 1, format_type_be(types[i]),
 							format_type_be(TEXTOID))));
 
@@ -275,11 +350,10 @@ stats_fill_fcinfo_from_arg_pairs(FunctionCallInfo pairs_fcinfo,
 		if (pg_strcasecmp(argname, "version") == 0)
 			continue;
 
-		argnum = get_arg_by_name(argname, arginfo, elevel);
+		argnum = get_arg_by_name(argname, arginfo);
 
 		if (argnum < 0 || !stats_check_arg_type(argname, types[i + 1],
-												arginfo[argnum].argtype,
-												elevel))
+												arginfo[argnum].argtype))
 		{
 			result = false;
 			continue;

@@ -2,7 +2,7 @@
 #
 # Makefile for src/bin/scripts
 #
-# Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+# Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
 #
 # src/bin/scripts/Makefile
@@ -28,7 +28,7 @@ createuser: createuser.o common.o $(WIN32RES) | submake-libpq submake-libpgport 
 dropdb: dropdb.o common.o $(WIN32RES) | submake-libpq submake-libpgport submake-libpgfeutils
 dropuser: dropuser.o common.o $(WIN32RES) | submake-libpq submake-libpgport submake-libpgfeutils
 clusterdb: clusterdb.o common.o $(WIN32RES) | submake-libpq submake-libpgport submake-libpgfeutils
-vacuumdb: vacuumdb.o common.o $(WIN32RES) | submake-libpq submake-libpgport submake-libpgfeutils
+vacuumdb: vacuumdb.o vacuuming.o common.o $(WIN32RES) | submake-libpq submake-libpgport submake-libpgfeutils
 reindexdb: reindexdb.o common.o $(WIN32RES) | submake-libpq submake-libpgport submake-libpgfeutils
 pg_isready: pg_isready.o common.o $(WIN32RES) | submake-libpq submake-libpgport submake-libpgfeutils
 
@@ -50,7 +50,7 @@ uninstall:
 
 clean distclean:
 	rm -f $(addsuffix $(X), $(PROGRAMS)) $(addsuffix .o, $(PROGRAMS))
-	rm -f common.o $(WIN32RES)
+	rm -f common.o vacuuming.o $(WIN32RES)
 	rm -rf tmp_check
 
 export with_icu

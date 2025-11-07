@@ -49,7 +49,7 @@
  * by re-setting the page's page_dirty flag.
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/access/transam/slru.c
@@ -100,8 +100,7 @@ SlruFileName(SlruCtl ctl, char *path, int64 segno)
 		 * that in the future we can't decrease SLRU_PAGES_PER_SEGMENT easily.
 		 */
 		Assert(segno >= 0 && segno <= INT64CONST(0xFFFFFFFFFFFFFFF));
-		return snprintf(path, MAXPGPATH, "%s/%015llX", ctl->Dir,
-						(long long) segno);
+		return snprintf(path, MAXPGPATH, "%s/%015" PRIX64, ctl->Dir, segno);
 	}
 	else
 	{
@@ -247,6 +246,7 @@ SimpleLruAutotuneBuffers(int divisor, int max)
  * buffer_tranche_id: tranche ID to use for the SLRU's per-buffer LWLocks.
  * bank_tranche_id: tranche ID to use for the bank LWLocks.
  * sync_handler: which set of functions to use to handle sync requests
+ * long_segment_names: use short or long segment names
  */
 void
 SimpleLruInit(SlruCtl ctl, const char *name, int nslots, int nlsns,
@@ -343,7 +343,7 @@ SimpleLruInit(SlruCtl ctl, const char *name, int nslots, int nlsns,
 	ctl->shared = shared;
 	ctl->sync_handler = sync_handler;
 	ctl->long_segment_names = long_segment_names;
-	ctl->bank_mask = (nslots / SLRU_BANK_SIZE) - 1;
+	ctl->nbanks = nbanks;
 	strlcpy(ctl->Dir, subdir, sizeof(ctl->Dir));
 }
 
@@ -401,15 +401,15 @@ SimpleLruZeroPage(SlruCtl ctl, int64 pageno)
 	/*
 	 * Assume this page is now the latest active page.
 	 *
-	 * Note that because both this routine and SlruSelectLRUPage run with
-	 * ControlLock held, it is not possible for this to be zeroing a page that
-	 * SlruSelectLRUPage is going to evict simultaneously.  Therefore, there's
-	 * no memory barrier here.
+	 * Note that because both this routine and SlruSelectLRUPage run with a
+	 * SLRU bank lock held, it is not possible for this to be zeroing a page
+	 * that SlruSelectLRUPage is going to evict simultaneously.  Therefore,
+	 * there's no memory barrier here.
 	 */
 	pg_atomic_write_u64(&shared->latest_page_number, pageno);
 
 	/* update the stats counter of zeroed pages */
-	pgstat_count_slru_page_zeroed(shared->slru_stats_idx);
+	pgstat_count_slru_blocks_zeroed(shared->slru_stats_idx);
 
 	return slotno;
 }
@@ -432,6 +432,31 @@ SimpleLruZeroLSNs(SlruCtl ctl, int slotno)
 	if (shared->lsn_groups_per_page > 0)
 		MemSet(&shared->group_lsn[slotno * shared->lsn_groups_per_page], 0,
 			   shared->lsn_groups_per_page * sizeof(XLogRecPtr));
+}
+
+/*
+ * This is a convenience wrapper for the common case of zeroing a page and
+ * immediately flushing it to disk.
+ *
+ * SLRU bank lock is acquired and released here.
+ */
+void
+SimpleLruZeroAndWritePage(SlruCtl ctl, int64 pageno)
+{
+	int			slotno;
+	LWLock	   *lock;
+
+	lock = SimpleLruGetBankLock(ctl, pageno);
+	LWLockAcquire(lock, LW_EXCLUSIVE);
+
+	/* Create and zero the page */
+	slotno = SimpleLruZeroPage(ctl, pageno);
+
+	/* Make sure it's written out */
+	SimpleLruWritePage(ctl, slotno);
+	Assert(!ctl->shared->page_dirty[slotno]);
+
+	LWLockRelease(lock);
 }
 
 /*
@@ -536,7 +561,7 @@ SimpleLruReadPage(SlruCtl ctl, int64 pageno, bool write_ok,
 			SlruRecentlyUsed(shared, slotno);
 
 			/* update the stats counter of pages found in the SLRU */
-			pgstat_count_slru_page_hit(shared->slru_stats_idx);
+			pgstat_count_slru_blocks_hit(shared->slru_stats_idx);
 
 			return slotno;
 		}
@@ -581,7 +606,7 @@ SimpleLruReadPage(SlruCtl ctl, int64 pageno, bool write_ok,
 		SlruRecentlyUsed(shared, slotno);
 
 		/* update the stats counter of pages not found in SLRU */
-		pgstat_count_slru_page_read(shared->slru_stats_idx);
+		pgstat_count_slru_blocks_read(shared->slru_stats_idx);
 
 		return slotno;
 	}
@@ -606,7 +631,7 @@ SimpleLruReadPage_ReadOnly(SlruCtl ctl, int64 pageno, TransactionId xid)
 {
 	SlruShared	shared = ctl->shared;
 	LWLock	   *banklock = SimpleLruGetBankLock(ctl, pageno);
-	int			bankno = pageno & ctl->bank_mask;
+	int			bankno = pageno % ctl->nbanks;
 	int			bankstart = bankno * SLRU_BANK_SIZE;
 	int			bankend = bankstart + SLRU_BANK_SIZE;
 
@@ -620,11 +645,11 @@ SimpleLruReadPage_ReadOnly(SlruCtl ctl, int64 pageno, TransactionId xid)
 			shared->page_number[slotno] == pageno &&
 			shared->page_status[slotno] != SLRU_PAGE_READ_IN_PROGRESS)
 		{
-			/* See comments for SlruRecentlyUsed macro */
+			/* See comments for SlruRecentlyUsed() */
 			SlruRecentlyUsed(shared, slotno);
 
 			/* update the stats counter of pages found in the SLRU */
-			pgstat_count_slru_page_hit(shared->slru_stats_idx);
+			pgstat_count_slru_blocks_hit(shared->slru_stats_idx);
 
 			return slotno;
 		}
@@ -754,7 +779,7 @@ SimpleLruDoesPhysicalPageExist(SlruCtl ctl, int64 pageno)
 	off_t		endpos;
 
 	/* update the stats counter of checked pages */
-	pgstat_count_slru_page_exists(ctl->shared->slru_stats_idx);
+	pgstat_count_slru_blocks_exists(ctl->shared->slru_stats_idx);
 
 	SlruFileName(ctl, path, segno);
 
@@ -883,7 +908,7 @@ SlruPhysicalWritePage(SlruCtl ctl, int64 pageno, int slotno, SlruWriteAll fdata)
 	int			fd = -1;
 
 	/* update the stats counter of written pages */
-	pgstat_count_slru_page_written(shared->slru_stats_idx);
+	pgstat_count_slru_blocks_written(shared->slru_stats_idx);
 
 	/*
 	 * Honor the write-WAL-before-data rule, if appropriate, so that we do not
@@ -912,7 +937,7 @@ SlruPhysicalWritePage(SlruCtl ctl, int64 pageno, int slotno, SlruWriteAll fdata)
 				max_lsn = this_lsn;
 		}
 
-		if (!XLogRecPtrIsInvalid(max_lsn))
+		if (XLogRecPtrIsValid(max_lsn))
 		{
 			/*
 			 * As noted above, elog(ERROR) is not acceptable here, so if
@@ -1180,7 +1205,7 @@ SlruSelectLRUPage(SlruCtl ctl, int64 pageno)
 		int			bestinvalidslot = 0;	/* keep compiler quiet */
 		int			best_invalid_delta = -1;
 		int64		best_invalid_page_number = 0;	/* keep compiler quiet */
-		int			bankno = pageno & ctl->bank_mask;
+		int			bankno = pageno % ctl->nbanks;
 		int			bankstart = bankno * SLRU_BANK_SIZE;
 		int			bankend = bankstart + SLRU_BANK_SIZE;
 

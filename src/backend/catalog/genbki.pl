@@ -6,7 +6,7 @@
 #    headers from specially formatted header files and data files.
 #    postgres.bki is used to initialize the postgres template database.
 #
-# Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+# Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
 #
 # src/backend/catalog/genbki.pl
@@ -480,6 +480,8 @@ foreach my $catname (@catnames)
 
 EOM
 
+	printf $def "/* Macros related to the structure of $catname */\n\n";
+
 	# Emit OID macros for catalog's OID and rowtype OID, if wanted
 	printf $def "#define %s %s\n",
 	  $catalog->{relation_oid_macro}, $catalog->{relation_oid}
@@ -561,6 +563,7 @@ EOM
 	print $def "\n#define Natts_$catname $attnum\n\n";
 
 	# Emit client code copied from source header
+	printf $def "/* Definitions copied from ${catname}.h */\n\n";
 	foreach my $line (@{ $catalog->{client_code} })
 	{
 		print $def $line;
@@ -572,6 +575,9 @@ EOM
 	{
 		print $bki "open $catname\n";
 	}
+
+	printf $def
+	  "\n/* OID symbols for objects defined in ${catname}.dat */\n\n";
 
 	# For pg_attribute.h, we generate data entries ourselves.
 	if ($catname eq 'pg_attribute')
@@ -1048,8 +1054,7 @@ sub morph_row_for_schemapg
 		}
 
 		# Expand booleans from 'f'/'t' to 'false'/'true'.
-		# Some values might be other macros (eg FLOAT8PASSBYVAL),
-		# don't change.
+		# Some values might be other macros, if so don't change.
 		elsif ($atttype eq 'bool')
 		{
 			$row->{$attname} = 'true' if $row->{$attname} eq 't';
@@ -1156,7 +1161,7 @@ sub print_boilerplate
  * %s
  *    %s
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * NOTES

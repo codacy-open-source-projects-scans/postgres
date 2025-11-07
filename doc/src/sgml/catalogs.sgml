@@ -596,7 +596,10 @@
       </para>
       <para>
        Approximate average size (in bytes) of the transition state
-       data, or zero to use a default estimate
+       data. A positive value provides an estimate; zero means to
+       use a default estimate. A negative value indicates the state
+       data can grow unboundedly in size, such as when the aggregate
+       accumulates input rows (e.g., array_agg, string_agg).
       </para></entry>
      </row>
 
@@ -1188,17 +1191,6 @@
 
      <row>
       <entry role="catalog_table_entry"><para role="column_definition">
-       <structfield>attcacheoff</structfield> <type>int4</type>
-      </para>
-      <para>
-       Always -1 in storage, but when loaded into a row descriptor
-       in memory this might be updated to cache the offset of the attribute
-       within the row
-      </para></entry>
-     </row>
-
-     <row>
-      <entry role="catalog_table_entry"><para role="column_definition">
        <structfield>atttypmod</structfield> <type>int4</type>
       </para>
       <para>
@@ -1271,7 +1263,7 @@
        <structfield>attnotnull</structfield> <type>bool</type>
       </para>
       <para>
-       This column has a not-null constraint.
+       This column has a (possibly invalid) not-null constraint.
       </para></entry>
      </row>
 
@@ -1318,8 +1310,10 @@
       </para>
       <para>
        If a zero byte (<literal>''</literal>), then not a generated column.
-       Otherwise, <literal>s</literal> = stored.  (Other values might be added
-       in the future.)
+       Otherwise, <literal>s</literal> = stored, <literal>v</literal> =
+       virtual.  A stored generated column is physically stored like a normal
+       column.  A virtual generated column is physically stored as a null
+       value, with the actual value being computed at run time.
       </para></entry>
      </row>
 
@@ -1591,7 +1585,7 @@
        <structfield>rolpassword</structfield> <type>text</type>
       </para>
       <para>
-       Password (possibly encrypted); null if none. The format depends
+       Encrypted password; null if none. The format depends
        on the form of encryption used.
       </para></entry>
      </row>
@@ -1635,11 +1629,6 @@ SCRAM-SHA-256$<replaceable>&lt;iteration count&gt;</replaceable>:<replaceable>&l
    where <replaceable>salt</replaceable>, <replaceable>StoredKey</replaceable> and
    <replaceable>ServerKey</replaceable> are in Base64 encoded format. This format is
    the same as that specified by <ulink url="https://datatracker.ietf.org/doc/html/rfc5803">RFC 5803</ulink>.
-  </para>
-
-  <para>
-    A password that does not follow either of those formats is assumed to be
-    unencrypted.
   </para>
  </sect1>
 
@@ -1965,7 +1954,7 @@ SCRAM-SHA-256$<replaceable>&lt;iteration count&gt;</replaceable>:<replaceable>&l
       </para>
       <para>
        The OID of the data type that corresponds to this table's row type,
-       if any; zero for indexes, sequences, and toast tables, which have
+       if any; zero for indexes, sequences, and TOAST tables, which have
        no <structname>pg_type</structname> entry
       </para></entry>
      </row>
@@ -2074,6 +2063,27 @@ SCRAM-SHA-256$<replaceable>&lt;iteration count&gt;</replaceable>:<replaceable>&l
        <link linkend="sql-createindex"><command>CREATE INDEX</command></link>.
       </para></entry>
      </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>relallfrozen</structfield> <type>int4</type>
+      </para>
+      <para>
+       Number of pages that are marked all-frozen in the table's visibility
+       map.  This is only an estimate used for triggering autovacuums. It can
+       also be used along with <structfield>relallvisible</structfield> for
+       scheduling manual vacuums and tuning <link
+       linkend="runtime-config-vacuum-freezing">vacuum's freezing
+       behavior</link>.
+
+       It is updated by
+       <link linkend="sql-vacuum"><command>VACUUM</command></link>,
+       <link linkend="sql-analyze"><command>ANALYZE</command></link>,
+       and a few DDL commands such as
+       <link linkend="sql-createindex"><command>CREATE INDEX</command></link>.
+      </para></entry>
+     </row>
+
 
      <row>
       <entry role="catalog_table_entry"><para role="column_definition">
@@ -2604,11 +2614,19 @@ SCRAM-SHA-256$<replaceable>&lt;iteration count&gt;</replaceable>:<replaceable>&l
 
      <row>
       <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>conenforced</structfield> <type>bool</type>
+      </para>
+      <para>
+       Is the constraint enforced?
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
        <structfield>convalidated</structfield> <type>bool</type>
       </para>
       <para>
        Has the constraint been validated?
-       Currently, can be false only for foreign keys and CHECK constraints
       </para></entry>
      </row>
 
@@ -3143,7 +3161,7 @@ SCRAM-SHA-256$<replaceable>&lt;iteration count&gt;</replaceable>:<replaceable>&l
        <structfield>datcollate</structfield> <type>text</type>
       </para>
       <para>
-       LC_COLLATE for this database
+       LC_COLLATE for this database (ignored unless <structfield>datlocprovider</structfield> is <literal>c</literal>)
       </para></entry>
      </row>
 
@@ -3339,7 +3357,8 @@ SCRAM-SHA-256$<replaceable>&lt;iteration count&gt;</replaceable>:<replaceable>&l
        <literal>S</literal> = sequence,
        <literal>f</literal> = function,
        <literal>T</literal> = type,
-       <literal>n</literal> = schema
+       <literal>n</literal> = schema,
+       <literal>L</literal> = large object
       </para></entry>
      </row>
 
@@ -6041,7 +6060,7 @@ SCRAM-SHA-256$<replaceable>&lt;iteration count&gt;</replaceable>:<replaceable>&l
        The function has no side effects.  No information about the
        arguments is conveyed except via the return value.  Any function
        that might throw an error depending on the values of its arguments
-       is not leak-proof.
+       is not leakproof.
       </para></entry>
      </row>
 
@@ -6357,6 +6376,16 @@ SCRAM-SHA-256$<replaceable>&lt;iteration count&gt;</replaceable>:<replaceable>&l
 
      <row>
       <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>puballsequences</structfield> <type>bool</type>
+      </para>
+      <para>
+       If true, this publication automatically includes all sequences
+       in the database, including any that will be created in the future.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
        <structfield>pubinsert</structfield> <type>bool</type>
       </para>
       <para>
@@ -6403,6 +6432,20 @@ SCRAM-SHA-256$<replaceable>&lt;iteration count&gt;</replaceable>:<replaceable>&l
        If true, operations on a leaf partition are replicated using the
        identity and schema of its topmost partitioned ancestor mentioned in the
        publication instead of its own.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>pubgencols</structfield> <type>char</type>
+      </para>
+      <para>
+       Controls how to handle generated column replication when there is no
+       publication column list:
+       <literal>n</literal> = generated columns in the tables associated with
+       the publication should not be replicated,
+       <literal>s</literal> = stored generated columns in the tables associated
+       with the publication should be replicated.
       </para></entry>
      </row>
     </tbody>
@@ -7941,7 +7984,7 @@ SCRAM-SHA-256$<replaceable>&lt;iteration count&gt;</replaceable>:<replaceable>&l
       </para>
       <para>
        Finish LSN of the transaction whose changes are to be skipped, if a valid
-       LSN; otherwise <literal>0/0</literal>.
+       LSN; otherwise <literal>0/0000000</literal>.
       </para></entry>
      </row>
 
@@ -8054,6 +8097,43 @@ SCRAM-SHA-256$<replaceable>&lt;iteration count&gt;</replaceable>:<replaceable>&l
 
      <row>
       <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>subretaindeadtuples</structfield> <type>bool</type>
+      </para>
+      <para>
+       If true, the detection of <xref linkend="conflict-update-deleted"/> is
+       enabled and the information (e.g., dead tuples, commit timestamps, and
+       origins) on the subscriber that is useful for conflict detection is
+       retained.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>submaxretention</structfield> <type>int4</type>
+      </para>
+      <para>
+       The maximum duration (in milliseconds) for which information (e.g., dead
+       tuples, commit timestamps, and origins) useful for conflict detection can
+       be retained.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>subretentionactive</structfield> <type>bool</type>
+      </para>
+      <para>
+       The retention status of information (e.g., dead tuples, commit
+       timestamps, and origins) useful for conflict detection. True if
+       <link linkend="sql-createsubscription-params-with-retain-dead-tuples"><literal>retain_dead_tuples</literal></link>
+       is enabled, and the retention duration has not exceeded
+       <link linkend="sql-createsubscription-params-with-max-retention-duration"><literal>max_retention_duration</literal></link>,
+       when defined.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
        <structfield>subconninfo</structfield> <type>text</type>
       </para>
       <para>
@@ -8119,16 +8199,19 @@ SCRAM-SHA-256$<replaceable>&lt;iteration count&gt;</replaceable>:<replaceable>&l
   </indexterm>
 
   <para>
-   The catalog <structname>pg_subscription_rel</structname> contains the
-   state for each replicated relation in each subscription.  This is a
-   many-to-many mapping.
+   The catalog <structname>pg_subscription_rel</structname> stores the
+   state of each replicated table and sequence for each subscription.  This
+   is a many-to-many mapping.
   </para>
 
   <para>
-   This catalog only contains tables known to the subscription after running
-   either <link linkend="sql-createsubscription"><command>CREATE SUBSCRIPTION</command></link> or
-   <link linkend="sql-altersubscription"><command>ALTER SUBSCRIPTION ... REFRESH
-   PUBLICATION</command></link>.
+   This catalog contains tables and sequences known to the subscription
+   after running:
+   <link linkend="sql-createsubscription"><command>CREATE SUBSCRIPTION</command></link>,
+   <link linkend="sql-altersubscription-params-refresh-publication">
+   <command>ALTER SUBSCRIPTION ... REFRESH PUBLICATION</command></link>, or
+   <link linkend="sql-altersubscription-params-refresh-sequences">
+   <command>ALTER SUBSCRIPTION ... REFRESH SEQUENCES</command></link>.
   </para>
 
   <table>
@@ -8162,7 +8245,7 @@ SCRAM-SHA-256$<replaceable>&lt;iteration count&gt;</replaceable>:<replaceable>&l
        (references <link linkend="catalog-pg-class"><structname>pg_class</structname></link>.<structfield>oid</structfield>)
       </para>
       <para>
-       Reference to relation
+       Reference to table or sequence
       </para></entry>
      </row>
 
@@ -8171,12 +8254,20 @@ SCRAM-SHA-256$<replaceable>&lt;iteration count&gt;</replaceable>:<replaceable>&l
        <structfield>srsubstate</structfield> <type>char</type>
       </para>
       <para>
-       State code:
+       State code for the table or sequence.
+      </para>
+      <para>
+       State codes for tables:
        <literal>i</literal> = initialize,
        <literal>d</literal> = data is being copied,
        <literal>f</literal> = finished table copy,
        <literal>s</literal> = synchronized,
        <literal>r</literal> = ready (normal replication)
+      </para>
+      <para>
+       State codes for sequences:
+       <literal>i</literal> = initialize,
+       <literal>r</literal> = ready
       </para></entry>
      </row>
 

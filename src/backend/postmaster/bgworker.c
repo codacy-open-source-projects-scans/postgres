@@ -2,7 +2,7 @@
  * bgworker.c
  *		POSTGRES pluggable background workers implementation
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/postmaster/bgworker.c
@@ -131,7 +131,10 @@ static const struct
 		"ParallelApplyWorkerMain", ParallelApplyWorkerMain
 	},
 	{
-		"TablesyncWorkerMain", TablesyncWorkerMain
+		"TableSyncWorkerMain", TableSyncWorkerMain
+	},
+	{
+		"SequenceSyncWorkerMain", SequenceSyncWorkerMain
 	}
 };
 
@@ -613,6 +616,7 @@ ResetBackgroundWorkerCrashTimes(void)
 			 * resetting.
 			 */
 			rw->rw_crashed_at = 0;
+			rw->rw_pid = 0;
 
 			/*
 			 * If there was anyone waiting for it, they're history.
@@ -714,7 +718,7 @@ bgworker_die(SIGNAL_ARGS)
  * Main entry point for background worker processes.
  */
 void
-BackgroundWorkerMain(char *startup_data, size_t startup_data_len)
+BackgroundWorkerMain(const void *startup_data, size_t startup_data_len)
 {
 	sigjmp_buf	local_sigjmp_buf;
 	BackgroundWorker *worker;
@@ -854,7 +858,7 @@ BackgroundWorkerInitializeConnection(const char *dbname, const char *username, u
 	BackgroundWorker *worker = MyBgworkerEntry;
 	bits32		init_flags = 0; /* never honor session_preload_libraries */
 
-	/* ignore datallowconn? */
+	/* ignore datallowconn and ACL_CONNECT? */
 	if (flags & BGWORKER_BYPASS_ALLOWCONN)
 		init_flags |= INIT_PG_OVERRIDE_ALLOW_CONNS;
 	/* ignore rolcanlogin? */
@@ -888,7 +892,7 @@ BackgroundWorkerInitializeConnectionByOid(Oid dboid, Oid useroid, uint32 flags)
 	BackgroundWorker *worker = MyBgworkerEntry;
 	bits32		init_flags = 0; /* never honor session_preload_libraries */
 
-	/* ignore datallowconn? */
+	/* ignore datallowconn and ACL_CONNECT? */
 	if (flags & BGWORKER_BYPASS_ALLOWCONN)
 		init_flags |= INIT_PG_OVERRIDE_ALLOW_CONNS;
 	/* ignore rolcanlogin? */

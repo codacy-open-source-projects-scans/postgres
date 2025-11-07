@@ -4,7 +4,7 @@
  *	  interface routines for the postgres GiST index access method.
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -65,6 +65,9 @@ gisthandler(PG_FUNCTION_ARGS)
 	amroutine->amoptsprocnum = GIST_OPTIONS_PROC;
 	amroutine->amcanorder = false;
 	amroutine->amcanorderbyop = true;
+	amroutine->amcanhash = false;
+	amroutine->amconsistentequality = false;
+	amroutine->amconsistentordering = false;
 	amroutine->amcanbackward = false;
 	amroutine->amcanunique = false;
 	amroutine->amcanmulticol = true;
@@ -107,6 +110,8 @@ gisthandler(PG_FUNCTION_ARGS)
 	amroutine->amestimateparallelscan = NULL;
 	amroutine->aminitparallelscan = NULL;
 	amroutine->amparallelrescan = NULL;
+	amroutine->amtranslatestrategy = NULL;
+	amroutine->amtranslatecmptype = gisttranslatecmptype;
 
 	PG_RETURN_POINTER(amroutine);
 }
@@ -425,7 +430,7 @@ gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate,
 			{
 				IndexTuple	thistup = (IndexTuple) data;
 
-				if (PageAddItem(ptr->page, (Item) data, IndexTupleSize(thistup), i + FirstOffsetNumber, false, false) == InvalidOffsetNumber)
+				if (PageAddItem(ptr->page, data, IndexTupleSize(thistup), i + FirstOffsetNumber, false, false) == InvalidOffsetNumber)
 					elog(ERROR, "failed to add item to index page in \"%s\"", RelationGetRelationName(rel));
 
 				/*
@@ -546,8 +551,7 @@ gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate,
 			if (ntup == 1)
 			{
 				/* One-for-one replacement, so use PageIndexTupleOverwrite */
-				if (!PageIndexTupleOverwrite(page, oldoffnum, (Item) *itup,
-											 IndexTupleSize(*itup)))
+				if (!PageIndexTupleOverwrite(page, oldoffnum, *itup, IndexTupleSize(*itup)))
 					elog(ERROR, "failed to add item to index page in \"%s\"",
 						 RelationGetRelationName(rel));
 			}
@@ -678,7 +682,7 @@ gistdoinsert(Relation r, IndexTuple itup, Size freespace,
 			state.stack = stack = stack->parent;
 		}
 
-		if (XLogRecPtrIsInvalid(stack->lsn))
+		if (!XLogRecPtrIsValid(stack->lsn))
 			stack->buffer = ReadBuffer(state.r, stack->blkno);
 
 		/*
@@ -691,10 +695,10 @@ gistdoinsert(Relation r, IndexTuple itup, Size freespace,
 			gistcheckpage(state.r, stack->buffer);
 		}
 
-		stack->page = (Page) BufferGetPage(stack->buffer);
+		stack->page = BufferGetPage(stack->buffer);
 		stack->lsn = xlocked ?
 			PageGetLSN(stack->page) : BufferGetLSNAtomic(stack->buffer);
-		Assert(!RelationNeedsWAL(state.r) || !XLogRecPtrIsInvalid(stack->lsn));
+		Assert(!RelationNeedsWAL(state.r) || XLogRecPtrIsValid(stack->lsn));
 
 		/*
 		 * If this page was split but the downlink was never inserted to the
@@ -778,7 +782,7 @@ gistdoinsert(Relation r, IndexTuple itup, Size freespace,
 					LockBuffer(stack->buffer, GIST_UNLOCK);
 					LockBuffer(stack->buffer, GIST_EXCLUSIVE);
 					xlocked = true;
-					stack->page = (Page) BufferGetPage(stack->buffer);
+					stack->page = BufferGetPage(stack->buffer);
 
 					if (PageGetLSN(stack->page) != stack->lsn)
 					{
@@ -842,7 +846,7 @@ gistdoinsert(Relation r, IndexTuple itup, Size freespace,
 				LockBuffer(stack->buffer, GIST_UNLOCK);
 				LockBuffer(stack->buffer, GIST_EXCLUSIVE);
 				xlocked = true;
-				stack->page = (Page) BufferGetPage(stack->buffer);
+				stack->page = BufferGetPage(stack->buffer);
 				stack->lsn = PageGetLSN(stack->page);
 
 				if (stack->blkno == GIST_ROOT_BLKNO)
@@ -933,7 +937,7 @@ gistFindPath(Relation r, BlockNumber child, OffsetNumber *downlinkoffnum)
 		buffer = ReadBuffer(r, top->blkno);
 		LockBuffer(buffer, GIST_SHARE);
 		gistcheckpage(r, buffer);
-		page = (Page) BufferGetPage(buffer);
+		page = BufferGetPage(buffer);
 
 		if (GistPageIsLeaf(page))
 		{
@@ -1028,7 +1032,7 @@ gistFindCorrectParent(Relation r, GISTInsertStack *child, bool is_build)
 	GISTInsertStack *ptr;
 
 	gistcheckpage(r, parent->buffer);
-	parent->page = (Page) BufferGetPage(parent->buffer);
+	parent->page = BufferGetPage(parent->buffer);
 	maxoff = PageGetMaxOffsetNumber(parent->page);
 
 	/* Check if the downlink is still where it was before */
@@ -1043,12 +1047,19 @@ gistFindCorrectParent(Relation r, GISTInsertStack *child, bool is_build)
 	/*
 	 * The page has changed since we looked. During normal operation, every
 	 * update of a page changes its LSN, so the LSN we memorized should have
-	 * changed too. During index build, however, we don't WAL-log the changes
-	 * until we have built the index, so the LSN doesn't change. There is no
-	 * concurrent activity during index build, but we might have changed the
-	 * parent ourselves.
+	 * changed too.
+	 *
+	 * During index build, however, we don't WAL-log the changes until we have
+	 * built the index, so the LSN doesn't change. There is no concurrent
+	 * activity during index build, but we might have changed the parent
+	 * ourselves.
+	 *
+	 * We will also get here if child->downlinkoffnum is invalid. That happens
+	 * if 'parent' had been updated by an earlier call to this function on its
+	 * grandchild, which had to move right.
 	 */
-	Assert(parent->lsn != PageGetLSN(parent->page) || is_build);
+	Assert(parent->lsn != PageGetLSN(parent->page) || is_build ||
+		   child->downlinkoffnum == InvalidOffsetNumber);
 
 	/*
 	 * Scan the page to re-find the downlink. If the page was split, it might
@@ -1086,7 +1097,7 @@ gistFindCorrectParent(Relation r, GISTInsertStack *child, bool is_build)
 		parent->buffer = ReadBuffer(r, parent->blkno);
 		LockBuffer(parent->buffer, GIST_EXCLUSIVE);
 		gistcheckpage(r, parent->buffer);
-		parent->page = (Page) BufferGetPage(parent->buffer);
+		parent->page = BufferGetPage(parent->buffer);
 	}
 
 	/*
@@ -1109,7 +1120,7 @@ gistFindCorrectParent(Relation r, GISTInsertStack *child, bool is_build)
 	while (ptr)
 	{
 		ptr->buffer = ReadBuffer(r, ptr->blkno);
-		ptr->page = (Page) BufferGetPage(ptr->buffer);
+		ptr->page = BufferGetPage(ptr->buffer);
 		ptr = ptr->parent;
 	}
 
@@ -1557,9 +1568,8 @@ initGISTstate(Relation index)
 	 * tuples during page split.  Also, B-tree is not adjusting tuples on
 	 * internal pages the way GiST does.
 	 */
-	giststate->nonLeafTupdesc = CreateTupleDescCopyConstr(index->rd_att);
-	giststate->nonLeafTupdesc->natts =
-		IndexRelationGetNumberOfKeyAttributes(index);
+	giststate->nonLeafTupdesc = CreateTupleDescTruncatedCopy(index->rd_att,
+															 IndexRelationGetNumberOfKeyAttributes(index));
 
 	for (i = 0; i < IndexRelationGetNumberOfKeyAttributes(index); i++)
 	{

@@ -3,7 +3,7 @@
  * objectaddress.c
  *	  functions for working with ObjectAddresses
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -62,7 +62,6 @@
 #include "catalog/pg_ts_template.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_user_mapping.h"
-#include "commands/dbcommands.h"
 #include "commands/defrem.h"
 #include "commands/event_trigger.h"
 #include "commands/extension.h"
@@ -2005,16 +2004,20 @@ get_object_address_defacl(List *object, bool missing_ok)
 		case DEFACLOBJ_NAMESPACE:
 			objtype_str = "schemas";
 			break;
+		case DEFACLOBJ_LARGEOBJECT:
+			objtype_str = "large objects";
+			break;
 		default:
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("unrecognized default ACL object type \"%c\"", objtype),
-					 errhint("Valid object types are \"%c\", \"%c\", \"%c\", \"%c\", \"%c\".",
+					 errhint("Valid object types are \"%c\", \"%c\", \"%c\", \"%c\", \"%c\", \"%c\".",
 							 DEFACLOBJ_RELATION,
 							 DEFACLOBJ_SEQUENCE,
 							 DEFACLOBJ_FUNCTION,
 							 DEFACLOBJ_TYPE,
-							 DEFACLOBJ_NAMESPACE)));
+							 DEFACLOBJ_NAMESPACE,
+							 DEFACLOBJ_LARGEOBJECT)));
 	}
 
 	/*
@@ -2785,13 +2788,34 @@ get_object_property_data(Oid class_id)
 HeapTuple
 get_catalog_object_by_oid(Relation catalog, AttrNumber oidcol, Oid objectId)
 {
+	return
+		get_catalog_object_by_oid_extended(catalog, oidcol, objectId, false);
+}
+
+/*
+ * Same as get_catalog_object_by_oid(), but with an additional "locktup"
+ * argument controlling whether to acquire a LOCKTAG_TUPLE at mode
+ * InplaceUpdateTupleLock.  See README.tuplock section "Locking to write
+ * inplace-updated tables".
+ */
+HeapTuple
+get_catalog_object_by_oid_extended(Relation catalog,
+								   AttrNumber oidcol,
+								   Oid objectId,
+								   bool locktup)
+{
 	HeapTuple	tuple;
 	Oid			classId = RelationGetRelid(catalog);
 	int			oidCacheId = get_object_catcache_oid(classId);
 
 	if (oidCacheId > 0)
 	{
-		tuple = SearchSysCacheCopy1(oidCacheId, ObjectIdGetDatum(objectId));
+		if (locktup)
+			tuple = SearchSysCacheLockedCopy1(oidCacheId,
+											  ObjectIdGetDatum(objectId));
+		else
+			tuple = SearchSysCacheCopy1(oidCacheId,
+										ObjectIdGetDatum(objectId));
 		if (!HeapTupleIsValid(tuple))	/* should not happen */
 			return NULL;
 	}
@@ -2816,6 +2840,10 @@ get_catalog_object_by_oid(Relation catalog, AttrNumber oidcol, Oid objectId)
 			systable_endscan(scan);
 			return NULL;
 		}
+
+		if (locktup)
+			LockTuple(catalog, &tuple->t_self, InplaceUpdateTupleLock);
+
 		tuple = heap_copytuple(tuple);
 
 		systable_endscan(scan);
@@ -3819,6 +3847,12 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 										 _("default privileges on new schemas belonging to role %s"),
 										 rolename);
 						break;
+					case DEFACLOBJ_LARGEOBJECT:
+						Assert(!nspname);
+						appendStringInfo(&buffer,
+										 _("default privileges on new large objects belonging to role %s"),
+										 rolename);
+						break;
 					default:
 						/* shouldn't get here */
 						if (nspname)
@@ -4248,8 +4282,8 @@ pg_identify_object(PG_FUNCTION_ARGS)
 			nspAttnum = get_object_attnum_namespace(address.classId);
 			if (nspAttnum != InvalidAttrNumber)
 			{
-				schema_oid = heap_getattr(objtup, nspAttnum,
-										  RelationGetDescr(catalog), &isnull);
+				schema_oid = DatumGetObjectId(heap_getattr(objtup, nspAttnum,
+														   RelationGetDescr(catalog), &isnull));
 				if (isnull)
 					elog(ERROR, "invalid null namespace in object %u/%u/%d",
 						 address.classId, address.objectId, address.objectSubId);
@@ -4815,7 +4849,7 @@ getObjectIdentityParts(const ObjectAddress *object,
 	 * will be initialized in all cases inside the switch; but we do it anyway
 	 * so that we can test below that no branch leaves it unset.
 	 */
-	Assert(PointerIsValid(objname) == PointerIsValid(objargs));
+	Assert((objname != NULL) == (objargs != NULL));
 	if (objname)
 	{
 		*objname = NIL;
@@ -5740,6 +5774,10 @@ getObjectIdentityParts(const ObjectAddress *object,
 					case DEFACLOBJ_NAMESPACE:
 						appendStringInfoString(&buffer,
 											   " on schemas");
+						break;
+					case DEFACLOBJ_LARGEOBJECT:
+						appendStringInfoString(&buffer,
+											   " on large objects");
 						break;
 				}
 

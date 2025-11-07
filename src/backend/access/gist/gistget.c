@@ -4,7 +4,7 @@
  *	  fetch tuples from a GiST scan.
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -46,7 +46,7 @@ gistkillitems(IndexScanDesc scan)
 	bool		killedsomething = false;
 
 	Assert(so->curBlkno != InvalidBlockNumber);
-	Assert(!XLogRecPtrIsInvalid(so->curPageLSN));
+	Assert(XLogRecPtrIsValid(so->curPageLSN));
 	Assert(so->killedItems != NULL);
 
 	buffer = ReadBuffer(scan->indexRelation, so->curBlkno);
@@ -353,7 +353,7 @@ gistScanPage(IndexScanDesc scan, GISTSearchItem *pageItem,
 	 * parentlsn < nsn), or if the system crashed after a page split but
 	 * before the downlink was inserted into the parent.
 	 */
-	if (!XLogRecPtrIsInvalid(pageItem->data.parentlsn) &&
+	if (XLogRecPtrIsValid(pageItem->data.parentlsn) &&
 		(GistFollowRight(page) ||
 		 pageItem->data.parentlsn < GistPageGetNSN(page)) &&
 		opaque->rightlink != InvalidBlockNumber /* sanity check */ )
@@ -625,6 +625,8 @@ gistgettuple(IndexScanDesc scan, ScanDirection dir)
 		GISTSearchItem fakeItem;
 
 		pgstat_count_index_scan(scan->indexRelation);
+		if (scan->instrument)
+			scan->instrument->nsearches++;
 
 		so->firstCall = false;
 		so->curPageData = so->nPageData = 0;
@@ -750,6 +752,8 @@ gistgetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 		return 0;
 
 	pgstat_count_index_scan(scan->indexRelation);
+	if (scan->instrument)
+		scan->instrument->nsearches++;
 
 	/* Begin the scan by processing the root page */
 	so->curPageData = so->nPageData = 0;

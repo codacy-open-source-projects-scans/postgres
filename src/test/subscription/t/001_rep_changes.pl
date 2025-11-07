@@ -1,5 +1,5 @@
 
-# Copyright (c) 2021-2024, PostgreSQL Global Development Group
+# Copyright (c) 2021-2025, PostgreSQL Global Development Group
 
 # Basic logical replication test
 use strict;
@@ -113,6 +113,9 @@ $node_subscriber->safe_psql('postgres',
 # Wait for initial table sync to finish
 $node_subscriber->wait_for_subscription_sync($node_publisher, 'tap_sub');
 
+# Reset IO statistics, for the WAL sender check with pg_stat_io.
+$node_publisher->safe_psql('postgres', "SELECT pg_stat_reset_shared('io')");
+
 my $result =
   $node_subscriber->safe_psql('postgres', "SELECT count(*) FROM tab_notrep");
 is($result, qq(0), 'check non-replicated table is empty on subscriber');
@@ -183,6 +186,19 @@ is( $node_subscriber->safe_psql(
 $result =
   $node_subscriber->safe_psql('postgres', "SELECT count(*) FROM tab_no_col");
 is($result, qq(2), 'check replicated changes for table having no columns');
+
+# Wait for the logical WAL sender to update its IO statistics.  This is
+# done before the next restart, which would force a flush of its stats, and
+# far enough from the reset done above to not impact the run time.
+$node_publisher->poll_query_until(
+	'postgres',
+	qq[SELECT sum(reads) > 0
+       FROM pg_catalog.pg_stat_io
+       WHERE backend_type = 'walsender'
+       AND object = 'wal']
+  )
+  or die
+  "Timed out while waiting for the walsender to update its IO statistics";
 
 # insert some duplicate rows
 $node_publisher->safe_psql('postgres',
@@ -348,14 +364,17 @@ $node_publisher->safe_psql('postgres', "DELETE FROM tab_full_pk WHERE a = 2");
 $node_publisher->wait_for_catchup('tap_sub');
 
 my $logfile = slurp_file($node_subscriber->logfile, $log_location);
-ok( $logfile =~
-	  qr/conflict detected on relation "public.tab_full_pk": conflict=update_missing.*\n.*DETAIL:.* Could not find the row to be updated.*\n.*Remote tuple \(1, quux\); replica identity \(a\)=\(1\)/m,
+like(
+	$logfile,
+	qr/conflict detected on relation "public.tab_full_pk": conflict=update_missing.*\n.*DETAIL:.* Could not find the row to be updated.*\n.*Remote row \(1, quux\); replica identity \(a\)=\(1\)/m,
 	'update target row is missing');
-ok( $logfile =~
-	  qr/conflict detected on relation "public.tab_full": conflict=update_missing.*\n.*DETAIL:.* Could not find the row to be updated.*\n.*Remote tuple \(26\); replica identity full \(25\)/m,
+like(
+	$logfile,
+	qr/conflict detected on relation "public.tab_full": conflict=update_missing.*\n.*DETAIL:.* Could not find the row to be updated.*\n.*Remote row \(26\); replica identity full \(25\)/m,
 	'update target row is missing');
-ok( $logfile =~
-	  qr/conflict detected on relation "public.tab_full_pk": conflict=delete_missing.*\n.*DETAIL:.* Could not find the row to be deleted.*\n.*Replica identity \(a\)=\(2\)/m,
+like(
+	$logfile,
+	qr/conflict detected on relation "public.tab_full_pk": conflict=delete_missing.*\n.*DETAIL:.* Could not find the row to be deleted.*\n.*Replica identity \(a\)=\(2\)/m,
 	'delete target row is missing');
 
 $node_subscriber->append_conf('postgresql.conf',
@@ -499,7 +518,9 @@ $node_publisher->safe_psql('postgres', "INSERT INTO tab_notrep VALUES (11)");
 $node_publisher->wait_for_catchup('tap_sub');
 
 $logfile = slurp_file($node_publisher->logfile, $log_location);
-ok($logfile =~ qr/skipped replication of an empty transaction with XID/,
+like(
+	$logfile,
+	qr/skipped replication of an empty transaction with XID/,
 	'empty transaction is skipped');
 
 $result =
@@ -572,8 +593,9 @@ CREATE TABLE skip_wal();
 CREATE PUBLICATION tap_pub2 FOR TABLE skip_wal;
 ROLLBACK;
 });
-ok( $reterr =~
-	  m/WARNING:  "wal_level" is insufficient to publish logical changes/,
+like(
+	$reterr,
+	qr/WARNING:  "wal_level" is insufficient to publish logical changes/,
 	'CREATE PUBLICATION while "wal_level=minimal"');
 
 done_testing();

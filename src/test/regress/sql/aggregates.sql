@@ -182,6 +182,11 @@ SELECT newcnt(*) AS cnt_1000 FROM onek;
 SELECT oldcnt(*) AS cnt_1000 FROM onek;
 SELECT sum2(q1,q2) FROM int8_tbl;
 
+-- sanity checks
+SELECT sum(q1+q2), sum(q1)+sum(q2) FROM int8_tbl;
+SELECT sum(q1-q2), sum(q2-q1), sum(q1)-sum(q2) FROM int8_tbl;
+SELECT sum(q1*2000), sum(-q1*2000), 2000*sum(q1) FROM int8_tbl;
+
 -- test for outer-level aggregates
 
 -- this should work
@@ -507,42 +512,96 @@ create temp table p_t1_2 partition of p_t1 for values in(2);
 -- Ensure we can remove non-PK columns for partitioned tables.
 explain (costs off) select * from p_t1 group by a,b,c,d;
 
-create unique index t3_c_uidx on t3(c);
+create unique index t2_z_uidx on t2(z);
 
 -- Ensure we don't remove any columns from the GROUP BY for a unique
 -- index on a NULLable column.
-explain (costs off) select b,c from t3 group by b,c;
+explain (costs off) select y,z from t2 group by y,z;
 
 -- Make the column NOT NULL and ensure we remove the redundant column
-alter table t3 alter column c set not null;
-explain (costs off) select b,c from t3 group by b,c;
+alter table t2 alter column z set not null;
+explain (costs off) select y,z from t2 group by y,z;
 
 -- When there are multiple supporting unique indexes and the GROUP BY contains
 -- columns to cover all of those, ensure we pick the index with the least
 -- number of columns so that we can remove more columns from the GROUP BY.
-explain (costs off) select a,b,c from t3 group by a,b,c;
+explain (costs off) select x,y,z from t2 group by x,y,z;
 
 -- As above but try ordering the columns differently to ensure we get the
 -- same result.
-explain (costs off) select a,b,c from t3 group by c,a,b;
+explain (costs off) select x,y,z from t2 group by z,x,y;
 
 -- Ensure we don't use a partial index as proof of functional dependency
-drop index t3_c_uidx;
-create index t3_c_uidx on t3 (c) where c > 0;
-explain (costs off) select b,c from t3 group by b,c;
+drop index t2_z_uidx;
+create index t2_z_uidx on t2 (z) where z > 0;
+explain (costs off) select y,z from t2 group by y,z;
 
 -- A unique index defined as NULLS NOT DISTINCT does not need a supporting NOT
 -- NULL constraint on the indexed columns.  Ensure the redundant columns are
 -- removed from the GROUP BY for such a table.
-drop index t3_c_uidx;
-alter table t3 alter column c drop not null;
-create unique index t3_c_uidx on t3(c) nulls not distinct;
-explain (costs off) select b,c from t3 group by b,c;
+drop index t2_z_uidx;
+alter table t2 alter column z drop not null;
+create unique index t2_z_uidx on t2(z) nulls not distinct;
+explain (costs off) select y,z from t2 group by y,z;
 
 drop table t1 cascade;
 drop table t2;
 drop table t3;
 drop table p_t1;
+
+--
+-- Test GROUP BY ALL
+--
+-- We don't care about the data here, just the proper transformation of the
+-- GROUP BY clause, so test some queries and verify the EXPLAIN plans.
+--
+
+CREATE TEMP TABLE t1 (
+  a int,
+  b int,
+  c int
+);
+
+-- basic example
+EXPLAIN (COSTS OFF) SELECT b, COUNT(*) FROM t1 GROUP BY ALL;
+
+-- multiple columns, non-consecutive order
+EXPLAIN (COSTS OFF) SELECT a, SUM(b), b FROM t1 GROUP BY ALL;
+
+-- multi columns, no aggregate
+EXPLAIN (COSTS OFF) SELECT a + b FROM t1 GROUP BY ALL;
+
+-- check we detect a non-top-level aggregate
+EXPLAIN (COSTS OFF) SELECT a, SUM(b) + 4 FROM t1 GROUP BY ALL;
+
+-- including grouped column is okay
+EXPLAIN (COSTS OFF) SELECT a, SUM(b) + a FROM t1 GROUP BY ALL;
+
+-- including non-grouped column, not so much
+EXPLAIN (COSTS OFF) SELECT a, SUM(b) + c FROM t1 GROUP BY ALL;
+
+-- all aggregates, should reduce to GROUP BY ()
+EXPLAIN (COSTS OFF) SELECT COUNT(a), SUM(b) FROM t1 GROUP BY ALL;
+
+-- likewise with empty target list
+EXPLAIN (COSTS OFF) SELECT FROM t1 GROUP BY ALL;
+
+-- window functions are not to be included in GROUP BY, either
+EXPLAIN (COSTS OFF) SELECT a, COUNT(a) OVER (PARTITION BY a) FROM t1 GROUP BY ALL;
+
+-- all cols
+EXPLAIN (COSTS OFF) SELECT *, count(*) FROM t1 GROUP BY ALL;
+
+-- group by all with grouping element(s) (equivalent to GROUP BY's
+-- default behavior, explicit antithesis to GROUP BY DISTINCT)
+EXPLAIN (COSTS OFF) SELECT a, count(*) FROM t1 GROUP BY ALL a;
+
+-- verify deparsing of GROUP BY ALL
+CREATE TEMP VIEW v1 AS SELECT b, COUNT(*) FROM t1 GROUP BY ALL;
+SELECT pg_get_viewdef('v1'::regclass);
+
+DROP VIEW v1;
+DROP TABLE t1;
 
 --
 -- Test GROUP BY matching of join columns that are type-coerced due to USING
@@ -632,6 +691,25 @@ set enable_presorted_aggregate to off;
 explain (costs off)
 select sum(two order by two) from tenk1;
 reset enable_presorted_aggregate;
+
+--
+-- Test cases with FILTER clause
+--
+
+-- Ensure we presort when the aggregate contains plain Vars
+explain (costs off)
+select sum(two order by two) filter (where two > 1) from tenk1;
+
+-- Ensure we presort for RelabelType'd Vars
+explain (costs off)
+select string_agg(distinct f1, ',') filter (where length(f1) > 1)
+from varchar_tbl;
+
+-- Ensure we don't presort when the aggregate's argument contains an
+-- explicit cast.
+explain (costs off)
+select string_agg(distinct f1::varchar(2), ',') filter (where length(f1) > 1)
+from varchar_tbl;
 
 --
 -- Test combinations of DISTINCT and/or ORDER BY
@@ -852,10 +930,15 @@ select * from v_pagg_test order by y;
 -- Ensure parallel aggregation is actually being used.
 explain (costs off) select * from v_pagg_test order by y;
 
-set max_parallel_workers_per_gather = 0;
-
 -- Ensure results are the same without parallel aggregation.
+set max_parallel_workers_per_gather = 0;
 select * from v_pagg_test order by y;
+
+-- Check that we don't fail on anonymous record types.
+set max_parallel_workers_per_gather = 2;
+explain (costs off)
+select array_dims(array_agg(s)) from (select * from pagg_test) s;
+select array_dims(array_agg(s)) from (select * from pagg_test) s;
 
 -- Clean up
 reset max_parallel_workers_per_gather;
@@ -1480,15 +1563,6 @@ select v||'a', case v||'a' when 'aa' then 1 else 0 end, count(*)
 select v||'a', case when v||'a' = 'aa' then 1 else 0 end, count(*)
   from unnest(array['a','b']) u(v)
  group by v||'a' order by 1;
-
--- Make sure that generation of HashAggregate for uniqification purposes
--- does not lead to array overflow due to unexpected duplicate hash keys
--- see CAFeeJoKKu0u+A_A9R9316djW-YW3-+Gtgvy3ju655qRHR3jtdA@mail.gmail.com
-set enable_memoize to off;
-explain (costs off)
-  select 1 from tenk1
-   where (hundred, thousand) in (select twothousand, twothousand from onek);
-reset enable_memoize;
 
 --
 -- Hash Aggregation Spill tests

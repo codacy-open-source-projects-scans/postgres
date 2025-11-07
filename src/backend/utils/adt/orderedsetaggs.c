@@ -3,7 +3,7 @@
  * orderedsetaggs.c
  *		Ordered-set aggregate functions.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -660,8 +660,8 @@ pct_info_cmp(const void *pa, const void *pb)
  */
 static struct pct_info *
 setup_pct_info(int num_percentiles,
-			   Datum *percentiles_datum,
-			   bool *percentiles_null,
+			   const Datum *percentiles_datum,
+			   const bool *percentiles_null,
 			   int64 rowcount,
 			   bool continuous)
 {
@@ -1007,7 +1007,7 @@ percentile_cont_float8_multi_final(PG_FUNCTION_ARGS)
 											  FLOAT8OID,
 	/* hard-wired info on type float8 */
 											  sizeof(float8),
-											  FLOAT8PASSBYVAL,
+											  true,
 											  TYPALIGN_DOUBLE,
 											  float8_lerp);
 }

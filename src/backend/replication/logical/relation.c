@@ -2,7 +2,7 @@
  * relation.c
  *	   PostgreSQL logical replication relation mapping cache
  *
- * Copyright (c) 2016-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2016-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/replication/logical/relation.c
@@ -27,6 +27,7 @@
 #include "replication/logicalrelation.h"
 #include "replication/worker_internal.h"
 #include "utils/inval.h"
+#include "utils/lsyscache.h"
 #include "utils/syscache.h"
 
 
@@ -195,6 +196,17 @@ logicalrep_relmap_update(LogicalRepRelation *remoterel)
 		entry->remoterel.atttyps[i] = remoterel->atttyps[i];
 	}
 	entry->remoterel.replident = remoterel->replident;
+
+	/*
+	 * XXX The walsender currently does not transmit the relkind of the remote
+	 * relation when replicating changes. Since we support replicating only
+	 * table changes at present, we default to initializing relkind as
+	 * RELKIND_RELATION. This is needed in CheckSubscriptionRelkind() to check
+	 * if the publisher and subscriber relation kinds are compatible.
+	 */
+	entry->remoterel.relkind =
+		(remoterel->relkind == 0) ? RELKIND_RELATION : remoterel->relkind;
+
 	entry->remoterel.attkeys = bms_copy(remoterel->attkeys);
 	MemoryContextSwitchTo(oldctx);
 }
@@ -237,7 +249,7 @@ logicalrep_get_attrs_str(LogicalRepRelation *remoterel, Bitmapset *atts)
 	{
 		attcnt++;
 		if (attcnt > 1)
-			appendStringInfo(&attsbuf, _(", "));
+			appendStringInfoString(&attsbuf, _(", "));
 
 		appendStringInfo(&attsbuf, _("\"%s\""), remoterel->attnames[i]);
 	}
@@ -424,6 +436,7 @@ logicalrep_rel_open(LogicalRepRelId remoteid, LOCKMODE lockmode)
 
 		/* Check for supported relkind. */
 		CheckSubscriptionRelkind(entry->localrel->rd_rel->relkind,
+								 remoterel->relkind,
 								 remoterel->nspname, remoterel->relname);
 
 		/*
@@ -835,7 +848,10 @@ IsIndexUsableForReplicaIdentityFull(Relation idxrel, AttrMap *attrmap)
 	/* Ensure that the index has a valid equal strategy for each key column */
 	for (int i = 0; i < idxrel->rd_index->indnkeyatts; i++)
 	{
-		if (get_equal_strategy_number(indclass->values[i]) == InvalidStrategy)
+		Oid			opfamily;
+
+		opfamily = get_opclass_family(indclass->values[i]);
+		if (IndexAmTranslateCompareType(COMPARE_EQ, idxrel->rd_rel->relam, opfamily, true) == InvalidStrategy)
 			return false;
 	}
 

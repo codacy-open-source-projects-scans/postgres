@@ -140,7 +140,7 @@
  *	SLRU per-bank locks
  *		- Protects SerialSlruCtl
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -168,7 +168,7 @@
  *		PredicateLockRelation(Relation relation, Snapshot snapshot)
  *		PredicateLockPage(Relation relation, BlockNumber blkno,
  *						Snapshot snapshot)
- *		PredicateLockTID(Relation relation, ItemPointer tid, Snapshot snapshot,
+ *		PredicateLockTID(Relation relation, const ItemPointerData *tid, Snapshot snapshot,
  *						 TransactionId tuple_xid)
  *		PredicateLockPageSplit(Relation relation, BlockNumber oldblkno,
  *							   BlockNumber newblkno)
@@ -180,7 +180,7 @@
  * conflict detection (may also trigger rollback)
  *		CheckForSerializableConflictOut(Relation relation, TransactionId xid,
  *										Snapshot snapshot)
- *		CheckForSerializableConflictIn(Relation relation, ItemPointer tid,
+ *		CheckForSerializableConflictIn(Relation relation, const ItemPointerData *tid,
  *									   BlockNumber blkno)
  *		CheckTableForSerializableConflictIn(Relation relation)
  *
@@ -191,7 +191,7 @@
  *		AtPrepare_PredicateLocks(void);
  *		PostPrepare_PredicateLocks(TransactionId xid);
  *		PredicateLockTwoPhaseFinish(TransactionId xid, bool isCommit);
- *		predicatelock_twophase_recover(TransactionId xid, uint16 info,
+ *		predicatelock_twophase_recover(FullTransactionId fxid, uint16 info,
  *									   void *recdata, uint32 len);
  */
 
@@ -1145,7 +1145,7 @@ void
 PredicateLockShmemInit(void)
 {
 	HASHCTL		info;
-	long		max_table_size;
+	int64		max_table_size;
 	Size		requestSize;
 	bool		found;
 
@@ -1226,13 +1226,20 @@ PredicateLockShmemInit(void)
 	 */
 	max_table_size *= 10;
 
+	requestSize = add_size(PredXactListDataSize,
+						   (mul_size((Size) max_table_size,
+									 sizeof(SERIALIZABLEXACT))));
+
 	PredXact = ShmemInitStruct("PredXactList",
-							   PredXactListDataSize,
+							   requestSize,
 							   &found);
 	Assert(found == IsUnderPostmaster);
 	if (!found)
 	{
 		int			i;
+
+		/* clean everything, both the header and the element */
+		memset(PredXact, 0, requestSize);
 
 		dlist_init(&PredXact->availableList);
 		dlist_init(&PredXact->activeList);
@@ -1242,11 +1249,9 @@ PredicateLockShmemInit(void)
 		PredXact->LastSxactCommitSeqNo = FirstNormalSerCommitSeqNo - 1;
 		PredXact->CanPartialClearThrough = 0;
 		PredXact->HavePartialClearedThrough = 0;
-		requestSize = mul_size((Size) max_table_size,
-							   sizeof(SERIALIZABLEXACT));
-		PredXact->element = ShmemAlloc(requestSize);
+		PredXact->element
+			= (SERIALIZABLEXACT *) ((char *) PredXact + PredXactListDataSize);
 		/* Add all elements to available list, clean. */
-		memset(PredXact->element, 0, requestSize);
 		for (i = 0; i < max_table_size; i++)
 		{
 			LWLockInitialize(&PredXact->element[i].perXactPredicateListLock,
@@ -1300,20 +1305,25 @@ PredicateLockShmemInit(void)
 	 */
 	max_table_size *= 5;
 
+	requestSize = RWConflictPoolHeaderDataSize +
+		mul_size((Size) max_table_size,
+				 RWConflictDataSize);
+
 	RWConflictPool = ShmemInitStruct("RWConflictPool",
-									 RWConflictPoolHeaderDataSize,
+									 requestSize,
 									 &found);
 	Assert(found == IsUnderPostmaster);
 	if (!found)
 	{
 		int			i;
 
+		/* clean everything, including the elements */
+		memset(RWConflictPool, 0, requestSize);
+
 		dlist_init(&RWConflictPool->availableList);
-		requestSize = mul_size((Size) max_table_size,
-							   RWConflictDataSize);
-		RWConflictPool->element = ShmemAlloc(requestSize);
+		RWConflictPool->element = (RWConflict) ((char *) RWConflictPool +
+												RWConflictPoolHeaderDataSize);
 		/* Add all elements to available list, clean. */
-		memset(RWConflictPool->element, 0, requestSize);
 		for (i = 0; i < max_table_size; i++)
 		{
 			dlist_push_tail(&RWConflictPool->availableList,
@@ -2608,7 +2618,7 @@ PredicateLockPage(Relation relation, BlockNumber blkno, Snapshot snapshot)
  * Skip if this is a temporary table.
  */
 void
-PredicateLockTID(Relation relation, ItemPointer tid, Snapshot snapshot,
+PredicateLockTID(Relation relation, const ItemPointerData *tid, Snapshot snapshot,
 				 TransactionId tuple_xid)
 {
 	PREDICATELOCKTARGETTAG tag;
@@ -4323,7 +4333,7 @@ CheckTargetForConflictsIn(PREDICATELOCKTARGETTAG *targettag)
  * tuple itself.
  */
 void
-CheckForSerializableConflictIn(Relation relation, ItemPointer tid, BlockNumber blkno)
+CheckForSerializableConflictIn(Relation relation, const ItemPointerData *tid, BlockNumber blkno)
 {
 	PREDICATELOCKTARGETTAG targettag;
 
@@ -4846,7 +4856,7 @@ AtPrepare_PredicateLocks(void)
  *		anyway. We only need to clean up our local state.
  */
 void
-PostPrepare_PredicateLocks(TransactionId xid)
+PostPrepare_PredicateLocks(FullTransactionId fxid)
 {
 	if (MySerializableXact == InvalidSerializableXact)
 		return;
@@ -4869,12 +4879,12 @@ PostPrepare_PredicateLocks(TransactionId xid)
  *		commits or aborts.
  */
 void
-PredicateLockTwoPhaseFinish(TransactionId xid, bool isCommit)
+PredicateLockTwoPhaseFinish(FullTransactionId fxid, bool isCommit)
 {
 	SERIALIZABLEXID *sxid;
 	SERIALIZABLEXIDTAG sxidtag;
 
-	sxidtag.xid = xid;
+	sxidtag.xid = XidFromFullTransactionId(fxid);
 
 	LWLockAcquire(SerializableXactHashLock, LW_SHARED);
 	sxid = (SERIALIZABLEXID *)
@@ -4896,10 +4906,11 @@ PredicateLockTwoPhaseFinish(TransactionId xid, bool isCommit)
  * Re-acquire a predicate lock belonging to a transaction that was prepared.
  */
 void
-predicatelock_twophase_recover(TransactionId xid, uint16 info,
+predicatelock_twophase_recover(FullTransactionId fxid, uint16 info,
 							   void *recdata, uint32 len)
 {
 	TwoPhasePredicateRecord *record;
+	TransactionId xid = XidFromFullTransactionId(fxid);
 
 	Assert(len == sizeof(TwoPhasePredicateRecord));
 

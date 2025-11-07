@@ -7,7 +7,7 @@
  * information for an old server, but not to fail outright.  (But failing
  * against a pre-9.2 server is allowed.)
  *
- * Copyright (c) 2000-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2025, PostgreSQL Global Development Group
  *
  * src/bin/psql/describe.c
  */
@@ -24,6 +24,7 @@
 #include "catalog/pg_constraint_d.h"
 #include "catalog/pg_default_acl_d.h"
 #include "catalog/pg_proc_d.h"
+#include "catalog/pg_publication_d.h"
 #include "catalog/pg_statistic_ext_d.h"
 #include "catalog/pg_subscription_d.h"
 #include "catalog/pg_type_d.h"
@@ -295,6 +296,7 @@ describeFunctions(const char *functypes, const char *func_pattern,
 				  char **arg_patterns, int num_arg_patterns,
 				  bool verbose, bool showSystem)
 {
+	const char *df_options = "anptwSx+";
 	bool		showAggregate = strchr(functypes, 'a') != NULL;
 	bool		showNormal = strchr(functypes, 'n') != NULL;
 	bool		showProcedure = strchr(functypes, 'p') != NULL;
@@ -304,14 +306,14 @@ describeFunctions(const char *functypes, const char *func_pattern,
 	PQExpBufferData buf;
 	PGresult   *res;
 	printQueryOpt myopt = pset.popt;
-	static const bool translate_columns[] = {false, false, false, false, true, true, true, false, true, false, false, false, false};
+	static const bool translate_columns[] = {false, false, false, false, true, true, true, false, true, true, false, false, false, false};
 
 	/* No "Parallel" column before 9.6 */
-	static const bool translate_columns_pre_96[] = {false, false, false, false, true, true, false, true, false, false, false, false};
+	static const bool translate_columns_pre_96[] = {false, false, false, false, true, true, false, true, true, false, false, false, false};
 
-	if (strlen(functypes) != strspn(functypes, "anptwS+"))
+	if (strlen(functypes) != strspn(functypes, df_options))
 	{
-		pg_log_error("\\df only takes [anptwS+] as options");
+		pg_log_error("\\df only takes [%s] as options", df_options);
 		return true;
 	}
 
@@ -409,11 +411,15 @@ describeFunctions(const char *functypes, const char *func_pattern,
 							  gettext_noop("Parallel"));
 		appendPQExpBuffer(&buf,
 						  ",\n pg_catalog.pg_get_userbyid(p.proowner) as \"%s\""
-						  ",\n CASE WHEN prosecdef THEN '%s' ELSE '%s' END AS \"%s\"",
+						  ",\n CASE WHEN prosecdef THEN '%s' ELSE '%s' END AS \"%s\""
+						  ",\n CASE WHEN p.proleakproof THEN '%s' ELSE '%s' END as \"%s\"",
 						  gettext_noop("Owner"),
 						  gettext_noop("definer"),
 						  gettext_noop("invoker"),
-						  gettext_noop("Security"));
+						  gettext_noop("Security"),
+						  gettext_noop("yes"),
+						  gettext_noop("no"),
+						  gettext_noop("Leakproof?"));
 		appendPQExpBufferStr(&buf, ",\n ");
 		printACLColumn(&buf, "p.proacl");
 		appendPQExpBuffer(&buf,
@@ -792,6 +798,7 @@ describeOperators(const char *oper_pattern,
 	PQExpBufferData buf;
 	PGresult   *res;
 	printQueryOpt myopt = pset.popt;
+	static const bool translate_columns[] = {false, false, false, false, false, false, true, false};
 
 	initPQExpBuffer(&buf);
 
@@ -825,8 +832,12 @@ describeOperators(const char *oper_pattern,
 
 	if (verbose)
 		appendPQExpBuffer(&buf,
-						  "  o.oprcode AS \"%s\",\n",
-						  gettext_noop("Function"));
+						  "  o.oprcode AS \"%s\",\n"
+						  "  CASE WHEN p.proleakproof THEN '%s' ELSE '%s' END AS \"%s\",\n",
+						  gettext_noop("Function"),
+						  gettext_noop("yes"),
+						  gettext_noop("no"),
+						  gettext_noop("Leakproof?"));
 
 	appendPQExpBuffer(&buf,
 					  "  coalesce(pg_catalog.obj_description(o.oid, 'pg_operator'),\n"
@@ -850,6 +861,10 @@ describeOperators(const char *oper_pattern,
 							 "     LEFT JOIN pg_catalog.pg_type t0 ON t0.oid = o.oprright\n"
 							 "     LEFT JOIN pg_catalog.pg_namespace nt0 ON nt0.oid = t0.typnamespace\n");
 	}
+
+	if (verbose)
+		appendPQExpBufferStr(&buf,
+							 "     LEFT JOIN pg_catalog.pg_proc p ON p.oid = o.oprcode\n");
 
 	if (!showSystem && !oper_pattern)
 		appendPQExpBufferStr(&buf, "WHERE n.nspname <> 'pg_catalog'\n"
@@ -908,6 +923,8 @@ describeOperators(const char *oper_pattern,
 
 	myopt.title = _("List of operators");
 	myopt.translate_header = true;
+	myopt.translate_columns = translate_columns;
+	myopt.n_translate_columns = lengthof(translate_columns);
 
 	printQuery(res, &myopt, pset.queryFout, false, pset.logfile);
 
@@ -1206,7 +1223,9 @@ listDefaultACLs(const char *pattern)
 	printfPQExpBuffer(&buf,
 					  "SELECT pg_catalog.pg_get_userbyid(d.defaclrole) AS \"%s\",\n"
 					  "  n.nspname AS \"%s\",\n"
-					  "  CASE d.defaclobjtype WHEN '%c' THEN '%s' WHEN '%c' THEN '%s' WHEN '%c' THEN '%s' WHEN '%c' THEN '%s' WHEN '%c' THEN '%s' END AS \"%s\",\n"
+					  "  CASE d.defaclobjtype "
+					  "    WHEN '%c' THEN '%s' WHEN '%c' THEN '%s' WHEN '%c' THEN '%s'"
+					  "    WHEN '%c' THEN '%s' WHEN '%c' THEN '%s' WHEN '%c' THEN '%s' END AS \"%s\",\n"
 					  "  ",
 					  gettext_noop("Owner"),
 					  gettext_noop("Schema"),
@@ -1220,6 +1239,8 @@ listDefaultACLs(const char *pattern)
 					  gettext_noop("type"),
 					  DEFACLOBJ_NAMESPACE,
 					  gettext_noop("schema"),
+					  DEFACLOBJ_LARGEOBJECT,
+					  gettext_noop("large object"),
 					  gettext_noop("Type"));
 
 	printACLColumn(&buf, "d.defaclacl");
@@ -1725,7 +1746,7 @@ describeOneTableDetails(const char *schemaname,
 		*(PQgetvalue(res, 0, 13)) : 'd';
 	if (pset.sversion >= 120000)
 		tableinfo.relam = PQgetisnull(res, 0, 14) ?
-			(char *) NULL : pg_strdup(PQgetvalue(res, 0, 14));
+			NULL : pg_strdup(PQgetvalue(res, 0, 14));
 	else
 		tableinfo.relam = NULL;
 	PQclear(res);
@@ -1738,7 +1759,7 @@ describeOneTableDetails(const char *schemaname,
 	{
 		PGresult   *result = NULL;
 		printQueryOpt myopt = pset.popt;
-		char	   *footers[2] = {NULL, NULL};
+		char	   *footers[3] = {NULL, NULL, NULL};
 
 		if (pset.sversion >= 100000)
 		{
@@ -1834,6 +1855,39 @@ describeOneTableDetails(const char *schemaname,
 		}
 		PQclear(result);
 
+		/* Print any publications */
+		if (pset.sversion >= 190000)
+		{
+			printfPQExpBuffer(&buf, "SELECT pubname FROM pg_catalog.pg_publication p"
+							  "\nWHERE p.puballsequences"
+							  "\n AND pg_catalog.pg_relation_is_publishable('%s')"
+							  "\nORDER BY 1",
+							  oid);
+
+			result = PSQLexec(buf.data);
+			if (result)
+			{
+				int			nrows = PQntuples(result);
+
+				if (nrows > 0)
+				{
+					printfPQExpBuffer(&tmpbuf, _("Publications:"));
+					for (i = 0; i < nrows; i++)
+						appendPQExpBuffer(&tmpbuf, "\n    \"%s\"", PQgetvalue(result, i, 0));
+
+					/* Store in the first available footer slot */
+					if (footers[0] == NULL)
+						footers[0] = pg_strdup(tmpbuf.data);
+					else
+						footers[1] = pg_strdup(tmpbuf.data);
+
+					resetPQExpBuffer(&tmpbuf);
+				}
+
+				PQclear(result);
+			}
+		}
+
 		if (tableinfo.relpersistence == RELPERSISTENCE_UNLOGGED)
 			printfPQExpBuffer(&title, _("Unlogged sequence \"%s.%s\""),
 							  schemaname, relationname);
@@ -1849,6 +1903,7 @@ describeOneTableDetails(const char *schemaname,
 		printQuery(res, &myopt, pset.queryFout, false, pset.logfile);
 
 		free(footers[0]);
+		free(footers[1]);
 
 		retval = true;
 		goto error_return;		/* not an error, just return early */
@@ -2104,6 +2159,12 @@ describeOneTableDetails(const char *schemaname,
 			else if (generated[0] == ATTRIBUTE_GENERATED_STORED)
 			{
 				default_str = psprintf("generated always as (%s) stored",
+									   PQgetvalue(res, i, attrdef_col));
+				mustfree = true;
+			}
+			else if (generated[0] == ATTRIBUTE_GENERATED_VIRTUAL)
+			{
+				default_str = psprintf("generated always as (%s)",
 									   PQgetvalue(res, i, attrdef_col));
 				mustfree = true;
 			}
@@ -2528,136 +2589,124 @@ describeOneTableDetails(const char *schemaname,
 			PQclear(result);
 		}
 
-		/*
-		 * Print foreign-key constraints (there are none if no triggers,
-		 * except if the table is partitioned, in which case the triggers
-		 * appear in the partitions)
-		 */
-		if (tableinfo.hastriggers ||
-			tableinfo.relkind == RELKIND_PARTITIONED_TABLE)
+		/* Print foreign-key constraints */
+		if (pset.sversion >= 120000 &&
+			(tableinfo.ispartition || tableinfo.relkind == RELKIND_PARTITIONED_TABLE))
 		{
-			if (pset.sversion >= 120000 &&
-				(tableinfo.ispartition || tableinfo.relkind == RELKIND_PARTITIONED_TABLE))
-			{
-				/*
-				 * Put the constraints defined in this table first, followed
-				 * by the constraints defined in ancestor partitioned tables.
-				 */
-				printfPQExpBuffer(&buf,
-								  "SELECT conrelid = '%s'::pg_catalog.regclass AS sametable,\n"
-								  "       conname,\n"
-								  "       pg_catalog.pg_get_constraintdef(oid, true) AS condef,\n"
-								  "       conrelid::pg_catalog.regclass AS ontable\n"
-								  "  FROM pg_catalog.pg_constraint,\n"
-								  "       pg_catalog.pg_partition_ancestors('%s')\n"
-								  " WHERE conrelid = relid AND contype = " CppAsString2(CONSTRAINT_FOREIGN) " AND conparentid = 0\n"
-								  "ORDER BY sametable DESC, conname;",
-								  oid, oid);
-			}
-			else
-			{
-				printfPQExpBuffer(&buf,
-								  "SELECT true as sametable, conname,\n"
-								  "  pg_catalog.pg_get_constraintdef(r.oid, true) as condef,\n"
-								  "  conrelid::pg_catalog.regclass AS ontable\n"
-								  "FROM pg_catalog.pg_constraint r\n"
-								  "WHERE r.conrelid = '%s' AND r.contype = " CppAsString2(CONSTRAINT_FOREIGN) "\n",
-								  oid);
+			/*
+			 * Put the constraints defined in this table first, followed by
+			 * the constraints defined in ancestor partitioned tables.
+			 */
+			printfPQExpBuffer(&buf,
+							  "SELECT conrelid = '%s'::pg_catalog.regclass AS sametable,\n"
+							  "       conname,\n"
+							  "       pg_catalog.pg_get_constraintdef(oid, true) AS condef,\n"
+							  "       conrelid::pg_catalog.regclass AS ontable\n"
+							  "  FROM pg_catalog.pg_constraint,\n"
+							  "       pg_catalog.pg_partition_ancestors('%s')\n"
+							  " WHERE conrelid = relid AND contype = " CppAsString2(CONSTRAINT_FOREIGN) " AND conparentid = 0\n"
+							  "ORDER BY sametable DESC, conname;",
+							  oid, oid);
+		}
+		else
+		{
+			printfPQExpBuffer(&buf,
+							  "SELECT true as sametable, conname,\n"
+							  "  pg_catalog.pg_get_constraintdef(r.oid, true) as condef,\n"
+							  "  conrelid::pg_catalog.regclass AS ontable\n"
+							  "FROM pg_catalog.pg_constraint r\n"
+							  "WHERE r.conrelid = '%s' AND r.contype = " CppAsString2(CONSTRAINT_FOREIGN) "\n",
+							  oid);
 
-				if (pset.sversion >= 120000)
-					appendPQExpBufferStr(&buf, "     AND conparentid = 0\n");
-				appendPQExpBufferStr(&buf, "ORDER BY conname");
-			}
-
-			result = PSQLexec(buf.data);
-			if (!result)
-				goto error_return;
-			else
-				tuples = PQntuples(result);
-
-			if (tuples > 0)
-			{
-				int			i_sametable = PQfnumber(result, "sametable"),
-							i_conname = PQfnumber(result, "conname"),
-							i_condef = PQfnumber(result, "condef"),
-							i_ontable = PQfnumber(result, "ontable");
-
-				printTableAddFooter(&cont, _("Foreign-key constraints:"));
-				for (i = 0; i < tuples; i++)
-				{
-					/*
-					 * Print untranslated constraint name and definition. Use
-					 * a "TABLE tab" prefix when the constraint is defined in
-					 * a parent partitioned table.
-					 */
-					if (strcmp(PQgetvalue(result, i, i_sametable), "f") == 0)
-						printfPQExpBuffer(&buf, "    TABLE \"%s\" CONSTRAINT \"%s\" %s",
-										  PQgetvalue(result, i, i_ontable),
-										  PQgetvalue(result, i, i_conname),
-										  PQgetvalue(result, i, i_condef));
-					else
-						printfPQExpBuffer(&buf, "    \"%s\" %s",
-										  PQgetvalue(result, i, i_conname),
-										  PQgetvalue(result, i, i_condef));
-
-					printTableAddFooter(&cont, buf.data);
-				}
-			}
-			PQclear(result);
+			if (pset.sversion >= 120000)
+				appendPQExpBufferStr(&buf, "     AND conparentid = 0\n");
+			appendPQExpBufferStr(&buf, "ORDER BY conname");
 		}
 
-		/* print incoming foreign-key references */
-		if (tableinfo.hastriggers ||
-			tableinfo.relkind == RELKIND_PARTITIONED_TABLE)
+		result = PSQLexec(buf.data);
+		if (!result)
+			goto error_return;
+		else
+			tuples = PQntuples(result);
+
+		if (tuples > 0)
 		{
-			if (pset.sversion >= 120000)
-			{
-				printfPQExpBuffer(&buf,
-								  "SELECT conname, conrelid::pg_catalog.regclass AS ontable,\n"
-								  "       pg_catalog.pg_get_constraintdef(oid, true) AS condef\n"
-								  "  FROM pg_catalog.pg_constraint c\n"
-								  " WHERE confrelid IN (SELECT pg_catalog.pg_partition_ancestors('%s')\n"
-								  "                     UNION ALL VALUES ('%s'::pg_catalog.regclass))\n"
-								  "       AND contype = " CppAsString2(CONSTRAINT_FOREIGN) " AND conparentid = 0\n"
-								  "ORDER BY conname;",
-								  oid, oid);
-			}
-			else
-			{
-				printfPQExpBuffer(&buf,
-								  "SELECT conname, conrelid::pg_catalog.regclass AS ontable,\n"
-								  "       pg_catalog.pg_get_constraintdef(oid, true) AS condef\n"
-								  "  FROM pg_catalog.pg_constraint\n"
-								  " WHERE confrelid = %s AND contype = " CppAsString2(CONSTRAINT_FOREIGN) "\n"
-								  "ORDER BY conname;",
-								  oid);
-			}
+			int			i_sametable = PQfnumber(result, "sametable"),
+						i_conname = PQfnumber(result, "conname"),
+						i_condef = PQfnumber(result, "condef"),
+						i_ontable = PQfnumber(result, "ontable");
 
-			result = PSQLexec(buf.data);
-			if (!result)
-				goto error_return;
-			else
-				tuples = PQntuples(result);
-
-			if (tuples > 0)
+			printTableAddFooter(&cont, _("Foreign-key constraints:"));
+			for (i = 0; i < tuples; i++)
 			{
-				int			i_conname = PQfnumber(result, "conname"),
-							i_ontable = PQfnumber(result, "ontable"),
-							i_condef = PQfnumber(result, "condef");
-
-				printTableAddFooter(&cont, _("Referenced by:"));
-				for (i = 0; i < tuples; i++)
-				{
+				/*
+				 * Print untranslated constraint name and definition. Use a
+				 * "TABLE tab" prefix when the constraint is defined in a
+				 * parent partitioned table.
+				 */
+				if (strcmp(PQgetvalue(result, i, i_sametable), "f") == 0)
 					printfPQExpBuffer(&buf, "    TABLE \"%s\" CONSTRAINT \"%s\" %s",
 									  PQgetvalue(result, i, i_ontable),
 									  PQgetvalue(result, i, i_conname),
 									  PQgetvalue(result, i, i_condef));
+				else
+					printfPQExpBuffer(&buf, "    \"%s\" %s",
+									  PQgetvalue(result, i, i_conname),
+									  PQgetvalue(result, i, i_condef));
 
-					printTableAddFooter(&cont, buf.data);
-				}
+				printTableAddFooter(&cont, buf.data);
 			}
-			PQclear(result);
 		}
+		PQclear(result);
+
+		/* print incoming foreign-key references */
+		if (pset.sversion >= 120000)
+		{
+			printfPQExpBuffer(&buf,
+							  "SELECT conname, conrelid::pg_catalog.regclass AS ontable,\n"
+							  "       pg_catalog.pg_get_constraintdef(oid, true) AS condef\n"
+							  "  FROM pg_catalog.pg_constraint c\n"
+							  " WHERE confrelid IN (SELECT pg_catalog.pg_partition_ancestors('%s')\n"
+							  "                     UNION ALL VALUES ('%s'::pg_catalog.regclass))\n"
+							  "       AND contype = " CppAsString2(CONSTRAINT_FOREIGN) " AND conparentid = 0\n"
+							  "ORDER BY conname;",
+							  oid, oid);
+		}
+		else
+		{
+			printfPQExpBuffer(&buf,
+							  "SELECT conname, conrelid::pg_catalog.regclass AS ontable,\n"
+							  "       pg_catalog.pg_get_constraintdef(oid, true) AS condef\n"
+							  "  FROM pg_catalog.pg_constraint\n"
+							  " WHERE confrelid = %s AND contype = " CppAsString2(CONSTRAINT_FOREIGN) "\n"
+							  "ORDER BY conname;",
+							  oid);
+		}
+
+		result = PSQLexec(buf.data);
+		if (!result)
+			goto error_return;
+		else
+			tuples = PQntuples(result);
+
+		if (tuples > 0)
+		{
+			int			i_conname = PQfnumber(result, "conname"),
+						i_ontable = PQfnumber(result, "ontable"),
+						i_condef = PQfnumber(result, "condef");
+
+			printTableAddFooter(&cont, _("Referenced by:"));
+			for (i = 0; i < tuples; i++)
+			{
+				printfPQExpBuffer(&buf, "    TABLE \"%s\" CONSTRAINT \"%s\" %s",
+								  PQgetvalue(result, i, i_ontable),
+								  PQgetvalue(result, i, i_conname),
+								  PQgetvalue(result, i, i_condef));
+
+				printTableAddFooter(&cont, buf.data);
+			}
+		}
+		PQclear(result);
 
 		/* print any row-level policies */
 		if (pset.sversion >= 90500)
@@ -3092,7 +3141,8 @@ describeOneTableDetails(const char *schemaname,
 		{
 			printfPQExpBuffer(&buf,
 							  "SELECT c.conname, a.attname, c.connoinherit,\n"
-							  "  c.conislocal, c.coninhcount <> 0\n"
+							  "  c.conislocal, c.coninhcount <> 0,\n"
+							  "  c.convalidated\n"
 							  "FROM pg_catalog.pg_constraint c JOIN\n"
 							  "  pg_catalog.pg_attribute a ON\n"
 							  "    (a.attrelid = c.conrelid AND a.attnum = c.conkey[1])\n"
@@ -3115,14 +3165,16 @@ describeOneTableDetails(const char *schemaname,
 			{
 				bool		islocal = PQgetvalue(result, i, 3)[0] == 't';
 				bool		inherited = PQgetvalue(result, i, 4)[0] == 't';
+				bool		validated = PQgetvalue(result, i, 5)[0] == 't';
 
-				printfPQExpBuffer(&buf, "    \"%s\" NOT NULL \"%s\"%s",
+				printfPQExpBuffer(&buf, "    \"%s\" NOT NULL \"%s\"%s%s",
 								  PQgetvalue(result, i, 0),
 								  PQgetvalue(result, i, 1),
 								  PQgetvalue(result, i, 2)[0] == 't' ?
 								  " NO INHERIT" :
 								  islocal && inherited ? _(" (local, inherited)") :
-								  inherited ? _(" (inherited)") : "");
+								  inherited ? _(" (inherited)") : "",
+								  !validated ? " NOT VALID" : "");
 
 				printTableAddFooter(&cont, buf.data);
 			}
@@ -3995,14 +4047,18 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
 	bool		showSeq = strchr(tabtypes, 's') != NULL;
 	bool		showForeign = strchr(tabtypes, 'E') != NULL;
 
+	int			ntypes;
 	PQExpBufferData buf;
 	PGresult   *res;
 	printQueryOpt myopt = pset.popt;
 	int			cols_so_far;
 	bool		translate_columns[] = {false, false, true, false, false, false, false, false, false};
 
-	/* If tabtypes is empty, we default to \dtvmsE (but see also command.c) */
-	if (!(showTables || showIndexes || showViews || showMatViews || showSeq || showForeign))
+	/* Count the number of explicitly-requested relation types */
+	ntypes = showTables + showIndexes + showViews + showMatViews +
+		showSeq + showForeign;
+	/* If none, we default to \dtvmsE (but see also command.c) */
+	if (ntypes == 0)
 		showTables = showViews = showMatViews = showSeq = showForeign = true;
 
 	initPQExpBuffer(&buf);
@@ -4153,14 +4209,63 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
 	if (PQntuples(res) == 0 && !pset.quiet)
 	{
 		if (pattern)
-			pg_log_error("Did not find any relation named \"%s\".",
-						 pattern);
+		{
+			if (ntypes != 1)
+				pg_log_error("Did not find any relations named \"%s\".",
+							 pattern);
+			else if (showTables)
+				pg_log_error("Did not find any tables named \"%s\".",
+							 pattern);
+			else if (showIndexes)
+				pg_log_error("Did not find any indexes named \"%s\".",
+							 pattern);
+			else if (showViews)
+				pg_log_error("Did not find any views named \"%s\".",
+							 pattern);
+			else if (showMatViews)
+				pg_log_error("Did not find any materialized views named \"%s\".",
+							 pattern);
+			else if (showSeq)
+				pg_log_error("Did not find any sequences named \"%s\".",
+							 pattern);
+			else if (showForeign)
+				pg_log_error("Did not find any foreign tables named \"%s\".",
+							 pattern);
+			else				/* should not get here */
+				pg_log_error_internal("Did not find any ??? named \"%s\".",
+									  pattern);
+		}
 		else
-			pg_log_error("Did not find any relations.");
+		{
+			if (ntypes != 1)
+				pg_log_error("Did not find any relations.");
+			else if (showTables)
+				pg_log_error("Did not find any tables.");
+			else if (showIndexes)
+				pg_log_error("Did not find any indexes.");
+			else if (showViews)
+				pg_log_error("Did not find any views.");
+			else if (showMatViews)
+				pg_log_error("Did not find any materialized views.");
+			else if (showSeq)
+				pg_log_error("Did not find any sequences.");
+			else if (showForeign)
+				pg_log_error("Did not find any foreign tables.");
+			else				/* should not get here */
+				pg_log_error_internal("Did not find any ??? relations.");
+		}
 	}
 	else
 	{
-		myopt.title = _("List of relations");
+		myopt.title =
+			(ntypes != 1) ? _("List of relations") :
+			(showTables) ? _("List of tables") :
+			(showIndexes) ? _("List of indexes") :
+			(showViews) ? _("List of views") :
+			(showMatViews) ? _("List of materialized views") :
+			(showSeq) ? _("List of sequences") :
+			(showForeign) ? _("List of foreign tables") :
+			"List of ???";		/* should not get here */
 		myopt.translate_header = true;
 		myopt.translate_columns = translate_columns;
 		myopt.n_translate_columns = lengthof(translate_columns);
@@ -4886,7 +4991,7 @@ listCasts(const char *pattern, bool verbose)
 	PQExpBufferData buf;
 	PGresult   *res;
 	printQueryOpt myopt = pset.popt;
-	static const bool translate_columns[] = {false, false, false, true, false};
+	static const bool translate_columns[] = {false, false, false, true, true, false};
 
 	initPQExpBuffer(&buf);
 
@@ -4924,7 +5029,13 @@ listCasts(const char *pattern, bool verbose)
 
 	if (verbose)
 		appendPQExpBuffer(&buf,
-						  ",\n       d.description AS \"%s\"",
+						  ",\n       CASE WHEN p.proleakproof THEN '%s'\n"
+						  "            ELSE '%s'\n"
+						  "       END AS \"%s\",\n"
+						  "       d.description AS \"%s\"",
+						  gettext_noop("yes"),
+						  gettext_noop("no"),
+						  gettext_noop("Leakproof?"),
 						  gettext_noop("Description"));
 
 	/*
@@ -6107,13 +6218,16 @@ listExtensions(const char *pattern)
 	initPQExpBuffer(&buf);
 	printfPQExpBuffer(&buf,
 					  "SELECT e.extname AS \"%s\", "
-					  "e.extversion AS \"%s\", n.nspname AS \"%s\", c.description AS \"%s\"\n"
+					  "e.extversion AS \"%s\", ae.default_version AS \"%s\","
+					  "n.nspname AS \"%s\", d.description AS \"%s\"\n"
 					  "FROM pg_catalog.pg_extension e "
 					  "LEFT JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace "
-					  "LEFT JOIN pg_catalog.pg_description c ON c.objoid = e.oid "
-					  "AND c.classoid = 'pg_catalog.pg_extension'::pg_catalog.regclass\n",
+					  "LEFT JOIN pg_catalog.pg_description d ON d.objoid = e.oid "
+					  "AND d.classoid = 'pg_catalog.pg_extension'::pg_catalog.regclass "
+					  "LEFT JOIN pg_catalog.pg_available_extensions() ae(name, default_version, comment) ON ae.name = e.extname\n",
 					  gettext_noop("Name"),
 					  gettext_noop("Version"),
+					  gettext_noop("Default version"),
 					  gettext_noop("Schema"),
 					  gettext_noop("Description"));
 
@@ -6318,7 +6432,7 @@ listPublications(const char *pattern)
 	PQExpBufferData buf;
 	PGresult   *res;
 	printQueryOpt myopt = pset.popt;
-	static const bool translate_columns[] = {false, false, false, false, false, false, false, false, false};
+	static const bool translate_columns[] = {false, false, false, false, false, false, false, false, false, false};
 
 	if (pset.sversion < 100000)
 	{
@@ -6335,13 +6449,20 @@ listPublications(const char *pattern)
 	printfPQExpBuffer(&buf,
 					  "SELECT pubname AS \"%s\",\n"
 					  "  pg_catalog.pg_get_userbyid(pubowner) AS \"%s\",\n"
-					  "  puballtables AS \"%s\",\n"
-					  "  pubinsert AS \"%s\",\n"
-					  "  pubupdate AS \"%s\",\n"
-					  "  pubdelete AS \"%s\"",
+					  "  puballtables AS \"%s\"",
 					  gettext_noop("Name"),
 					  gettext_noop("Owner"),
-					  gettext_noop("All tables"),
+					  gettext_noop("All tables"));
+
+	if (pset.sversion >= 190000)
+		appendPQExpBuffer(&buf,
+						  ",\n  puballsequences AS \"%s\"",
+						  gettext_noop("All sequences"));
+
+	appendPQExpBuffer(&buf,
+					  ",\n  pubinsert AS \"%s\",\n"
+					  "  pubupdate AS \"%s\",\n"
+					  "  pubdelete AS \"%s\"",
 					  gettext_noop("Inserts"),
 					  gettext_noop("Updates"),
 					  gettext_noop("Deletes"));
@@ -6351,7 +6472,12 @@ listPublications(const char *pattern)
 						  gettext_noop("Truncates"));
 	if (pset.sversion >= 180000)
 		appendPQExpBuffer(&buf,
-						  ",\n  pubgencols AS \"%s\"",
+						  ",\n (CASE pubgencols\n"
+						  "    WHEN '%c' THEN 'none'\n"
+						  "    WHEN '%c' THEN 'stored'\n"
+						  "   END) AS \"%s\"",
+						  PUBLISH_GENCOLS_NONE,
+						  PUBLISH_GENCOLS_STORED,
 						  gettext_noop("Generated columns"));
 	if (pset.sversion >= 130000)
 		appendPQExpBuffer(&buf,
@@ -6447,6 +6573,7 @@ describePublications(const char *pattern)
 	bool		has_pubtruncate;
 	bool		has_pubgencols;
 	bool		has_pubviaroot;
+	bool		has_pubsequence;
 
 	PQExpBufferData title;
 	printTableContent cont;
@@ -6461,6 +6588,7 @@ describePublications(const char *pattern)
 		return true;
 	}
 
+	has_pubsequence = (pset.sversion >= 190000);
 	has_pubtruncate = (pset.sversion >= 110000);
 	has_pubgencols = (pset.sversion >= 180000);
 	has_pubviaroot = (pset.sversion >= 130000);
@@ -6470,16 +6598,44 @@ describePublications(const char *pattern)
 	printfPQExpBuffer(&buf,
 					  "SELECT oid, pubname,\n"
 					  "  pg_catalog.pg_get_userbyid(pubowner) AS owner,\n"
-					  "  puballtables, pubinsert, pubupdate, pubdelete");
+					  "  puballtables");
+
+	if (has_pubsequence)
+		appendPQExpBufferStr(&buf,
+							 ", puballsequences");
+	else
+		appendPQExpBufferStr(&buf,
+							 ", false AS puballsequences");
+
+	appendPQExpBufferStr(&buf,
+						 ", pubinsert, pubupdate, pubdelete");
+
 	if (has_pubtruncate)
 		appendPQExpBufferStr(&buf,
 							 ", pubtruncate");
-	if (has_pubgencols)
+	else
 		appendPQExpBufferStr(&buf,
-							 ", pubgencols");
+							 ", false AS pubtruncate");
+
+	if (has_pubgencols)
+		appendPQExpBuffer(&buf,
+						  ", (CASE pubgencols\n"
+						  "    WHEN '%c' THEN 'none'\n"
+						  "    WHEN '%c' THEN 'stored'\n"
+						  "   END) AS \"%s\"\n",
+						  PUBLISH_GENCOLS_NONE,
+						  PUBLISH_GENCOLS_STORED,
+						  gettext_noop("Generated columns"));
+	else
+		appendPQExpBufferStr(&buf,
+							 ", 'none' AS pubgencols");
+
 	if (has_pubviaroot)
 		appendPQExpBufferStr(&buf,
 							 ", pubviaroot");
+	else
+		appendPQExpBufferStr(&buf,
+							 ", false AS pubviaroot");
 
 	appendPQExpBufferStr(&buf,
 						 "\nFROM pg_catalog.pg_publication\n");
@@ -6528,6 +6684,8 @@ describePublications(const char *pattern)
 		bool		puballtables = strcmp(PQgetvalue(res, i, 3), "t") == 0;
 		printTableOpt myopt = pset.popt.topt;
 
+		if (has_pubsequence)
+			ncols++;
 		if (has_pubtruncate)
 			ncols++;
 		if (has_pubgencols)
@@ -6541,6 +6699,8 @@ describePublications(const char *pattern)
 
 		printTableAddHeader(&cont, gettext_noop("Owner"), true, align);
 		printTableAddHeader(&cont, gettext_noop("All tables"), true, align);
+		if (has_pubsequence)
+			printTableAddHeader(&cont, gettext_noop("All sequences"), true, align);
 		printTableAddHeader(&cont, gettext_noop("Inserts"), true, align);
 		printTableAddHeader(&cont, gettext_noop("Updates"), true, align);
 		printTableAddHeader(&cont, gettext_noop("Deletes"), true, align);
@@ -6553,15 +6713,17 @@ describePublications(const char *pattern)
 
 		printTableAddCell(&cont, PQgetvalue(res, i, 2), false, false);
 		printTableAddCell(&cont, PQgetvalue(res, i, 3), false, false);
-		printTableAddCell(&cont, PQgetvalue(res, i, 4), false, false);
+		if (has_pubsequence)
+			printTableAddCell(&cont, PQgetvalue(res, i, 4), false, false);
 		printTableAddCell(&cont, PQgetvalue(res, i, 5), false, false);
 		printTableAddCell(&cont, PQgetvalue(res, i, 6), false, false);
+		printTableAddCell(&cont, PQgetvalue(res, i, 7), false, false);
 		if (has_pubtruncate)
-			printTableAddCell(&cont, PQgetvalue(res, i, 7), false, false);
-		if (has_pubgencols)
 			printTableAddCell(&cont, PQgetvalue(res, i, 8), false, false);
-		if (has_pubviaroot)
+		if (has_pubgencols)
 			printTableAddCell(&cont, PQgetvalue(res, i, 9), false, false);
+		if (has_pubviaroot)
+			printTableAddCell(&cont, PQgetvalue(res, i, 10), false, false);
 
 		if (!puballtables)
 		{
@@ -6644,7 +6806,7 @@ describeSubscriptions(const char *pattern, bool verbose)
 	printQueryOpt myopt = pset.popt;
 	static const bool translate_columns[] = {false, false, false, false,
 		false, false, false, false, false, false, false, false, false, false,
-	false};
+	false, false, false, false};
 
 	if (pset.sversion < 100000)
 	{
@@ -6712,6 +6874,20 @@ describeSubscriptions(const char *pattern, bool verbose)
 			appendPQExpBuffer(&buf,
 							  ", subfailover AS \"%s\"\n",
 							  gettext_noop("Failover"));
+		if (pset.sversion >= 190000)
+		{
+			appendPQExpBuffer(&buf,
+							  ", subretaindeadtuples AS \"%s\"\n",
+							  gettext_noop("Retain dead tuples"));
+
+			appendPQExpBuffer(&buf,
+							  ", submaxretention AS \"%s\"\n",
+							  gettext_noop("Max retention duration"));
+
+			appendPQExpBuffer(&buf,
+							  ", subretentionactive AS \"%s\"\n",
+							  gettext_noop("Retention active"));
+		}
 
 		appendPQExpBuffer(&buf,
 						  ",  subsynccommit AS \"%s\"\n"
@@ -6987,7 +7163,7 @@ listOpFamilyOperators(const char *access_method_pattern,
 	printQueryOpt myopt = pset.popt;
 	bool		have_where = false;
 
-	static const bool translate_columns[] = {false, false, false, false, false, false};
+	static const bool translate_columns[] = {false, false, false, false, false, false, true};
 
 	initPQExpBuffer(&buf);
 
@@ -7015,8 +7191,15 @@ listOpFamilyOperators(const char *access_method_pattern,
 
 	if (verbose)
 		appendPQExpBuffer(&buf,
-						  ", ofs.opfname AS \"%s\"\n",
-						  gettext_noop("Sort opfamily"));
+						  ", ofs.opfname AS \"%s\",\n"
+						  "  CASE\n"
+						  "    WHEN p.proleakproof THEN '%s'\n"
+						  "    ELSE '%s'\n"
+						  "  END AS \"%s\"\n",
+						  gettext_noop("Sort opfamily"),
+						  gettext_noop("yes"),
+						  gettext_noop("no"),
+						  gettext_noop("Leakproof?"));
 	appendPQExpBufferStr(&buf,
 						 "FROM pg_catalog.pg_amop o\n"
 						 "  LEFT JOIN pg_catalog.pg_opfamily of ON of.oid = o.amopfamily\n"
@@ -7024,7 +7207,9 @@ listOpFamilyOperators(const char *access_method_pattern,
 						 "  LEFT JOIN pg_catalog.pg_namespace nsf ON of.opfnamespace = nsf.oid\n");
 	if (verbose)
 		appendPQExpBufferStr(&buf,
-							 "  LEFT JOIN pg_catalog.pg_opfamily ofs ON ofs.oid = o.amopsortfamily\n");
+							 "  LEFT JOIN pg_catalog.pg_opfamily ofs ON ofs.oid = o.amopsortfamily\n"
+							 "  LEFT JOIN pg_catalog.pg_operator op ON op.oid = o.amopopr\n"
+							 "  LEFT JOIN pg_catalog.pg_proc p ON p.oid = op.oprcode\n");
 
 	if (access_method_pattern)
 	{

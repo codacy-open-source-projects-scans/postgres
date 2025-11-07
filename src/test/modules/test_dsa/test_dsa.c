@@ -3,7 +3,7 @@
  * test_dsa.c
  *		Test dynamic shared memory areas (DSAs)
  *
- * Copyright (c) 2022-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2022-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		src/test/modules/test_dsa/test_dsa.c
@@ -29,8 +29,7 @@ test_dsa_basic(PG_FUNCTION_ARGS)
 	dsa_pointer p[100];
 
 	/* XXX: this tranche is leaked */
-	tranche_id = LWLockNewTrancheId();
-	LWLockRegisterTranche(tranche_id, "test_dsa");
+	tranche_id = LWLockNewTrancheId("test_dsa");
 
 	a = dsa_create(tranche_id);
 	for (int i = 0; i < 100; i++)
@@ -70,8 +69,7 @@ test_dsa_resowners(PG_FUNCTION_ARGS)
 	ResourceOwner childowner;
 
 	/* XXX: this tranche is leaked */
-	tranche_id = LWLockNewTrancheId();
-	LWLockRegisterTranche(tranche_id, "test_dsa");
+	tranche_id = LWLockNewTrancheId("test_dsa");
 
 	/* Create DSA in parent resource owner */
 	a = dsa_create(tranche_id);

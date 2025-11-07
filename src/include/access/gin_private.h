@@ -2,7 +2,7 @@
  * gin_private.h
  *	  header file for postgres inverted index access method implementation.
  *
- *	Copyright (c) 2006-2024, PostgreSQL Global Development Group
+ *	Copyright (c) 2006-2025, PostgreSQL Global Development Group
  *
  *	src/include/access/gin_private.h
  *--------------------------------------------------------------------------
@@ -13,6 +13,7 @@
 #include "access/amapi.h"
 #include "access/gin.h"
 #include "access/ginblock.h"
+#include "access/htup_details.h"
 #include "access/itup.h"
 #include "common/int.h"
 #include "catalog/pg_am_d.h"
@@ -109,6 +110,7 @@ extern Datum *ginExtractEntries(GinState *ginstate, OffsetNumber attnum,
 extern OffsetNumber gintuple_get_attrnum(GinState *ginstate, IndexTuple tuple);
 extern Datum gintuple_get_key(GinState *ginstate, IndexTuple tuple,
 							  GinNullCategory *category);
+extern char *ginbuildphasename(int64 phasenum);
 
 /* gininsert.c */
 extern IndexBuildResult *ginbuild(Relation heap, Relation index,
@@ -331,7 +333,7 @@ typedef struct GinScanKeyData
 	bool		curItemMatches;
 	bool		recheckCurItem;
 	bool		isFinished;
-}			GinScanKeyData;
+} GinScanKeyData;
 
 typedef struct GinScanEntryData
 {
@@ -353,7 +355,14 @@ typedef struct GinScanEntryData
 	/* for a partial-match or full-scan query, we accumulate all TIDs here */
 	TIDBitmap  *matchBitmap;
 	TBMPrivateIterator *matchIterator;
-	TBMIterateResult *matchResult;
+
+	/*
+	 * If blockno is InvalidBlockNumber, all of the other fields in the
+	 * matchResult are meaningless.
+	 */
+	TBMIterateResult matchResult;
+	OffsetNumber matchOffsets[TBM_MAX_TUPLES_PER_PAGE];
+	int			matchNtuples;
 
 	/* used for Posting list and one page in Posting tree */
 	ItemPointerData *list;
@@ -469,7 +478,7 @@ extern void ginInsertCleanup(GinState *ginstate, bool full_clean,
 
 /* ginpostinglist.c */
 
-extern GinPostingList *ginCompressPostingList(const ItemPointer ipd, int nipd,
+extern GinPostingList *ginCompressPostingList(const ItemPointerData *ipd, int nipd,
 											  int maxsize, int *nwritten);
 extern int	ginPostingListDecodeAllSegmentsToTbm(GinPostingList *ptr, int len, TIDBitmap *tbm);
 

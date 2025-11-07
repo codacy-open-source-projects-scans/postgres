@@ -1376,6 +1376,60 @@ synchronous_standby_names = 'ANY 2 (s1, s2, s3)'
    </sect3>
   </sect2>
 
+  <sect2 id="read-your-writes-consistency">
+   <title>Read-Your-Writes Consistency</title>
+
+   <para>
+    In asynchronous replication, there is always a short window where changes
+    on the primary may not yet be visible on the standby due to replication
+    lag. This can lead to inconsistencies when an application writes data on
+    the primary and then immediately issues a read query on the standby.
+    However, it is possible to address this without switching to synchronous
+    replication.
+   </para>
+
+   <para>
+    To address this, PostgreSQL offers a mechanism for read-your-writes
+    consistency. The key idea is to ensure that a client sees its own writes
+    by synchronizing the WAL replay on the standby with the known point of
+    change on the primary.
+   </para>
+
+   <para>
+    This is achieved by the following steps.  After performing write
+    operations, the application retrieves the current WAL location using a
+    function call like this.
+
+    <programlisting>
+postgres=# SELECT pg_current_wal_insert_lsn();
+pg_current_wal_insert_lsn
+--------------------
+0/306EE20
+(1 row)
+    </programlisting>
+   </para>
+
+   <para>
+    The <acronym>LSN</acronym> obtained from the primary is then communicated
+    to the standby server. This can be managed at the application level or
+    via the connection pooler.  On the standby, the application issues the
+    <xref linkend="sql-wait-for"/> command to block further processing until
+    the standby's WAL replay process reaches (or exceeds) the specified
+    <acronym>LSN</acronym>.
+
+    <programlisting>
+postgres=# WAIT FOR LSN '0/306EE20';
+ status
+--------
+ success
+(1 row)
+    </programlisting>
+    Once the command returns a status of success, it guarantees that all
+    changes up to the provided <acronym>LSN</acronym> have been applied,
+    ensuring that subsequent read queries will reflect the latest updates.
+   </para>
+  </sect2>
+
   <sect2 id="continuous-archiving-in-standby">
    <title>Continuous Archiving in Standby</title>
 
@@ -1535,7 +1589,8 @@ synchronous_standby_names = 'ANY 2 (s1, s2, s3)'
    <para>
     When the <xref linkend="guc-hot-standby"/> parameter is set to true on a
     standby server, it will begin accepting connections once the recovery has
-    brought the system to a consistent state.  All such connections are
+    brought the system to a consistent state and be ready for hot standby.
+    All such connections are
     strictly read-only; not even temporary tables may be written.
    </para>
 
@@ -1974,9 +2029,12 @@ LOG:  database system is ready to accept read-only connections
     Consistency information is recorded once per checkpoint on the primary.
     It is not possible to enable hot standby when reading WAL
     written during a period when <varname>wal_level</varname> was not set to
-    <literal>replica</literal> or <literal>logical</literal> on the primary.  Reaching
-    a consistent state can also be delayed in the presence of both of these
-    conditions:
+    <literal>replica</literal> or <literal>logical</literal> on the primary.
+    Even after reaching a consistent state, the recovery snapshot may not
+    be ready for hot standby if both of the following conditions are met,
+    delaying accepting read-only connections.  To enable hot standby,
+    long-lived write transactions with more than 64 subtransactions
+    need to be closed on the primary.
 
       <itemizedlist>
        <listitem>

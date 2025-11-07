@@ -3,7 +3,7 @@
  *	   Functionality for synchronizing slots to a standby server from the
  *         primary server.
  *
- * Copyright (c) 2024, PostgreSQL Global Development Group
+ * Copyright (c) 2024-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/replication/logical/slotsync.c
@@ -52,7 +52,6 @@
 #include "access/xlog_internal.h"
 #include "access/xlogrecovery.h"
 #include "catalog/pg_database.h"
-#include "commands/dbcommands.h"
 #include "libpq/pqsignal.h"
 #include "pgstat.h"
 #include "postmaster/interrupt.h"
@@ -139,6 +138,7 @@ typedef struct RemoteSlot
 	bool		failover;
 	XLogRecPtr	restart_lsn;
 	XLogRecPtr	confirmed_lsn;
+	XLogRecPtr	two_phase_at;
 	TransactionId catalog_xmin;
 
 	/* RS_INVAL_NONE if valid, or the reason of invalidation */
@@ -195,14 +195,14 @@ update_local_synced_slot(RemoteSlot *remote_slot, Oid remote_dbid,
 		 * restart_lsn or the initial xmin_horizon computed for the local slot
 		 * is ahead of the remote slot.
 		 *
-		 * If the slot is persistent, restart_lsn of the synced slot could
-		 * still be ahead of the remote slot. Since we use slot advance
-		 * functionality to keep snapbuild/slot updated, it is possible that
-		 * the restart_lsn is advanced to a later position than it has on the
-		 * primary. This can happen when slot advancing machinery finds
-		 * running xacts record after reaching the consistent state at a later
-		 * point than the primary where it serializes the snapshot and updates
-		 * the restart_lsn.
+		 * If the slot is persistent, both restart_lsn and catalog_xmin of the
+		 * synced slot could still be ahead of the remote slot. Since we use
+		 * slot advance functionality to keep snapbuild/slot updated, it is
+		 * possible that the restart_lsn and catalog_xmin are advanced to a
+		 * later position than it has on the primary. This can happen when
+		 * slot advancing machinery finds running xacts record after reaching
+		 * the consistent state at a later point than the primary where it
+		 * serializes the snapshot and updates the restart_lsn.
 		 *
 		 * We LOG the message if the slot is temporary as it can help the user
 		 * to understand why the slot is not sync-ready. In the case of a
@@ -210,9 +210,9 @@ update_local_synced_slot(RemoteSlot *remote_slot, Oid remote_dbid,
 		 * impact the users, so we used DEBUG1 level to log the message.
 		 */
 		ereport(slot->data.persistency == RS_TEMPORARY ? LOG : DEBUG1,
-				errmsg("could not synchronize replication slot \"%s\" because remote slot precedes local slot",
+				errmsg("could not synchronize replication slot \"%s\"",
 					   remote_slot->name),
-				errdetail("The remote slot has LSN %X/%X and catalog xmin %u, but the local slot has LSN %X/%X and catalog xmin %u.",
+				errdetail("Synchronization could lead to data loss, because the remote slot needs WAL at LSN %X/%08X and catalog xmin %u, but the standby has LSN %X/%08X and catalog xmin %u.",
 						  LSN_FORMAT_ARGS(remote_slot->restart_lsn),
 						  remote_slot->catalog_xmin,
 						  LSN_FORMAT_ARGS(slot->data.restart_lsn),
@@ -220,16 +220,25 @@ update_local_synced_slot(RemoteSlot *remote_slot, Oid remote_dbid,
 
 		if (remote_slot_precedes)
 			*remote_slot_precedes = true;
+
+		/*
+		 * Skip updating the configuration. This is required to avoid syncing
+		 * two_phase_at without syncing confirmed_lsn. Otherwise, the prepared
+		 * transaction between old confirmed_lsn and two_phase_at will
+		 * unexpectedly get decoded and sent to the downstream after
+		 * promotion. See comments in ReorderBufferFinishPrepared.
+		 */
+		return false;
 	}
 
 	/*
 	 * Attempt to sync LSNs and xmins only if remote slot is ahead of local
 	 * slot.
 	 */
-	else if (remote_slot->confirmed_lsn > slot->data.confirmed_flush ||
-			 remote_slot->restart_lsn > slot->data.restart_lsn ||
-			 TransactionIdFollows(remote_slot->catalog_xmin,
-								  slot->data.catalog_xmin))
+	if (remote_slot->confirmed_lsn > slot->data.confirmed_flush ||
+		remote_slot->restart_lsn > slot->data.restart_lsn ||
+		TransactionIdFollows(remote_slot->catalog_xmin,
+							 slot->data.catalog_xmin))
 	{
 		/*
 		 * We can't directly copy the remote slot's LSN or xmin unless there
@@ -265,7 +274,7 @@ update_local_synced_slot(RemoteSlot *remote_slot, Oid remote_dbid,
 				ereport(ERROR,
 						errmsg_internal("synchronized confirmed_flush for slot \"%s\" differs from remote slot",
 										remote_slot->name),
-						errdetail_internal("Remote slot has LSN %X/%X but local slot has LSN %X/%X.",
+						errdetail_internal("Remote slot has LSN %X/%08X but local slot has LSN %X/%08X.",
 										   LSN_FORMAT_ARGS(remote_slot->confirmed_lsn),
 										   LSN_FORMAT_ARGS(slot->data.confirmed_flush)));
 		}
@@ -276,7 +285,8 @@ update_local_synced_slot(RemoteSlot *remote_slot, Oid remote_dbid,
 	if (remote_dbid != slot->data.database ||
 		remote_slot->two_phase != slot->data.two_phase ||
 		remote_slot->failover != slot->data.failover ||
-		strcmp(remote_slot->plugin, NameStr(slot->data.plugin)) != 0)
+		strcmp(remote_slot->plugin, NameStr(slot->data.plugin)) != 0 ||
+		remote_slot->two_phase_at != slot->data.two_phase_at)
 	{
 		NameData	plugin_name;
 
@@ -287,10 +297,17 @@ update_local_synced_slot(RemoteSlot *remote_slot, Oid remote_dbid,
 		slot->data.plugin = plugin_name;
 		slot->data.database = remote_dbid;
 		slot->data.two_phase = remote_slot->two_phase;
+		slot->data.two_phase_at = remote_slot->two_phase_at;
 		slot->data.failover = remote_slot->failover;
 		SpinLockRelease(&slot->mutex);
 
 		updated_config = true;
+
+		/*
+		 * Ensure that there is no risk of sending prepared transactions
+		 * unexpectedly after the promotion.
+		 */
+		Assert(slot->data.two_phase_at <= slot->data.confirmed_flush);
 	}
 
 	/*
@@ -446,7 +463,7 @@ drop_local_obsolete_slots(List *remote_slot_list)
 
 			if (synced_slot)
 			{
-				ReplicationSlotAcquire(NameStr(local_slot->data.name), true);
+				ReplicationSlotAcquire(NameStr(local_slot->data.name), true, false);
 				ReplicationSlotDropAcquired();
 			}
 
@@ -476,7 +493,7 @@ reserve_wal_for_local_slot(XLogRecPtr restart_lsn)
 	ReplicationSlot *slot = MyReplicationSlot;
 
 	Assert(slot != NULL);
-	Assert(XLogRecPtrIsInvalid(slot->data.restart_lsn));
+	Assert(!XLogRecPtrIsValid(slot->data.restart_lsn));
 
 	while (true)
 	{
@@ -575,7 +592,7 @@ update_and_persist_local_synced_slot(RemoteSlot *remote_slot, Oid remote_dbid)
 	{
 		ereport(LOG,
 				errmsg("could not synchronize replication slot \"%s\"", remote_slot->name),
-				errdetail("Logical decoding could not find consistent point from local slot's LSN %X/%X.",
+				errdetail("Synchronization could lead to data loss, because the standby could not build a consistent snapshot to decode WALs at LSN %X/%08X.",
 						  LSN_FORMAT_ARGS(slot->data.restart_lsn)));
 
 		return false;
@@ -624,7 +641,7 @@ synchronize_one_slot(RemoteSlot *remote_slot, Oid remote_dbid)
 		ereport(AmLogicalSlotSyncWorkerProcess() ? LOG : ERROR,
 				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				errmsg("skipping slot synchronization because the received slot sync"
-					   " LSN %X/%X for slot \"%s\" is ahead of the standby position %X/%X",
+					   " LSN %X/%08X for slot \"%s\" is ahead of the standby position %X/%08X",
 					   LSN_FORMAT_ARGS(remote_slot->confirmed_lsn),
 					   remote_slot->name,
 					   LSN_FORMAT_ARGS(latestFlushPtr)));
@@ -665,7 +682,7 @@ synchronize_one_slot(RemoteSlot *remote_slot, Oid remote_dbid)
 		 * pre-check to ensure that at least one of the slot properties is
 		 * changed before acquiring the slot.
 		 */
-		ReplicationSlotAcquire(remote_slot->name, true);
+		ReplicationSlotAcquire(remote_slot->name, true, false);
 
 		Assert(slot == MyReplicationSlot);
 
@@ -715,7 +732,7 @@ synchronize_one_slot(RemoteSlot *remote_slot, Oid remote_dbid)
 				ereport(ERROR,
 						errmsg_internal("cannot synchronize local slot \"%s\"",
 										remote_slot->name),
-						errdetail_internal("Local slot's start streaming location LSN(%X/%X) is ahead of remote slot's LSN(%X/%X).",
+						errdetail_internal("Local slot's start streaming location LSN(%X/%08X) is ahead of remote slot's LSN(%X/%08X).",
 										   LSN_FORMAT_ARGS(slot->data.confirmed_flush),
 										   LSN_FORMAT_ARGS(remote_slot->confirmed_lsn)));
 
@@ -788,9 +805,9 @@ synchronize_one_slot(RemoteSlot *remote_slot, Oid remote_dbid)
 static bool
 synchronize_slots(WalReceiverConn *wrconn)
 {
-#define SLOTSYNC_COLUMN_COUNT 9
+#define SLOTSYNC_COLUMN_COUNT 10
 	Oid			slotRow[SLOTSYNC_COLUMN_COUNT] = {TEXTOID, TEXTOID, LSNOID,
-	LSNOID, XIDOID, BOOLOID, BOOLOID, TEXTOID, TEXTOID};
+	LSNOID, XIDOID, BOOLOID, LSNOID, BOOLOID, TEXTOID, TEXTOID};
 
 	WalRcvExecResult *res;
 	TupleTableSlot *tupslot;
@@ -798,7 +815,7 @@ synchronize_slots(WalReceiverConn *wrconn)
 	bool		some_slot_updated = false;
 	bool		started_tx = false;
 	const char *query = "SELECT slot_name, plugin, confirmed_flush_lsn,"
-		" restart_lsn, catalog_xmin, two_phase, failover,"
+		" restart_lsn, catalog_xmin, two_phase, two_phase_at, failover,"
 		" database, invalidation_reason"
 		" FROM pg_catalog.pg_replication_slots"
 		" WHERE failover and NOT temporary";
@@ -853,6 +870,9 @@ synchronize_slots(WalReceiverConn *wrconn)
 														   &isnull));
 		Assert(!isnull);
 
+		d = slot_getattr(tupslot, ++col, &isnull);
+		remote_slot->two_phase_at = isnull ? InvalidXLogRecPtr : DatumGetLSN(d);
+
 		remote_slot->failover = DatumGetBool(slot_getattr(tupslot, ++col,
 														  &isnull));
 		Assert(!isnull);
@@ -879,8 +899,8 @@ synchronize_slots(WalReceiverConn *wrconn)
 		 * pg_replication_slots view, then we can avoid fetching RS_EPHEMERAL
 		 * slots in the first place.
 		 */
-		if ((XLogRecPtrIsInvalid(remote_slot->restart_lsn) ||
-			 XLogRecPtrIsInvalid(remote_slot->confirmed_lsn) ||
+		if ((!XLogRecPtrIsValid(remote_slot->restart_lsn) ||
+			 !XLogRecPtrIsValid(remote_slot->confirmed_lsn) ||
 			 !TransactionIdIsValid(remote_slot->catalog_xmin)) &&
 			remote_slot->invalidated == RS_INVAL_NONE)
 			pfree(remote_slot);
@@ -1038,14 +1058,14 @@ ValidateSlotSyncParams(int elevel)
 {
 	/*
 	 * Logical slot sync/creation requires wal_level >= logical.
-	 *
-	 * Since altering the wal_level requires a server restart, so error out in
-	 * this case regardless of elevel provided by caller.
 	 */
 	if (wal_level < WAL_LEVEL_LOGICAL)
-		ereport(ERROR,
+	{
+		ereport(elevel,
 				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				errmsg("replication slot synchronization requires \"wal_level\" >= \"logical\""));
+		return false;
+	}
 
 	/*
 	 * A physical replication slot(primary_slot_name) is required on the
@@ -1150,7 +1170,7 @@ slotsync_reread_config(void)
  * Interrupt handler for main loop of slot sync worker.
  */
 static void
-ProcessSlotSyncInterrupts(WalReceiverConn *wrconn)
+ProcessSlotSyncInterrupts(void)
 {
 	CHECK_FOR_INTERRUPTS();
 
@@ -1317,7 +1337,7 @@ reset_syncing_flag()
 	SpinLockRelease(&SlotSyncCtx->mutex);
 
 	syncing_slots = false;
-};
+}
 
 /*
  * The main loop of our worker process.
@@ -1326,7 +1346,7 @@ reset_syncing_flag()
  * information periodically in order to create and sync the slots.
  */
 void
-ReplSlotSyncWorkerMain(char *startup_data, size_t startup_data_len)
+ReplSlotSyncWorkerMain(const void *startup_data, size_t startup_data_len)
 {
 	WalReceiverConn *wrconn = NULL;
 	char	   *dbname;
@@ -1456,13 +1476,14 @@ ReplSlotSyncWorkerMain(char *startup_data, size_t startup_data_len)
 	 */
 	wrconn = walrcv_connect(PrimaryConnInfo, false, false, false,
 							app_name.data, &err);
-	pfree(app_name.data);
 
 	if (!wrconn)
 		ereport(ERROR,
 				errcode(ERRCODE_CONNECTION_FAILURE),
 				errmsg("synchronization worker \"%s\" could not connect to the primary server: %s",
 					   app_name.data, err));
+
+	pfree(app_name.data);
 
 	/*
 	 * Register the disconnection callback.
@@ -1485,7 +1506,7 @@ ReplSlotSyncWorkerMain(char *startup_data, size_t startup_data_len)
 	{
 		bool		some_slot_updated = false;
 
-		ProcessSlotSyncInterrupts(wrconn);
+		ProcessSlotSyncInterrupts();
 
 		some_slot_updated = synchronize_slots(wrconn);
 
@@ -1541,9 +1562,7 @@ update_synced_slots_inactive_since(void)
 			if (now == 0)
 				now = GetCurrentTimestamp();
 
-			SpinLockAcquire(&s->mutex);
-			s->inactive_since = now;
-			SpinLockRelease(&s->mutex);
+			ReplicationSlotSetInactiveSince(s, now, true);
 		}
 	}
 
@@ -1617,8 +1636,9 @@ ShutDownSlotSync(void)
 /*
  * SlotSyncWorkerCanRestart
  *
- * Returns true if enough time (SLOTSYNC_RESTART_INTERVAL_SEC) has passed
- * since it was launched last. Otherwise returns false.
+ * Return true, indicating worker is allowed to restart, if enough time has
+ * passed since it was last launched to reach SLOTSYNC_RESTART_INTERVAL_SEC.
+ * Otherwise return false.
  *
  * This is a safety valve to protect against continuous respawn attempts if the
  * worker is dying immediately at launch. Note that since we will retry to
@@ -1630,14 +1650,19 @@ SlotSyncWorkerCanRestart(void)
 {
 	time_t		curtime = time(NULL);
 
-	/* Return false if too soon since last start. */
-	if ((unsigned int) (curtime - SlotSyncCtx->last_start_time) <
-		(unsigned int) SLOTSYNC_RESTART_INTERVAL_SEC)
-		return false;
-
-	SlotSyncCtx->last_start_time = curtime;
-
-	return true;
+	/*
+	 * If first time through, or time somehow went backwards, always update
+	 * last_start_time to match the current clock and allow worker start.
+	 * Otherwise allow it only once enough time has elapsed.
+	 */
+	if (SlotSyncCtx->last_start_time == 0 ||
+		curtime < SlotSyncCtx->last_start_time ||
+		curtime - SlotSyncCtx->last_start_time >= SLOTSYNC_RESTART_INTERVAL_SEC)
+	{
+		SlotSyncCtx->last_start_time = curtime;
+		return true;
+	}
+	return false;
 }
 
 /*

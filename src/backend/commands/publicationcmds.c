@@ -3,7 +3,7 @@
  * publicationcmds.c
  *		publication manipulation
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -29,7 +29,6 @@
 #include "catalog/pg_publication.h"
 #include "catalog/pg_publication_namespace.h"
 #include "catalog/pg_publication_rel.h"
-#include "commands/dbcommands.h"
 #include "commands/defrem.h"
 #include "commands/event_trigger.h"
 #include "commands/publicationcmds.h"
@@ -38,6 +37,7 @@
 #include "parser/parse_clause.h"
 #include "parser/parse_collate.h"
 #include "parser/parse_relation.h"
+#include "rewrite/rewriteHandler.h"
 #include "storage/lmgr.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -70,6 +70,7 @@ static void PublicationDropTables(Oid pubid, List *rels, bool missing_ok);
 static void PublicationAddSchemas(Oid pubid, List *schemas, bool if_not_exists,
 								  AlterPublicationStmt *stmt);
 static void PublicationDropSchemas(Oid pubid, List *schemas, bool missing_ok);
+static char defGetGeneratedColsOption(DefElem *def);
 
 
 static void
@@ -80,7 +81,7 @@ parse_publication_options(ParseState *pstate,
 						  bool *publish_via_partition_root_given,
 						  bool *publish_via_partition_root,
 						  bool *publish_generated_columns_given,
-						  bool *publish_generated_columns)
+						  char *publish_generated_columns)
 {
 	ListCell   *lc;
 
@@ -94,7 +95,7 @@ parse_publication_options(ParseState *pstate,
 	pubactions->pubdelete = true;
 	pubactions->pubtruncate = true;
 	*publish_via_partition_root = false;
-	*publish_generated_columns = false;
+	*publish_generated_columns = PUBLISH_GENCOLS_NONE;
 
 	/* Parse options */
 	foreach(lc, options)
@@ -160,7 +161,7 @@ parse_publication_options(ParseState *pstate,
 			if (*publish_generated_columns_given)
 				errorConflictingDefElem(defel, pstate);
 			*publish_generated_columns_given = true;
-			*publish_generated_columns = defGetBoolean(defel);
+			*publish_generated_columns = defGetGeneratedColsOption(defel);
 		}
 		else
 			ereport(ERROR,
@@ -344,15 +345,16 @@ pub_rf_contains_invalid_column(Oid pubid, Relation relation, List *ancestors,
  *    by the column list. If any column is missing, *invalid_column_list is set
  *    to true.
  * 2. Ensures that all the generated columns referenced in the REPLICA IDENTITY
- *    are published either by listing them in the column list or by enabling
- *    publish_generated_columns option. If any unpublished generated column is
- *    found, *invalid_gen_col is set to true.
+ *    are published, either by being explicitly named in the column list or, if
+ *    no column list is specified, by setting the option
+ *    publish_generated_columns to stored. If any unpublished
+ *    generated column is found, *invalid_gen_col is set to true.
  *
  * Returns true if any of the above conditions are not met.
  */
 bool
 pub_contains_invalid_column(Oid pubid, Relation relation, List *ancestors,
-							bool pubviaroot, bool pubgencols,
+							bool pubviaroot, char pubgencols_type,
 							bool *invalid_column_list,
 							bool *invalid_gen_col)
 {
@@ -394,12 +396,20 @@ pub_contains_invalid_column(Oid pubid, Relation relation, List *ancestors,
 
 		/*
 		 * As we don't allow a column list with REPLICA IDENTITY FULL, the
-		 * publish_generated_columns option must be set to true if the table
+		 * publish_generated_columns option must be set to stored if the table
 		 * has any stored generated columns.
 		 */
-		if (!pubgencols &&
+		if (pubgencols_type != PUBLISH_GENCOLS_STORED &&
 			relation->rd_att->constr &&
 			relation->rd_att->constr->has_generated_stored)
+			*invalid_gen_col = true;
+
+		/*
+		 * Virtual generated columns are currently not supported for logical
+		 * replication at all.
+		 */
+		if (relation->rd_att->constr &&
+			relation->rd_att->constr->has_generated_virtual)
 			*invalid_gen_col = true;
 
 		if (*invalid_gen_col && *invalid_column_list)
@@ -425,10 +435,20 @@ pub_contains_invalid_column(Oid pubid, Relation relation, List *ancestors,
 		if (columns == NULL)
 		{
 			/*
-			 * The publish_generated_columns option must be set to true if the
-			 * REPLICA IDENTITY contains any stored generated column.
+			 * The publish_generated_columns option must be set to stored if
+			 * the REPLICA IDENTITY contains any stored generated column.
 			 */
-			if (!pubgencols && att->attgenerated)
+			if (att->attgenerated == ATTRIBUTE_GENERATED_STORED && pubgencols_type != PUBLISH_GENCOLS_STORED)
+			{
+				*invalid_gen_col = true;
+				break;
+			}
+
+			/*
+			 * The equivalent setting for virtual generated columns does not
+			 * exist yet.
+			 */
+			if (att->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
 			{
 				*invalid_gen_col = true;
 				break;
@@ -468,6 +488,45 @@ pub_contains_invalid_column(Oid pubid, Relation relation, List *ancestors,
 	bms_free(idattrs);
 
 	return *invalid_column_list || *invalid_gen_col;
+}
+
+/*
+ * Invalidate entries in the RelationSyncCache for relations included in the
+ * specified publication, either via FOR TABLE or FOR TABLES IN SCHEMA.
+ *
+ * If 'puballtables' is true, invalidate all cache entries.
+ */
+void
+InvalidatePubRelSyncCache(Oid pubid, bool puballtables)
+{
+	if (puballtables)
+	{
+		CacheInvalidateRelSyncAll();
+	}
+	else
+	{
+		List	   *relids = NIL;
+		List	   *schemarelids = NIL;
+
+		/*
+		 * For partitioned tables, we must invalidate all partitions and
+		 * itself. WAL records for INSERT/UPDATE/DELETE specify leaf tables as
+		 * a target. However, WAL records for TRUNCATE specify both a root and
+		 * its leaves.
+		 */
+		relids = GetPublicationRelations(pubid,
+										 PUBLICATION_PART_ALL);
+		schemarelids = GetAllSchemaPublicationRelations(pubid,
+														PUBLICATION_PART_ALL);
+
+		relids = list_concat_unique_oid(relids, schemarelids);
+
+		/* Invalidate the relsyncache */
+		foreach_oid(relid, relids)
+			CacheInvalidateRelSync(relid);
+	}
+
+	return;
 }
 
 /* check_functions_in_node callback */
@@ -687,6 +746,8 @@ TransformPubWhereClauses(List *tables, const char *queryString,
 		/* Fix up collation information */
 		assign_expr_collations(pstate, whereclause);
 
+		whereclause = expand_generated_columns_in_expr(whereclause, pri->relation, 1);
+
 		/*
 		 * We allow only simple expressions in row filters. See
 		 * check_simple_rowfilter_expr_walker.
@@ -775,7 +836,7 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 	bool		publish_via_partition_root_given;
 	bool		publish_via_partition_root;
 	bool		publish_generated_columns_given;
-	bool		publish_generated_columns;
+	char		publish_generated_columns;
 	AclResult	aclresult;
 	List	   *relations = NIL;
 	List	   *schemaidlist = NIL;
@@ -786,11 +847,14 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 		aclcheck_error(aclresult, OBJECT_DATABASE,
 					   get_database_name(MyDatabaseId));
 
-	/* FOR ALL TABLES requires superuser */
-	if (stmt->for_all_tables && !superuser())
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be superuser to create FOR ALL TABLES publication")));
+	/* FOR ALL TABLES and FOR ALL SEQUENCES requires superuser */
+	if (!superuser())
+	{
+		if (stmt->for_all_tables || stmt->for_all_sequences)
+			ereport(ERROR,
+					errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					errmsg("must be superuser to create a FOR ALL TABLES or ALL SEQUENCES publication"));
+	}
 
 	rel = table_open(PublicationRelationId, RowExclusiveLock);
 
@@ -819,11 +883,20 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 							  &publish_generated_columns_given,
 							  &publish_generated_columns);
 
+	if (stmt->for_all_sequences &&
+		(publish_given || publish_via_partition_root_given ||
+		 publish_generated_columns_given))
+		ereport(NOTICE,
+				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				errmsg("publication parameters are not applicable to sequence synchronization and will be ignored for sequences"));
+
 	puboid = GetNewOidWithIndex(rel, PublicationObjectIndexId,
 								Anum_pg_publication_oid);
 	values[Anum_pg_publication_oid - 1] = ObjectIdGetDatum(puboid);
 	values[Anum_pg_publication_puballtables - 1] =
 		BoolGetDatum(stmt->for_all_tables);
+	values[Anum_pg_publication_puballsequences - 1] =
+		BoolGetDatum(stmt->for_all_sequences);
 	values[Anum_pg_publication_pubinsert - 1] =
 		BoolGetDatum(pubactions.pubinsert);
 	values[Anum_pg_publication_pubupdate - 1] =
@@ -835,7 +908,7 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 	values[Anum_pg_publication_pubviaroot - 1] =
 		BoolGetDatum(publish_via_partition_root);
 	values[Anum_pg_publication_pubgencols - 1] =
-		BoolGetDatum(publish_generated_columns);
+		CharGetDatum(publish_generated_columns);
 
 	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
 
@@ -853,10 +926,14 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 	/* Associate objects with the publication. */
 	if (stmt->for_all_tables)
 	{
-		/* Invalidate relcache so that publication info is rebuilt. */
+		/*
+		 * Invalidate relcache so that publication info is rebuilt. Sequences
+		 * publication doesn't require invalidation, as replica identity
+		 * checks don't apply to them.
+		 */
 		CacheInvalidateRelcacheAll();
 	}
-	else
+	else if (!stmt->for_all_sequences)
 	{
 		ObjectsInPublicationToOids(stmt->pubobjects, pstate, &relations,
 								   &schemaidlist);
@@ -922,11 +999,13 @@ AlterPublicationOptions(ParseState *pstate, AlterPublicationStmt *stmt,
 	bool		publish_via_partition_root_given;
 	bool		publish_via_partition_root;
 	bool		publish_generated_columns_given;
-	bool		publish_generated_columns;
+	char		publish_generated_columns;
 	ObjectAddress obj;
 	Form_pg_publication pubform;
 	List	   *root_relids = NIL;
 	ListCell   *lc;
+
+	pubform = (Form_pg_publication) GETSTRUCT(tup);
 
 	parse_publication_options(pstate,
 							  stmt->options,
@@ -936,7 +1015,12 @@ AlterPublicationOptions(ParseState *pstate, AlterPublicationStmt *stmt,
 							  &publish_generated_columns_given,
 							  &publish_generated_columns);
 
-	pubform = (Form_pg_publication) GETSTRUCT(tup);
+	if (pubform->puballsequences &&
+		(publish_given || publish_via_partition_root_given ||
+		 publish_generated_columns_given))
+		ereport(NOTICE,
+				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				errmsg("publication parameters are not applicable to sequence synchronization and will be ignored for sequences"));
 
 	/*
 	 * If the publication doesn't publish changes via the root partitioned
@@ -1046,7 +1130,7 @@ AlterPublicationOptions(ParseState *pstate, AlterPublicationStmt *stmt,
 
 	if (publish_generated_columns_given)
 	{
-		values[Anum_pg_publication_pubgencols - 1] = BoolGetDatum(publish_generated_columns);
+		values[Anum_pg_publication_pubgencols - 1] = CharGetDatum(publish_generated_columns);
 		replaces[Anum_pg_publication_pubgencols - 1] = true;
 	}
 
@@ -1390,20 +1474,50 @@ CheckAlterPublication(AlterPublicationStmt *stmt, HeapTuple tup,
 	 * Check that user is allowed to manipulate the publication tables in
 	 * schema
 	 */
-	if (schemaidlist && pubform->puballtables)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("publication \"%s\" is defined as FOR ALL TABLES",
-						NameStr(pubform->pubname)),
-				 errdetail("Schemas cannot be added to or dropped from FOR ALL TABLES publications.")));
+	if (schemaidlist && (pubform->puballtables || pubform->puballsequences))
+	{
+		if (pubform->puballtables && pubform->puballsequences)
+			ereport(ERROR,
+					errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					errmsg("publication \"%s\" is defined as FOR ALL TABLES, ALL SEQUENCES",
+						   NameStr(pubform->pubname)),
+					errdetail("Schemas cannot be added to or dropped from FOR ALL TABLES, ALL SEQUENCES publications."));
+		else if (pubform->puballtables)
+			ereport(ERROR,
+					errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					errmsg("publication \"%s\" is defined as FOR ALL TABLES",
+						   NameStr(pubform->pubname)),
+					errdetail("Schemas cannot be added to or dropped from FOR ALL TABLES publications."));
+		else
+			ereport(ERROR,
+					errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					errmsg("publication \"%s\" is defined as FOR ALL SEQUENCES",
+						   NameStr(pubform->pubname)),
+					errdetail("Schemas cannot be added to or dropped from FOR ALL SEQUENCES publications."));
+	}
 
 	/* Check that user is allowed to manipulate the publication tables. */
-	if (tables && pubform->puballtables)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("publication \"%s\" is defined as FOR ALL TABLES",
-						NameStr(pubform->pubname)),
-				 errdetail("Tables cannot be added to or dropped from FOR ALL TABLES publications.")));
+	if (tables && (pubform->puballtables || pubform->puballsequences))
+	{
+		if (pubform->puballtables && pubform->puballsequences)
+			ereport(ERROR,
+					errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					errmsg("publication \"%s\" is defined as FOR ALL TABLES, ALL SEQUENCES",
+						   NameStr(pubform->pubname)),
+					errdetail("Tables or sequences cannot be added to or dropped from FOR ALL TABLES, ALL SEQUENCES publications."));
+		else if (pubform->puballtables)
+			ereport(ERROR,
+					errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					errmsg("publication \"%s\" is defined as FOR ALL TABLES",
+						   NameStr(pubform->pubname)),
+					errdetail("Tables or sequences cannot be added to or dropped from FOR ALL TABLES publications."));
+		else
+			ereport(ERROR,
+					errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					errmsg("publication \"%s\" is defined as FOR ALL SEQUENCES",
+						   NameStr(pubform->pubname)),
+					errdetail("Tables or sequences cannot be added to or dropped from FOR ALL SEQUENCES publications."));
+	}
 }
 
 /*
@@ -1794,8 +1908,6 @@ PublicationAddTables(Oid pubid, List *rels, bool if_not_exists,
 {
 	ListCell   *lc;
 
-	Assert(!stmt || !stmt->for_all_tables);
-
 	foreach(lc, rels)
 	{
 		PublicationRelInfo *pub_rel = (PublicationRelInfo *) lfirst(lc);
@@ -1872,8 +1984,6 @@ PublicationAddSchemas(Oid pubid, List *schemas, bool if_not_exists,
 					  AlterPublicationStmt *stmt)
 {
 	ListCell   *lc;
-
-	Assert(!stmt || !stmt->for_all_tables);
 
 	foreach(lc, schemas)
 	{
@@ -1957,19 +2067,16 @@ AlterPublicationOwner_internal(Relation rel, HeapTuple tup, Oid newOwnerId)
 			aclcheck_error(aclresult, OBJECT_DATABASE,
 						   get_database_name(MyDatabaseId));
 
-		if (form->puballtables && !superuser_arg(newOwnerId))
-			ereport(ERROR,
-					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					 errmsg("permission denied to change owner of publication \"%s\"",
-							NameStr(form->pubname)),
-					 errhint("The owner of a FOR ALL TABLES publication must be a superuser.")));
-
-		if (!superuser_arg(newOwnerId) && is_schema_publication(form->oid))
-			ereport(ERROR,
-					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					 errmsg("permission denied to change owner of publication \"%s\"",
-							NameStr(form->pubname)),
-					 errhint("The owner of a FOR TABLES IN SCHEMA publication must be a superuser.")));
+		if (!superuser_arg(newOwnerId))
+		{
+			if (form->puballtables || form->puballsequences ||
+				is_schema_publication(form->oid))
+				ereport(ERROR,
+						errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						errmsg("permission denied to change owner of publication \"%s\"",
+							   NameStr(form->pubname)),
+						errhint("The owner of a FOR ALL TABLES or ALL SEQUENCES or TABLES IN SCHEMA publication must be a superuser."));
+		}
 	}
 
 	form->pubowner = newOwnerId;
@@ -1990,7 +2097,7 @@ AlterPublicationOwner_internal(Relation rel, HeapTuple tup, Oid newOwnerId)
 ObjectAddress
 AlterPublicationOwner(const char *name, Oid newOwnerId)
 {
-	Oid			subid;
+	Oid			pubid;
 	HeapTuple	tup;
 	Relation	rel;
 	ObjectAddress address;
@@ -2006,11 +2113,11 @@ AlterPublicationOwner(const char *name, Oid newOwnerId)
 				 errmsg("publication \"%s\" does not exist", name)));
 
 	pubform = (Form_pg_publication) GETSTRUCT(tup);
-	subid = pubform->oid;
+	pubid = pubform->oid;
 
 	AlterPublicationOwner_internal(rel, tup, newOwnerId);
 
-	ObjectAddressSet(address, PublicationRelationId, subid);
+	ObjectAddressSet(address, PublicationRelationId, pubid);
 
 	heap_freetuple(tup);
 
@@ -2023,23 +2130,53 @@ AlterPublicationOwner(const char *name, Oid newOwnerId)
  * Change publication owner -- by OID
  */
 void
-AlterPublicationOwner_oid(Oid subid, Oid newOwnerId)
+AlterPublicationOwner_oid(Oid pubid, Oid newOwnerId)
 {
 	HeapTuple	tup;
 	Relation	rel;
 
 	rel = table_open(PublicationRelationId, RowExclusiveLock);
 
-	tup = SearchSysCacheCopy1(PUBLICATIONOID, ObjectIdGetDatum(subid));
+	tup = SearchSysCacheCopy1(PUBLICATIONOID, ObjectIdGetDatum(pubid));
 
 	if (!HeapTupleIsValid(tup))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("publication with OID %u does not exist", subid)));
+				 errmsg("publication with OID %u does not exist", pubid)));
 
 	AlterPublicationOwner_internal(rel, tup, newOwnerId);
 
 	heap_freetuple(tup);
 
 	table_close(rel, RowExclusiveLock);
+}
+
+/*
+ * Extract the publish_generated_columns option value from a DefElem. "stored"
+ * and "none" values are accepted.
+ */
+static char
+defGetGeneratedColsOption(DefElem *def)
+{
+	char	   *sval = "";
+
+	/*
+	 * A parameter value is required.
+	 */
+	if (def->arg)
+	{
+		sval = defGetString(def);
+
+		if (pg_strcasecmp(sval, "none") == 0)
+			return PUBLISH_GENCOLS_NONE;
+		if (pg_strcasecmp(sval, "stored") == 0)
+			return PUBLISH_GENCOLS_STORED;
+	}
+
+	ereport(ERROR,
+			errcode(ERRCODE_SYNTAX_ERROR),
+			errmsg("invalid value for publication parameter \"%s\": \"%s\"", def->defname, sval),
+			errdetail("Valid values are \"%s\" and \"%s\".", "none", "stored"));
+
+	return PUBLISH_GENCOLS_NONE;	/* keep compiler quiet */
 }

@@ -3,7 +3,7 @@
  * walreceiver.h
  *	  Exports from replication/walreceiverfuncs.c.
  *
- * Portions Copyright (c) 2010-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2025, PostgreSQL Global Development Group
  *
  * src/include/replication/walreceiver.h
  *
@@ -486,8 +486,7 @@ walrcv_clear_result(WalRcvExecResult *walres)
 }
 
 /* prototypes for functions in walreceiver.c */
-extern void WalReceiverMain(char *startup_data, size_t startup_data_len) pg_attribute_noreturn();
-extern void ProcessWalRcvInterrupts(void);
+pg_noreturn extern void WalReceiverMain(const void *startup_data, size_t startup_data_len);
 extern void WalRcvForceReply(void);
 
 /* prototypes for functions in walreceiverfuncs.c */
@@ -496,6 +495,7 @@ extern void WalRcvShmemInit(void);
 extern void ShutdownWalRcv(void);
 extern bool WalRcvStreaming(void);
 extern bool WalRcvRunning(void);
+extern WalRcvState WalRcvGetState(void);
 extern void RequestXLogStreaming(TimeLineID tli, XLogRecPtr recptr,
 								 const char *conninfo, const char *slotname,
 								 bool create_temp_slot);

@@ -6,10 +6,10 @@
  * astreamer_lz4_compressor applies lz4 compression to the input stream,
  * and astreamer_lz4_decompressor does the reverse.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
- *		  src/bin/pg_basebackup/astreamer_lz4.c
+ *		  src/fe_utils/astreamer_lz4.c
  *-------------------------------------------------------------------------
  */
 
@@ -322,9 +322,9 @@ astreamer_lz4_decompressor_content(astreamer *streamer,
 
 	mystreamer = (astreamer_lz4_frame *) streamer;
 	next_in = (uint8 *) data;
-	next_out = (uint8 *) mystreamer->base.bbs_buffer.data;
+	next_out = (uint8 *) mystreamer->base.bbs_buffer.data + mystreamer->bytes_written;
 	avail_in = len;
-	avail_out = mystreamer->base.bbs_buffer.maxlen;
+	avail_out = mystreamer->base.bbs_buffer.maxlen - mystreamer->bytes_written;
 
 	while (avail_in > 0)
 	{

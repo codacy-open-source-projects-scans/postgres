@@ -3,7 +3,7 @@
  * tableam.c
  *		Table access method routines too big to be inline functions.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -24,6 +24,7 @@
 #include "access/syncscan.h"
 #include "access/tableam.h"
 #include "access/xact.h"
+#include "optimizer/optimizer.h"
 #include "optimizer/plancat.h"
 #include "port/pg_bitutils.h"
 #include "storage/bufmgr.h"
@@ -109,7 +110,7 @@ table_slot_create(Relation relation, List **reglist)
  */
 
 TableScanDesc
-table_beginscan_catalog(Relation relation, int nkeys, struct ScanKeyData *key)
+table_beginscan_catalog(Relation relation, int nkeys, ScanKeyData *key)
 {
 	uint32		flags = SO_TYPE_SEQSCAN |
 		SO_ALLOW_STRAT | SO_ALLOW_SYNC | SO_ALLOW_PAGEMODE | SO_TEMP_SNAPSHOT;
@@ -740,6 +741,8 @@ table_block_relation_estimate_size(Relation rel, int32 *attr_widths,
 		tuple_width += overhead_bytes_per_tuple;
 		/* note: integer division is intentional here */
 		density = (usable_bytes_per_page * fillfactor / 100) / tuple_width;
+		/* There's at least one row on the page, even with low fillfactor. */
+		density = clamp_row_est(density);
 	}
 	*tuples = rint(density * (double) curpages);
 

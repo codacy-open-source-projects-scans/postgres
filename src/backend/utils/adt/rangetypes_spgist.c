@@ -25,7 +25,7 @@
  * This implementation only uses the comparison function of the range element
  * datatype, therefore it works for any range type.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -757,7 +757,7 @@ spg_range_quad_inner_consistent(PG_FUNCTION_ARGS)
 				 * because it's range
 				 */
 				previousCentroid = datumCopy(in->prefixDatum, false, -1);
-				out->traversalValues[out->nNodes] = (void *) previousCentroid;
+				out->traversalValues[out->nNodes] = DatumGetPointer(previousCentroid);
 			}
 			out->nodeNumbers[out->nNodes] = i - 1;
 			out->nNodes++;

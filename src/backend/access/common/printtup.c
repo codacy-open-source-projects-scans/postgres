@@ -5,7 +5,7 @@
  *	  clients and standalone backends are supported here).
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -22,6 +22,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memdebug.h"
 #include "utils/memutils.h"
+#include "varatt.h"
 
 
 static void printtup_startup(DestReceiver *self, int operation,
@@ -350,7 +351,7 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 		 */
 		if (thisState->typisvarlena)
 			VALGRIND_CHECK_MEM_IS_DEFINED(DatumGetPointer(attr),
-										  VARSIZE_ANY(attr));
+										  VARSIZE_ANY(DatumGetPointer(attr)));
 
 		if (thisState->format == 0)
 		{

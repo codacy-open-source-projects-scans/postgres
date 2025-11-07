@@ -3,7 +3,7 @@
  * injection_stats.c
  *		Code for statistics of injection points.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -40,6 +40,7 @@ static const PgStat_KindInfo injection_stats = {
 	.name = "injection_points",
 	.fixed_amount = false,		/* Bounded by the number of points */
 	.write_to_file = true,
+	.track_entry_count = true,
 
 	/* Injection points are system-wide */
 	.accessed_across_databases = true,
@@ -59,7 +60,7 @@ static const PgStat_KindInfo injection_stats = {
 /*
  * Kind ID reserved for statistics of injection points.
  */
-#define PGSTAT_KIND_INJECTION	129
+#define PGSTAT_KIND_INJECTION	25
 
 /* Track if stats are loaded */
 static bool inj_stats_loaded = false;
@@ -80,6 +81,9 @@ injection_stats_flush_cb(PgStat_EntryRef *entry_ref, bool nowait)
 		return false;
 
 	shfuncent->stats.numcalls += localent->numcalls;
+
+	pgstat_unlock_entry(entry_ref);
+
 	return true;
 }
 
@@ -127,13 +131,13 @@ pgstat_create_inj(const char *name)
 	if (!inj_stats_loaded || !inj_stats_enabled)
 		return;
 
-	entry_ref = pgstat_get_entry_ref_locked(PGSTAT_KIND_INJECTION, InvalidOid,
-											PGSTAT_INJ_IDX(name), false);
+	entry_ref = pgstat_prep_pending_entry(PGSTAT_KIND_INJECTION, InvalidOid,
+										  PGSTAT_INJ_IDX(name), NULL);
+
 	shstatent = (PgStatShared_InjectionPoint *) entry_ref->shared_stats;
 
 	/* initialize shared memory data */
 	memset(&shstatent->stats, 0, sizeof(shstatent->stats));
-	pgstat_unlock_entry(entry_ref);
 }
 
 /*
@@ -161,23 +165,19 @@ void
 pgstat_report_inj(const char *name)
 {
 	PgStat_EntryRef *entry_ref;
-	PgStatShared_InjectionPoint *shstatent;
-	PgStat_StatInjEntry *statent;
+	PgStat_StatInjEntry *pending;
 
 	/* leave if disabled */
 	if (!inj_stats_loaded || !inj_stats_enabled)
 		return;
 
-	entry_ref = pgstat_get_entry_ref_locked(PGSTAT_KIND_INJECTION, InvalidOid,
-											PGSTAT_INJ_IDX(name), false);
+	entry_ref = pgstat_prep_pending_entry(PGSTAT_KIND_INJECTION, InvalidOid,
+										  PGSTAT_INJ_IDX(name), NULL);
 
-	shstatent = (PgStatShared_InjectionPoint *) entry_ref->shared_stats;
-	statent = &shstatent->stats;
+	pending = (PgStat_StatInjEntry *) entry_ref->pending;
 
-	/* Update the injection point statistics */
-	statent->numcalls++;
-
-	pgstat_unlock_entry(entry_ref);
+	/* Update the injection point pending statistics */
+	pending->numcalls++;
 }
 
 /*
@@ -195,4 +195,34 @@ injection_points_stats_numcalls(PG_FUNCTION_ARGS)
 		PG_RETURN_NULL();
 
 	PG_RETURN_INT64(entry->numcalls);
+}
+
+/*
+ * SQL function returning the number of entries allocated for injection
+ * points in the shared hashtable of pgstats.
+ */
+PG_FUNCTION_INFO_V1(injection_points_stats_count);
+Datum
+injection_points_stats_count(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(pgstat_get_entry_count(PGSTAT_KIND_INJECTION));
+}
+
+/* Only used by injection_points_stats_drop() */
+static bool
+match_inj_entries(PgStatShared_HashEntry *entry, Datum match_data)
+{
+	return entry->key.kind == PGSTAT_KIND_INJECTION;
+}
+
+/*
+ * SQL function that drops all injection point statistics.
+ */
+PG_FUNCTION_INFO_V1(injection_points_stats_drop);
+Datum
+injection_points_stats_drop(PG_FUNCTION_ARGS)
+{
+	pgstat_drop_matching_entries(match_inj_entries, 0);
+
+	PG_RETURN_VOID();
 }

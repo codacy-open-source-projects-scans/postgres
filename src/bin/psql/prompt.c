@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2025, PostgreSQL Global Development Group
  *
  * src/bin/psql/prompt.c
  */
@@ -31,8 +31,10 @@
  *		sockets, "[local:/dir/name]" if not default
  * %m - like %M, but hostname only (before first dot), or always "[local]"
  * %p - backend pid
+ * %P - pipeline status: on, off or abort
  * %> - database server port number
  * %n - database user name
+ * %S - search_path
  * %s - service
  * %/ - current database
  * %~ - like %/ but "~" when database name equals user name
@@ -166,10 +168,24 @@ get_prompt(promptStatus_t status, ConditionalStack cstack)
 					if (pset.db)
 						strlcpy(buf, session_username(), sizeof(buf));
 					break;
+					/* search_path */
+				case 'S':
+					if (pset.db)
+					{
+						const char *sp = PQparameterStatus(pset.db, "search_path");
+
+						/* Use ? for versions that don't report search_path. */
+						strlcpy(buf, sp ? sp : "?", sizeof(buf));
+					}
+					break;
 					/* service name */
 				case 's':
-					if (pset.db && PQservice(pset.db))
-						strlcpy(buf, PQservice(pset.db), sizeof(buf));
+					{
+						const char *service_name = GetVariable(pset.vars, "SERVICE");
+
+						if (service_name)
+							strlcpy(buf, service_name, sizeof(buf));
+					}
 					break;
 					/* backend pid */
 				case 'p':
@@ -181,6 +197,19 @@ get_prompt(promptStatus_t status, ConditionalStack cstack)
 							snprintf(buf, sizeof(buf), "%d", pid);
 					}
 					break;
+					/* pipeline status */
+				case 'P':
+					{
+						PGpipelineStatus status = PQpipelineStatus(pset.db);
+
+						if (status == PQ_PIPELINE_ON)
+							strlcpy(buf, "on", sizeof(buf));
+						else if (status == PQ_PIPELINE_ABORTED)
+							strlcpy(buf, "abort", sizeof(buf));
+						else
+							strlcpy(buf, "off", sizeof(buf));
+						break;
+					}
 
 				case '0':
 				case '1':

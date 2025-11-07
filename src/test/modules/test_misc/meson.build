@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2024, PostgreSQL Global Development Group
+# Copyright (c) 2022-2025, PostgreSQL Global Development Group
 
 tests += {
   'name': 'test_misc',
@@ -15,6 +15,9 @@ tests += {
       't/004_io_direct.pl',
       't/005_timeouts.pl',
       't/006_signal_autovacuum.pl',
+      't/007_catcache_inval.pl',
+      't/008_replslot_single_user.pl',
+      't/009_log_temp_files.pl',
     ],
   },
 }

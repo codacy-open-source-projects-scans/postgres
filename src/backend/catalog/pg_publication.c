@@ -3,7 +3,7 @@
  * pg_publication.c
  *		publication C API manipulation
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -115,8 +115,10 @@ check_publication_add_schema(Oid schemaid)
  * Returns if relation represented by oid and Form_pg_class entry
  * is publishable.
  *
- * Does same checks as check_publication_add_relation() above, but does not
- * need relation to be opened and also does not throw errors.
+ * Does same checks as check_publication_add_relation() above except for
+ * RELKIND_SEQUENCE, but does not need relation to be opened and also does
+ * not throw errors. Here, the additional check is to support ALL SEQUENCES
+ * publication.
  *
  * XXX  This also excludes all tables with relid < FirstNormalObjectId,
  * ie all tables created during initdb.  This mainly affects the preinstalled
@@ -134,7 +136,8 @@ static bool
 is_publishable_class(Oid relid, Form_pg_class reltuple)
 {
 	return (reltuple->relkind == RELKIND_RELATION ||
-			reltuple->relkind == RELKIND_PARTITIONED_TABLE) &&
+			reltuple->relkind == RELKIND_PARTITIONED_TABLE ||
+			reltuple->relkind == RELKIND_SEQUENCE) &&
 		!IsCatalogRelationOid(relid) &&
 		reltuple->relpersistence == RELPERSISTENCE_PERMANENT &&
 		relid >= FirstNormalObjectId;
@@ -546,7 +549,8 @@ publication_add_relation(Oid pubid, PublicationRelInfo *pri,
  * pub_collist_validate
  *		Process and validate the 'columns' list and ensure the columns are all
  *		valid to use for a publication.  Checks for and raises an ERROR for
- * 		any unknown columns, system columns, or duplicate columns.
+ *		any unknown columns, system columns, duplicate columns, or virtual
+ *		generated columns.
  *
  * Looks up each column's attnum and returns a 0-based Bitmapset of the
  * corresponding attnums.
@@ -556,6 +560,7 @@ pub_collist_validate(Relation targetrel, List *columns)
 {
 	Bitmapset  *set = NULL;
 	ListCell   *lc;
+	TupleDesc	tupdesc = RelationGetDescr(targetrel);
 
 	foreach(lc, columns)
 	{
@@ -572,6 +577,12 @@ pub_collist_validate(Relation targetrel, List *columns)
 			ereport(ERROR,
 					errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
 					errmsg("cannot use system column \"%s\" in publication column list",
+						   colname));
+
+		if (TupleDescAttr(tupdesc, attnum - 1)->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
+			ereport(ERROR,
+					errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
+					errmsg("cannot use virtual generated column \"%s\" in publication column list",
 						   colname));
 
 		if (bms_is_member(attnum, set))
@@ -622,10 +633,11 @@ pub_collist_to_bitmapset(Bitmapset *columns, Datum pubcols, MemoryContext mcxt)
 /*
  * Returns a bitmap representing the columns of the specified table.
  *
- * Generated columns are included if include_gencols is true.
+ * Generated columns are included if include_gencols_type is
+ * PUBLISH_GENCOLS_STORED.
  */
 Bitmapset *
-pub_form_cols_map(Relation relation, bool include_gencols)
+pub_form_cols_map(Relation relation, PublishGencolsType include_gencols_type)
 {
 	Bitmapset  *result = NULL;
 	TupleDesc	desc = RelationGetDescr(relation);
@@ -634,8 +646,19 @@ pub_form_cols_map(Relation relation, bool include_gencols)
 	{
 		Form_pg_attribute att = TupleDescAttr(desc, i);
 
-		if (att->attisdropped || (att->attgenerated && !include_gencols))
+		if (att->attisdropped)
 			continue;
+
+		if (att->attgenerated)
+		{
+			/* We only support replication of STORED generated cols. */
+			if (att->attgenerated != ATTRIBUTE_GENERATED_STORED)
+				continue;
+
+			/* User hasn't requested to replicate STORED generated cols. */
+			if (include_gencols_type != PUBLISH_GENCOLS_STORED)
+				continue;
+		}
 
 		result = bms_add_member(result, att->attnum);
 	}
@@ -753,8 +776,8 @@ GetRelationPublications(Oid relid)
 /*
  * Gets list of relation oids for a publication.
  *
- * This should only be used FOR TABLE publications, the FOR ALL TABLES
- * should use GetAllTablesPublicationRelations().
+ * This should only be used FOR TABLE publications, the FOR ALL TABLES/SEQUENCES
+ * should use GetAllPublicationRelations().
  */
 List *
 GetPublicationRelations(Oid pubid, PublicationPartOpt pub_partopt)
@@ -834,14 +857,16 @@ GetAllTablesPublications(void)
 }
 
 /*
- * Gets list of all relation published by FOR ALL TABLES publication(s).
+ * Gets list of all relations published by FOR ALL TABLES/SEQUENCES
+ * publication(s).
  *
  * If the publication publishes partition changes via their respective root
  * partitioned tables, we must exclude partitions in favor of including the
- * root partitioned tables.
+ * root partitioned tables. This is not applicable to FOR ALL SEQUENCES
+ * publication.
  */
 List *
-GetAllTablesPublicationRelations(bool pubviaroot)
+GetAllPublicationRelations(char relkind, bool pubviaroot)
 {
 	Relation	classRel;
 	ScanKeyData key[1];
@@ -849,12 +874,14 @@ GetAllTablesPublicationRelations(bool pubviaroot)
 	HeapTuple	tuple;
 	List	   *result = NIL;
 
+	Assert(!(relkind == RELKIND_SEQUENCE && pubviaroot));
+
 	classRel = table_open(RelationRelationId, AccessShareLock);
 
 	ScanKeyInit(&key[0],
 				Anum_pg_class_relkind,
 				BTEqualStrategyNumber, F_CHAREQ,
-				CharGetDatum(RELKIND_RELATION));
+				CharGetDatum(relkind));
 
 	scan = table_beginscan_catalog(classRel, 1, key);
 
@@ -981,7 +1008,7 @@ GetSchemaPublicationRelations(Oid schemaid, PublicationPartOpt pub_partopt)
 	ScanKeyInit(&key[0],
 				Anum_pg_class_relnamespace,
 				BTEqualStrategyNumber, F_OIDEQ,
-				schemaid);
+				ObjectIdGetDatum(schemaid));
 
 	/* get all the relations present in the specified schema */
 	scan = table_beginscan_catalog(classRel, 1, key);
@@ -1063,12 +1090,13 @@ GetPublication(Oid pubid)
 	pub->oid = pubid;
 	pub->name = pstrdup(NameStr(pubform->pubname));
 	pub->alltables = pubform->puballtables;
+	pub->allsequences = pubform->puballsequences;
 	pub->pubactions.pubinsert = pubform->pubinsert;
 	pub->pubactions.pubupdate = pubform->pubupdate;
 	pub->pubactions.pubdelete = pubform->pubdelete;
 	pub->pubactions.pubtruncate = pubform->pubtruncate;
 	pub->pubviaroot = pubform->pubviaroot;
-	pub->pubgencols = pubform->pubgencols;
+	pub->pubgencols_type = pubform->pubgencols;
 
 	ReleaseSysCache(tup);
 
@@ -1140,7 +1168,8 @@ pg_get_publication_tables(PG_FUNCTION_ARGS)
 			 * those. Otherwise, get the partitioned table itself.
 			 */
 			if (pub_elem->alltables)
-				pub_elem_tables = GetAllTablesPublicationRelations(pub_elem->pubviaroot);
+				pub_elem_tables = GetAllPublicationRelations(RELKIND_RELATION,
+															 pub_elem->pubviaroot);
 			else
 			{
 				List	   *relids,
@@ -1276,8 +1305,22 @@ pg_get_publication_tables(PG_FUNCTION_ARGS)
 			{
 				Form_pg_attribute att = TupleDescAttr(desc, i);
 
-				if (att->attisdropped || (att->attgenerated && !pub->pubgencols))
+				if (att->attisdropped)
 					continue;
+
+				if (att->attgenerated)
+				{
+					/* We only support replication of STORED generated cols. */
+					if (att->attgenerated != ATTRIBUTE_GENERATED_STORED)
+						continue;
+
+					/*
+					 * User hasn't requested to replicate STORED generated
+					 * cols.
+					 */
+					if (pub->pubgencols_type != PUBLISH_GENCOLS_STORED)
+						continue;
+				}
 
 				attnums[nattnums++] = att->attnum;
 			}
@@ -1294,6 +1337,52 @@ pg_get_publication_tables(PG_FUNCTION_ARGS)
 		rettuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
 
 		SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(rettuple));
+	}
+
+	SRF_RETURN_DONE(funcctx);
+}
+
+/*
+ * Returns Oids of sequences in a publication.
+ */
+Datum
+pg_get_publication_sequences(PG_FUNCTION_ARGS)
+{
+	FuncCallContext *funcctx;
+	List	   *sequences = NIL;
+
+	/* stuff done only on the first call of the function */
+	if (SRF_IS_FIRSTCALL())
+	{
+		char	   *pubname = text_to_cstring(PG_GETARG_TEXT_PP(0));
+		Publication *publication;
+		MemoryContext oldcontext;
+
+		/* create a function context for cross-call persistence */
+		funcctx = SRF_FIRSTCALL_INIT();
+
+		/* switch to memory context appropriate for multiple function calls */
+		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+		publication = GetPublicationByName(pubname, false);
+
+		if (publication->allsequences)
+			sequences = GetAllPublicationRelations(RELKIND_SEQUENCE, false);
+
+		funcctx->user_fctx = (void *) sequences;
+
+		MemoryContextSwitchTo(oldcontext);
+	}
+
+	/* stuff done on every call of the function */
+	funcctx = SRF_PERCALL_SETUP();
+	sequences = (List *) funcctx->user_fctx;
+
+	if (funcctx->call_cntr < list_length(sequences))
+	{
+		Oid			relid = list_nth_oid(sequences, funcctx->call_cntr);
+
+		SRF_RETURN_NEXT(funcctx, ObjectIdGetDatum(relid));
 	}
 
 	SRF_RETURN_DONE(funcctx);

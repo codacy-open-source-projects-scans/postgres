@@ -2,7 +2,7 @@
  * llvmjit.h
  *	  LLVM JIT provider.
  *
- * Copyright (c) 2016-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2016-2025, PostgreSQL Global Development Group
  *
  * src/include/jit/llvmjit.h
  *
@@ -74,6 +74,7 @@ typedef struct LLVMJitContext
 extern PGDLLIMPORT LLVMTypeRef TypeParamBool;
 extern PGDLLIMPORT LLVMTypeRef TypePGFunction;
 extern PGDLLIMPORT LLVMTypeRef TypeSizeT;
+extern PGDLLIMPORT LLVMTypeRef TypeDatum;
 extern PGDLLIMPORT LLVMTypeRef TypeStorageBool;
 
 extern PGDLLIMPORT LLVMTypeRef StructNullableDatum;
