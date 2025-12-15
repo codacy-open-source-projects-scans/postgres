@@ -78,7 +78,7 @@ struct LogicalRepInfos
 };
 
 static void cleanup_objects_atexit(void);
-static void usage();
+static void usage(void);
 static char *get_base_conninfo(const char *conninfo, char **dbname);
 static char *get_sub_conninfo(const struct CreateSubscriberOptions *opt);
 static char *get_exec_path(const char *argv0, const char *progname);
@@ -2255,7 +2255,8 @@ main(int argc, char **argv)
 
 		if (bad_switch)
 		{
-			pg_log_error("options %s and -a/--all cannot be used together", bad_switch);
+			pg_log_error("options %s and %s cannot be used together",
+						 bad_switch, "-a/--all");
 			pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 			exit(1);
 		}
@@ -2386,7 +2387,8 @@ main(int argc, char **argv)
 			dbinfos.objecttypes_to_clean |= OBJECTTYPE_PUBLICATIONS;
 		else
 		{
-			pg_log_error("invalid object type \"%s\" specified for --clean", cell->val);
+			pg_log_error("invalid object type \"%s\" specified for %s",
+						 cell->val, "--clean");
 			pg_log_error_hint("The valid value is: \"%s\"", "publications");
 			exit(1);
 		}

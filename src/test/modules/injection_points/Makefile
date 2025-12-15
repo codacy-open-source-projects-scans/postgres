@@ -4,8 +4,6 @@ MODULE_big = injection_points
 OBJS = \
 	$(WIN32RES) \
 	injection_points.o \
-	injection_stats.o \
-	injection_stats_fixed.o \
 	regress_injection.o
 EXTENSION = injection_points
 DATA = injection_points--1.0.sql
@@ -18,10 +16,10 @@ ISOLATION = basic \
 	    inplace \
 	    syscache-update-pruned \
 	    index-concurrently-upsert \
+	    index-concurrently-upsert-predicate \
 	    reindex-concurrently-upsert \
-	    index-concurrently-upsert-predicate
-
-TAP_TESTS = 1
+	    reindex-concurrently-upsert-on-constraint \
+	    reindex-concurrently-upsert-partitioned
 
 # The injection points are cluster-wide, so disable installcheck
 NO_INSTALLCHECK = 1

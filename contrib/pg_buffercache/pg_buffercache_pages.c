@@ -25,6 +25,9 @@
 #define NUM_BUFFERCACHE_EVICT_ELEM 2
 #define NUM_BUFFERCACHE_EVICT_RELATION_ELEM 3
 #define NUM_BUFFERCACHE_EVICT_ALL_ELEM 3
+#define NUM_BUFFERCACHE_MARK_DIRTY_ELEM 2
+#define NUM_BUFFERCACHE_MARK_DIRTY_RELATION_ELEM 3
+#define NUM_BUFFERCACHE_MARK_DIRTY_ALL_ELEM 3
 
 #define NUM_BUFFERCACHE_OS_PAGES_ELEM	3
 
@@ -101,6 +104,9 @@ PG_FUNCTION_INFO_V1(pg_buffercache_usage_counts);
 PG_FUNCTION_INFO_V1(pg_buffercache_evict);
 PG_FUNCTION_INFO_V1(pg_buffercache_evict_relation);
 PG_FUNCTION_INFO_V1(pg_buffercache_evict_all);
+PG_FUNCTION_INFO_V1(pg_buffercache_mark_dirty);
+PG_FUNCTION_INFO_V1(pg_buffercache_mark_dirty_relation);
+PG_FUNCTION_INFO_V1(pg_buffercache_mark_dirty_all);
 
 
 /* Only need to touch memory once per backend process lifetime */
@@ -128,7 +134,7 @@ pg_buffercache_pages(PG_FUNCTION_ARGS)
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
 		/* Create a user function context for cross-call persistence */
-		fctx = (BufferCachePagesContext *) palloc(sizeof(BufferCachePagesContext));
+		fctx = palloc_object(BufferCachePagesContext);
 
 		/*
 		 * To smoothly support upgrades from version 1.0 of this extension
@@ -376,8 +382,8 @@ pg_buffercache_os_pages_internal(FunctionCallInfo fcinfo, bool include_numa)
 			os_page_count = (endptr - startptr) / os_page_size;
 
 			/* Used to determine the NUMA node for all OS pages at once */
-			os_page_ptrs = palloc0(sizeof(void *) * os_page_count);
-			os_page_status = palloc(sizeof(uint64) * os_page_count);
+			os_page_ptrs = palloc0_array(void *, os_page_count);
+			os_page_status = palloc_array(int, os_page_count);
 
 			/*
 			 * Fill pointers for all the memory pages.  This loop stores and
@@ -419,7 +425,7 @@ pg_buffercache_os_pages_internal(FunctionCallInfo fcinfo, bool include_numa)
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
 		/* Create a user function context for cross-call persistence */
-		fctx = (BufferCacheOsPagesContext *) palloc(sizeof(BufferCacheOsPagesContext));
+		fctx = palloc_object(BufferCacheOsPagesContext);
 
 		if (get_call_result_type(fcinfo, NULL, &expected_tupledesc) != TYPEFUNC_COMPOSITE)
 			elog(ERROR, "return type must be a row type");
@@ -819,6 +825,122 @@ pg_buffercache_evict_all(PG_FUNCTION_ARGS)
 
 	values[0] = Int32GetDatum(buffers_evicted);
 	values[1] = Int32GetDatum(buffers_flushed);
+	values[2] = Int32GetDatum(buffers_skipped);
+
+	tuple = heap_form_tuple(tupledesc, values, nulls);
+	result = HeapTupleGetDatum(tuple);
+
+	PG_RETURN_DATUM(result);
+}
+
+/*
+ * Try to mark a shared buffer as dirty.
+ */
+Datum
+pg_buffercache_mark_dirty(PG_FUNCTION_ARGS)
+{
+
+	Datum		result;
+	TupleDesc	tupledesc;
+	HeapTuple	tuple;
+	Datum		values[NUM_BUFFERCACHE_MARK_DIRTY_ELEM];
+	bool		nulls[NUM_BUFFERCACHE_MARK_DIRTY_ELEM] = {0};
+
+	Buffer		buf = PG_GETARG_INT32(0);
+	bool		buffer_already_dirty;
+
+	if (get_call_result_type(fcinfo, NULL, &tupledesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	pg_buffercache_superuser_check("pg_buffercache_mark_dirty");
+
+	if (buf < 1 || buf > NBuffers)
+		elog(ERROR, "bad buffer ID: %d", buf);
+
+	values[0] = BoolGetDatum(MarkDirtyUnpinnedBuffer(buf, &buffer_already_dirty));
+	values[1] = BoolGetDatum(buffer_already_dirty);
+
+	tuple = heap_form_tuple(tupledesc, values, nulls);
+	result = HeapTupleGetDatum(tuple);
+
+	PG_RETURN_DATUM(result);
+}
+
+/*
+ * Try to mark all the shared buffers of a relation as dirty.
+ */
+Datum
+pg_buffercache_mark_dirty_relation(PG_FUNCTION_ARGS)
+{
+	Datum		result;
+	TupleDesc	tupledesc;
+	HeapTuple	tuple;
+	Datum		values[NUM_BUFFERCACHE_MARK_DIRTY_RELATION_ELEM];
+	bool		nulls[NUM_BUFFERCACHE_MARK_DIRTY_RELATION_ELEM] = {0};
+
+	Oid			relOid;
+	Relation	rel;
+
+	int32		buffers_already_dirty = 0;
+	int32		buffers_dirtied = 0;
+	int32		buffers_skipped = 0;
+
+	if (get_call_result_type(fcinfo, NULL, &tupledesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	pg_buffercache_superuser_check("pg_buffercache_mark_dirty_relation");
+
+	relOid = PG_GETARG_OID(0);
+
+	rel = relation_open(relOid, AccessShareLock);
+
+	if (RelationUsesLocalBuffers(rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("relation uses local buffers, %s() is intended to be used for shared buffers only",
+						"pg_buffercache_mark_dirty_relation")));
+
+	MarkDirtyRelUnpinnedBuffers(rel, &buffers_dirtied, &buffers_already_dirty,
+								&buffers_skipped);
+
+	relation_close(rel, AccessShareLock);
+
+	values[0] = Int32GetDatum(buffers_dirtied);
+	values[1] = Int32GetDatum(buffers_already_dirty);
+	values[2] = Int32GetDatum(buffers_skipped);
+
+	tuple = heap_form_tuple(tupledesc, values, nulls);
+	result = HeapTupleGetDatum(tuple);
+
+	PG_RETURN_DATUM(result);
+}
+
+/*
+ * Try to mark all the shared buffers as dirty.
+ */
+Datum
+pg_buffercache_mark_dirty_all(PG_FUNCTION_ARGS)
+{
+	Datum		result;
+	TupleDesc	tupledesc;
+	HeapTuple	tuple;
+	Datum		values[NUM_BUFFERCACHE_MARK_DIRTY_ALL_ELEM];
+	bool		nulls[NUM_BUFFERCACHE_MARK_DIRTY_ALL_ELEM] = {0};
+
+	int32		buffers_already_dirty = 0;
+	int32		buffers_dirtied = 0;
+	int32		buffers_skipped = 0;
+
+	if (get_call_result_type(fcinfo, NULL, &tupledesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	pg_buffercache_superuser_check("pg_buffercache_mark_dirty_all");
+
+	MarkDirtyAllUnpinnedBuffers(&buffers_dirtied, &buffers_already_dirty,
+								&buffers_skipped);
+
+	values[0] = Int32GetDatum(buffers_dirtied);
+	values[1] = Int32GetDatum(buffers_already_dirty);
 	values[2] = Int32GetDatum(buffers_skipped);
 
 	tuple = heap_form_tuple(tupledesc, values, nulls);

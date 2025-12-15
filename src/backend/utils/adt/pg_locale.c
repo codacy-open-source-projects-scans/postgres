@@ -953,7 +953,7 @@ get_iso_localename(const char *winlocname)
 	wchar_t		wc_locale_name[LOCALE_NAME_MAX_LENGTH];
 	wchar_t		buffer[LOCALE_NAME_MAX_LENGTH];
 	static char iso_lc_messages[LOCALE_NAME_MAX_LENGTH];
-	char	   *period;
+	const char *period;
 	int			len;
 	int			ret_val;
 
@@ -1222,10 +1222,10 @@ pg_newlocale_from_collation(Oid collid)
 		 * Make sure cache entry is marked invalid, in case we fail before
 		 * setting things.
 		 */
-		cache_entry->locale = 0;
+		cache_entry->locale = NULL;
 	}
 
-	if (cache_entry->locale == 0)
+	if (cache_entry->locale == NULL)
 	{
 		cache_entry->locale = create_pg_locale(collid, CollationCacheContext);
 	}
@@ -1588,6 +1588,17 @@ pg_iswxdigit(pg_wchar wc, pg_locale_t locale)
 		return locale->ctype->wc_isxdigit(wc, locale);
 }
 
+bool
+pg_iswcased(pg_wchar wc, pg_locale_t locale)
+{
+	/* for the C locale, Cased and Alpha are equivalent */
+	if (locale->ctype == NULL)
+		return (wc <= (pg_wchar) 127 &&
+				(pg_char_properties[wc] & PG_ISALPHA));
+	else
+		return locale->ctype->wc_iscased(wc, locale);
+}
+
 pg_wchar
 pg_towupper(pg_wchar wc, pg_locale_t locale)
 {
@@ -1627,32 +1638,6 @@ char_is_cased(char ch, pg_locale_t locale)
 	if (locale->ctype == NULL)
 		return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z');
 	return locale->ctype->char_is_cased(ch, locale);
-}
-
-/*
- * char_tolower_enabled()
- *
- * Does the provider support char_tolower()?
- */
-bool
-char_tolower_enabled(pg_locale_t locale)
-{
-	if (locale->ctype == NULL)
-		return true;
-	return (locale->ctype->char_tolower != NULL);
-}
-
-/*
- * char_tolower()
- *
- * Convert char (single-byte encoding) to lowercase.
- */
-char
-char_tolower(unsigned char ch, pg_locale_t locale)
-{
-	if (locale->ctype == NULL)
-		return pg_ascii_tolower(ch);
-	return locale->ctype->char_tolower(ch, locale);
 }
 
 /*

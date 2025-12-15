@@ -758,7 +758,7 @@ PrepareInplaceInvalidationState(void)
 	Assert(inplaceInvalInfo == NULL);
 
 	/* gone after WAL insertion CritSection ends, so use current context */
-	myInfo = (InvalidationInfo *) palloc0(sizeof(InvalidationInfo));
+	myInfo = palloc0_object(InvalidationInfo);
 
 	/* Stash our messages past end of the transactional messages, if any. */
 	if (transInvalInfo != NULL)
@@ -1753,7 +1753,7 @@ CacheInvalidateSmgr(RelFileLocatorBackend rlocator)
 	SharedInvalidationMessage msg;
 
 	/* verify optimization stated above stays valid */
-	StaticAssertStmt(MAX_BACKENDS_BITS <= 23,
+	StaticAssertDecl(MAX_BACKENDS_BITS <= 23,
 					 "MAX_BACKENDS_BITS is too big for inval.c");
 
 	msg.sm.id = SHAREDINVALSMGR_ID;
