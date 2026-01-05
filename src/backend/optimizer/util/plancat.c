@@ -4,7 +4,7 @@
  *	   routines for accessing the system catalogs
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -937,7 +937,7 @@ infer_arbiter_indexes(PlannerInfo *root)
 				Assert(idxForm->indisready);
 
 				/*
-				 * Set up inferElems and inferPredExprs to match the
+				 * Set up inferElems and inferIndexExprs to match the
 				 * constraint index, so that we can match them in the loop
 				 * below.
 				 */

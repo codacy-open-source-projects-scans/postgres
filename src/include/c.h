@@ -9,7 +9,7 @@
  *	  polluting the namespace with lots of stuff...
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/c.h
@@ -1262,7 +1262,7 @@ typedef struct PGAlignedXLogBlock
  */
 
 #if !HAVE_DECL_FDATASYNC
-extern int	fdatasync(int fildes);
+extern int	fdatasync(int fd);
 #endif
 
 /*

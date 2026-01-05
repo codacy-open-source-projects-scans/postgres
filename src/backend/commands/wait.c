@@ -4,7 +4,7 @@
  *	  Implements WAIT FOR, which allows waiting for events such as
  *	  time passing or LSN having been replayed on replica.
  *
- * Portions Copyright (c) 2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2025-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/commands/wait.c
@@ -131,8 +131,8 @@ ExecWaitStmt(ParseState *pstate, WaitStmt *stmt, DestReceiver *dest)
 	if (HaveRegisteredOrActiveSnapshot())
 		ereport(ERROR,
 				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				errmsg("WAIT FOR must be only called without an active or registered snapshot"),
-				errdetail("WAIT FOR cannot be executed from a function or a procedure or within a transaction with an isolation level higher than READ COMMITTED."));
+				errmsg("WAIT FOR must be called without an active or registered snapshot"),
+				errdetail("WAIT FOR cannot be executed from a function or procedure, nor within a transaction with an isolation level higher than READ COMMITTED."));
 
 	/*
 	 * As the result we should hold no snapshot, and correspondingly our xmin

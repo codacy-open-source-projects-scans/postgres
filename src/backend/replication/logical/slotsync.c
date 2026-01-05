@@ -3,7 +3,7 @@
  *	   Functionality for synchronizing slots to a standby server from the
  *         primary server.
  *
- * Copyright (c) 2024-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2024-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/replication/logical/slotsync.c
@@ -173,7 +173,7 @@ update_slotsync_skip_stats(SlotSyncSkipReason skip_reason)
 	slot = MyReplicationSlot;
 
 	/*
-	 * Update the slot sync related stats in pg_stat_replication_slot when a
+	 * Update the slot sync related stats in pg_stat_replication_slots when a
 	 * slot sync is skipped
 	 */
 	if (skip_reason != SS_SKIP_NONE)

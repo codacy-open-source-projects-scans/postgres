@@ -11,7 +11,7 @@
 # This configure script is free software; the Free Software Foundation
 # gives unlimited permission to copy, distribute and modify it.
 #
-# Copyright (c) 1996-2025, PostgreSQL Global Development Group
+# Copyright (c) 1996-2026, PostgreSQL Global Development Group
 ## -------------------- ##
 ## M4sh Initialization. ##
 ## -------------------- ##
@@ -1730,7 +1730,7 @@ Copyright (C) 2012 Free Software Foundation, Inc.
 This configure script is free software; the Free Software Foundation
 gives unlimited permission to copy, distribute and modify it.
 
-Copyright (c) 1996-2025, PostgreSQL Global Development Group
+Copyright (c) 1996-2026, PostgreSQL Global Development Group
 _ACEOF
   exit
 fi
@@ -13669,7 +13669,7 @@ fi
 ## Header files
 ##
 
-for ac_header in atomic.h copyfile.h execinfo.h getopt.h ifaddrs.h mbarrier.h sys/epoll.h sys/event.h sys/personality.h sys/prctl.h sys/procctl.h sys/signalfd.h sys/ucred.h termios.h uchar.h ucred.h xlocale.h
+for ac_header in copyfile.h execinfo.h getopt.h ifaddrs.h sys/epoll.h sys/event.h sys/personality.h sys/prctl.h sys/procctl.h sys/signalfd.h sys/ucred.h termios.h uchar.h ucred.h xlocale.h
 do :
   as_ac_Header=`$as_echo "ac_cv_header_$ac_header" | $as_tr_sh`
 ac_fn_c_check_header_mongrel "$LINENO" "$ac_header" "$as_ac_Header" "$ac_includes_default"

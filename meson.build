@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2025, PostgreSQL Global Development Group
+# Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 # Entry point for building PostgreSQL with meson
 #
@@ -1030,7 +1030,7 @@ if liburing.found()
 
   if cc.has_function('io_uring_queue_init_mem',
       dependencies: liburing, args: test_c_args)
-    cdata.set('HAVE_LIBURING_QUEUE_INIT_MEM', 1)
+    cdata.set('HAVE_IO_URING_QUEUE_INIT_MEM', 1)
   endif
 
 endif
@@ -2626,13 +2626,11 @@ endif
 # XXX: Might be worth conditioning some checks on the OS, to avoid doing
 # unnecessary checks over and over, particularly on windows.
 header_checks = [
-  'atomic.h',
   'copyfile.h',
   'crtdefs.h',
   'execinfo.h',
   'getopt.h',
   'ifaddrs.h',
-  'mbarrier.h',
   'strings.h',
   'sys/epoll.h',
   'sys/event.h',
