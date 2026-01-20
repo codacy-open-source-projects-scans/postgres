@@ -255,6 +255,7 @@ Barrier
 BaseBackupCmd
 BaseBackupTargetHandle
 BaseBackupTargetType
+BatchMVCCState
 BeginDirectModify_function
 BeginForeignInsert_function
 BeginForeignModify_function
@@ -421,6 +422,7 @@ CatalogIdMapEntry
 CatalogIndexState
 ChangeVarNodes_callback
 ChangeVarNodes_context
+ChannelName
 CheckPoint
 CheckPointStmt
 CheckpointStatsData
@@ -1110,6 +1112,8 @@ GistSplitUnion
 GistSplitVector
 GistTsVectorOptions
 GistVacState
+GlobalChannelEntry
+GlobalChannelKey
 GlobalTransaction
 GlobalTransactionData
 GlobalVisHorizonKind
@@ -1579,6 +1583,7 @@ ListParsedLex
 ListenAction
 ListenActionKind
 ListenStmt
+ListenerEntry
 LoInfo
 LoadStmt
 LocalBufferLookupEnt
@@ -2175,6 +2180,8 @@ PatternInfoArray
 Pattern_Prefix_Status
 Pattern_Type
 PendingFsyncEntry
+PendingListenAction
+PendingListenEntry
 PendingRelDelete
 PendingRelSync
 PendingUnlinkEntry
