@@ -208,6 +208,9 @@ typedef struct PlannerGlobal
 	/* "flat" list of RTEPermissionInfos */
 	List	   *finalrteperminfos;
 
+	/* list of SubPlanRTInfo nodes */
+	List	   *subrtinfos;
+
 	/* "flat" list of PlanRowMarks */
 	List	   *finalrowmarks;
 
@@ -228,6 +231,9 @@ typedef struct PlannerGlobal
 
 	/* type OIDs for PARAM_EXEC Params */
 	List	   *paramExecTypes;
+
+	/* info about nodes elided from the plan during setrefs processing */
+	List	   *elidedNodes;
 
 	/* highest PlaceHolderVar ID assigned */
 	Index		lastPHId;

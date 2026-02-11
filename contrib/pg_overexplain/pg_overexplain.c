@@ -191,6 +191,8 @@ overexplain_per_node_hook(PlanState *planstate, List *ancestors,
 	 */
 	if (options->range_table)
 	{
+		bool		opened_elided_nodes = false;
+
 		switch (nodeTag(plan))
 		{
 			case T_SeqScan:
@@ -251,6 +253,43 @@ overexplain_per_node_hook(PlanState *planstate, List *ancestors,
 			default:
 				break;
 		}
+
+		foreach_node(ElidedNode, n, es->pstmt->elidedNodes)
+		{
+			char	   *elidednodetag;
+
+			if (n->plan_node_id != plan->plan_node_id)
+				continue;
+
+			if (!opened_elided_nodes)
+			{
+				ExplainOpenGroup("Elided Nodes", "Elided Nodes", false, es);
+				opened_elided_nodes = true;
+			}
+
+			switch (n->elided_type)
+			{
+				case T_Append:
+					elidednodetag = "Append";
+					break;
+				case T_MergeAppend:
+					elidednodetag = "MergeAppend";
+					break;
+				case T_SubqueryScan:
+					elidednodetag = "SubqueryScan";
+					break;
+				default:
+					elidednodetag = psprintf("%d", n->elided_type);
+					break;
+			}
+
+			ExplainOpenGroup("Elided Node", NULL, true, es);
+			ExplainPropertyText("Elided Node Type", elidednodetag, es);
+			overexplain_bitmapset("Elided Node RTIs", n->relids, es);
+			ExplainCloseGroup("Elided Node", NULL, true, es);
+		}
+		if (opened_elided_nodes)
+			ExplainCloseGroup("Elided Nodes", "Elided Nodes", false, es);
 	}
 }
 
@@ -395,6 +434,8 @@ static void
 overexplain_range_table(PlannedStmt *plannedstmt, ExplainState *es)
 {
 	Index		rti;
+	ListCell   *lc_subrtinfo = list_head(plannedstmt->subrtinfos);
+	SubPlanRTInfo *rtinfo = NULL;
 
 	/* Open group, one entry per RangeTblEntry */
 	ExplainOpenGroup("Range Table", "Range Table", false, es);
@@ -405,6 +446,18 @@ overexplain_range_table(PlannedStmt *plannedstmt, ExplainState *es)
 		RangeTblEntry *rte = rt_fetch(rti, plannedstmt->rtable);
 		char	   *kind = NULL;
 		char	   *relkind;
+		SubPlanRTInfo *next_rtinfo;
+
+		/* Advance to next SubRTInfo, if it's time. */
+		if (lc_subrtinfo != NULL)
+		{
+			next_rtinfo = lfirst(lc_subrtinfo);
+			if (rti > next_rtinfo->rtoffset)
+			{
+				rtinfo = next_rtinfo;
+				lc_subrtinfo = lnext(plannedstmt->subrtinfos, lc_subrtinfo);
+			}
+		}
 
 		/* NULL entries are possible; skip them */
 		if (rte == NULL)
@@ -467,6 +520,28 @@ overexplain_range_table(PlannedStmt *plannedstmt, ExplainState *es)
 			ExplainPropertyText("Kind", kind, es);
 			ExplainPropertyBool("Inherited", rte->inh, es);
 			ExplainPropertyBool("In From Clause", rte->inFromCl, es);
+		}
+
+		/*
+		 * Indicate which subplan is the origin of which RTE. Note dummy
+		 * subplans. Here again, we crunch more onto one line in text format.
+		 */
+		if (rtinfo != NULL)
+		{
+			if (es->format == EXPLAIN_FORMAT_TEXT)
+			{
+				if (!rtinfo->dummy)
+					ExplainPropertyText("Subplan", rtinfo->plan_name, es);
+				else
+					ExplainPropertyText("Subplan",
+										psprintf("%s (dummy)",
+												 rtinfo->plan_name), es);
+			}
+			else
+			{
+				ExplainPropertyText("Subplan", rtinfo->plan_name, es);
+				ExplainPropertyBool("Subplan Is Dummy", rtinfo->dummy, es);
+			}
 		}
 
 		/* rte->alias is optional; rte->eref is requested */

@@ -511,7 +511,8 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 
 	/* Allow plugins to take control after we've initialized "glob" */
 	if (planner_setup_hook)
-		(*planner_setup_hook) (glob, parse, query_string, &tuple_fraction, es);
+		(*planner_setup_hook) (glob, parse, query_string, cursorOptions,
+							   &tuple_fraction, es);
 
 	/* primary planning entry point (may recurse for subqueries) */
 	root = subquery_planner(glob, parse, NULL, NULL, false, tuple_fraction,
@@ -654,6 +655,7 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 	result->unprunableRelids = bms_difference(glob->allRelids,
 											  glob->prunableRelids);
 	result->permInfos = glob->finalrteperminfos;
+	result->subrtinfos = glob->subrtinfos;
 	result->resultRelations = glob->resultRelations;
 	result->appendRelations = glob->appendRelations;
 	result->subplans = glob->subplans;
@@ -664,6 +666,7 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 	result->paramExecTypes = glob->paramExecTypes;
 	/* utilityStmt should be null, but we might as well copy it */
 	result->utilityStmt = parse->utilityStmt;
+	result->elidedNodes = glob->elidedNodes;
 	result->stmt_location = parse->stmt_location;
 	result->stmt_len = parse->stmt_len;
 
