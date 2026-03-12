@@ -469,7 +469,7 @@ GetPrivateRefCountEntrySlow(Buffer buffer, bool do_move)
 		free->data = res->data;
 		PrivateRefCountArrayKeys[ReservedRefCountSlot] = buffer;
 		/* update cache for the next lookup */
-		PrivateRefCountEntryLast = match;
+		PrivateRefCountEntryLast = ReservedRefCountSlot;
 
 		ReservedRefCountSlot = -1;
 
@@ -2516,24 +2516,24 @@ again:
 		}
 
 		/*
-		 * If using a nondefault strategy, and writing the buffer would
-		 * require a WAL flush, let the strategy decide whether to go ahead
-		 * and write/reuse the buffer or to choose another victim.  We need to
-		 * hold the content lock in at least share-exclusive mode to safely
-		 * inspect the page LSN, so this couldn't have been done inside
-		 * StrategyGetBuffer.
+		 * If using a nondefault strategy, and this victim came from the
+		 * strategy ring, let the strategy decide whether to reject it when
+		 * reusing it would require a WAL flush.  This only applies to
+		 * permanent buffers; unlogged buffers can have fake LSNs, so
+		 * XLogNeedsFlush() is not meaningful for them.
+		 *
+		 * We need to hold the content lock in at least share-exclusive mode
+		 * to safely inspect the page LSN, so this couldn't have been done
+		 * inside StrategyGetBuffer().
 		 */
-		if (strategy != NULL)
+		if (strategy && from_ring &&
+			buf_state & BM_PERMANENT &&
+			XLogNeedsFlush(BufferGetLSN(buf_hdr)) &&
+			StrategyRejectBuffer(strategy, buf_hdr, from_ring))
 		{
-			XLogRecPtr	lsn = BufferGetLSN(buf_hdr);
-
-			if (XLogNeedsFlush(lsn)
-				&& StrategyRejectBuffer(strategy, buf_hdr, from_ring))
-			{
-				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-				UnpinBuffer(buf_hdr);
-				goto again;
-			}
+			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+			UnpinBuffer(buf_hdr);
+			goto again;
 		}
 
 		/* OK, do the I/O */
@@ -2882,7 +2882,7 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 			buf_state = LockBufHdr(victim_buf_hdr);
 
 			/* some sanity checks while we hold the buffer header lock */
-			Assert(!(buf_state & (BM_VALID | BM_TAG_VALID | BM_DIRTY | BM_JUST_DIRTIED)));
+			Assert(!(buf_state & (BM_VALID | BM_TAG_VALID | BM_DIRTY)));
 			Assert(BUF_STATE_GET_REFCOUNT(buf_state) == 1);
 
 			victim_buf_hdr->tag = tag;
@@ -3085,7 +3085,7 @@ MarkBufferDirty(Buffer buffer)
 		buf_state = old_buf_state;
 
 		Assert(BUF_STATE_GET_REFCOUNT(buf_state) > 0);
-		buf_state |= BM_DIRTY | BM_JUST_DIRTIED;
+		buf_state |= BM_DIRTY;
 
 		if (pg_atomic_compare_exchange_u64(&bufHdr->state, &old_buf_state,
 										   buf_state))
@@ -4417,7 +4417,6 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	instr_time	io_start;
 	Block		bufBlock;
 	char	   *bufToWrite;
-	uint64		buf_state;
 
 	Assert(BufferLockHeldByMeInMode(buf, BUFFER_LOCK_EXCLUSIVE) ||
 		   BufferLockHeldByMeInMode(buf, BUFFER_LOCK_SHARE_EXCLUSIVE));
@@ -4446,18 +4445,11 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 										reln->smgr_rlocator.locator.dbOid,
 										reln->smgr_rlocator.locator.relNumber);
 
-	buf_state = LockBufHdr(buf);
-
 	/*
 	 * As we hold at least a share-exclusive lock on the buffer, the LSN
 	 * cannot change during the flush (and thus can't be torn).
 	 */
 	recptr = BufferGetLSN(buf);
-
-	/* To check if block content changes while flushing. - vadim 01/17/97 */
-	UnlockBufHdrExt(buf, buf_state,
-					0, BM_JUST_DIRTIED,
-					0);
 
 	/*
 	 * Force XLOG flush up to buffer's LSN.  This implements the basic WAL
@@ -4476,7 +4468,7 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	 * disastrous system-wide consequences.  To make sure that can't happen,
 	 * skip the flush if the buffer isn't permanent.
 	 */
-	if (buf_state & BM_PERMANENT)
+	if (pg_atomic_read_u64(&buf->state) & BM_PERMANENT)
 		XLogFlush(recptr);
 
 	/*
@@ -4529,8 +4521,7 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	pgBufferUsage.shared_blks_written++;
 
 	/*
-	 * Mark the buffer as clean (unless BM_JUST_DIRTIED has become set) and
-	 * end the BM_IO_IN_PROGRESS state.
+	 * Mark the buffer as clean and end the BM_IO_IN_PROGRESS state.
 	 */
 	TerminateBufferIO(buf, true, 0, true, false);
 
@@ -4625,34 +4616,45 @@ BufferIsPermanent(Buffer buffer)
 
 /*
  * BufferGetLSNAtomic
- *		Retrieves the LSN of the buffer atomically using a buffer header lock.
- *		This is necessary for some callers who may only hold a share lock on
- *		the buffer. A share lock allows a concurrent backend to set hint bits
- *		on the page, which in turn may require a WAL record to be emitted.
+ *		Retrieves the LSN of the buffer atomically.
+ *
+ * This is necessary for some callers who may only hold a share lock on
+ * the buffer. A share lock allows a concurrent backend to set hint bits
+ * on the page, which in turn may require a WAL record to be emitted.
+ *
+ * On platforms with 8 byte atomic reads/writes, we don't need to do any
+ * additional locking. On platforms not supporting such 8 byte atomic
+ * reads/writes, we need to actually take the header lock.
  */
 XLogRecPtr
 BufferGetLSNAtomic(Buffer buffer)
 {
-	char	   *page = BufferGetPage(buffer);
-	BufferDesc *bufHdr;
-	XLogRecPtr	lsn;
-
-	/*
-	 * If we don't need locking for correctness, fastpath out.
-	 */
-	if (!XLogHintBitIsNeeded() || BufferIsLocal(buffer))
-		return PageGetLSN(page);
-
 	/* Make sure we've got a real buffer, and that we hold a pin on it. */
 	Assert(BufferIsValid(buffer));
 	Assert(BufferIsPinned(buffer));
 
-	bufHdr = GetBufferDescriptor(buffer - 1);
-	LockBufHdr(bufHdr);
-	lsn = PageGetLSN(page);
-	UnlockBufHdr(bufHdr);
+#ifdef PG_HAVE_8BYTE_SINGLE_COPY_ATOMICITY
+	return PageGetLSN(BufferGetPage(buffer));
+#else
+	{
+		char	   *page = BufferGetPage(buffer);
+		BufferDesc *bufHdr;
+		XLogRecPtr	lsn;
 
-	return lsn;
+		/*
+		 * If we don't need locking for correctness, fastpath out.
+		 */
+		if (!XLogHintBitIsNeeded() || BufferIsLocal(buffer))
+			return PageGetLSN(page);
+
+		bufHdr = GetBufferDescriptor(buffer - 1);
+		LockBufHdr(bufHdr);
+		lsn = PageGetLSN(page);
+		UnlockBufHdr(bufHdr);
+
+		return lsn;
+	}
+#endif
 }
 
 /* ---------------------------------------------------------------------
@@ -5576,11 +5578,10 @@ MarkSharedBufferDirtyHint(Buffer buffer, BufferDesc *bufHdr, uint64 lockstate,
 	 * cleaned or dirtied the page concurrently, so we can just rely on the
 	 * previously fetched value here without any danger of races.
 	 */
-	if (unlikely((lockstate & (BM_DIRTY | BM_JUST_DIRTIED)) !=
-				 (BM_DIRTY | BM_JUST_DIRTIED)))
+	if (unlikely(!(lockstate & BM_DIRTY)))
 	{
 		XLogRecPtr	lsn = InvalidXLogRecPtr;
-		bool		delayChkptFlags = false;
+		bool		wal_log = false;
 		uint64		buf_state;
 
 		/*
@@ -5606,35 +5607,18 @@ MarkSharedBufferDirtyHint(Buffer buffer, BufferDesc *bufHdr, uint64 lockstate,
 				RelFileLocatorSkippingWAL(BufTagGetRelFileLocator(&bufHdr->tag)))
 				return;
 
-			/*
-			 * If the block is already dirty because we either made a change
-			 * or set a hint already, then we don't need to write a full page
-			 * image.  Note that aggressive cleaning of blocks dirtied by hint
-			 * bit setting would increase the call rate. Bulk setting of hint
-			 * bits would reduce the call rate...
-			 *
-			 * We must issue the WAL record before we mark the buffer dirty.
-			 * Otherwise we might write the page before we write the WAL. That
-			 * causes a race condition, since a checkpoint might occur between
-			 * writing the WAL record and marking the buffer dirty. We solve
-			 * that with a kluge, but one that is already in use during
-			 * transaction commit to prevent race conditions. Basically, we
-			 * simply prevent the checkpoint WAL record from being written
-			 * until we have marked the buffer dirty. We don't start the
-			 * checkpoint flush until we have marked dirty, so our checkpoint
-			 * must flush the change to disk successfully or the checkpoint
-			 * never gets written, so crash recovery will fix.
-			 *
-			 * It's possible we may enter here without an xid, so it is
-			 * essential that CreateCheckPoint waits for virtual transactions
-			 * rather than full transactionids.
-			 */
-			Assert((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0);
-			MyProc->delayChkptFlags |= DELAY_CHKPT_START;
-			delayChkptFlags = true;
-			lsn = XLogSaveBufferForHint(buffer, buffer_std);
+			wal_log = true;
 		}
 
+		/*
+		 * We must mark the page dirty before we emit the WAL record, as per
+		 * the usual rules, to ensure that BufferSync()/SyncOneBuffer() try to
+		 * flush the buffer, even if we haven't inserted the WAL record yet.
+		 * As we hold at least a share-exclusive lock, checkpoints will wait
+		 * for this backend to be done with the buffer before continuing. If
+		 * we did it the other way round, a checkpoint could start between
+		 * writing the WAL record and marking the buffer dirty.
+		 */
 		buf_state = LockBufHdr(bufHdr);
 
 		/*
@@ -5643,6 +5627,19 @@ MarkSharedBufferDirtyHint(Buffer buffer, BufferDesc *bufHdr, uint64 lockstate,
 		 */
 		Assert(!(buf_state & BM_DIRTY));
 		Assert(BUF_STATE_GET_REFCOUNT(buf_state) > 0);
+		UnlockBufHdrExt(bufHdr, buf_state,
+						BM_DIRTY,
+						0, 0);
+
+		/*
+		 * If the block is already dirty because we either made a change or
+		 * set a hint already, then we don't need to write a full page image.
+		 * Note that aggressive cleaning of blocks dirtied by hint bit setting
+		 * would increase the call rate. Bulk setting of hint bits would
+		 * reduce the call rate...
+		 */
+		if (wal_log)
+			lsn = XLogSaveBufferForHint(buffer, buffer_std);
 
 		if (XLogRecPtrIsValid(lsn))
 		{
@@ -5659,15 +5656,10 @@ MarkSharedBufferDirtyHint(Buffer buffer, BufferDesc *bufHdr, uint64 lockstate,
 			 * checksum here. That will happen when the page is written
 			 * sometime later in this checkpoint cycle.
 			 */
+			buf_state = LockBufHdr(bufHdr);
 			PageSetLSN(page, lsn);
+			UnlockBufHdr(bufHdr);
 		}
-
-		UnlockBufHdrExt(bufHdr, buf_state,
-						BM_DIRTY | BM_JUST_DIRTIED,
-						0, 0);
-
-		if (delayChkptFlags)
-			MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 
 		pgBufferUsage.shared_blks_dirtied++;
 		if (VacuumCostActive)
@@ -7132,10 +7124,8 @@ StartBufferIO(BufferDesc *buf, bool forInput, bool nowait)
  *	BM_IO_IN_PROGRESS bit is set for the buffer
  *	The buffer is Pinned
  *
- * If clear_dirty is true and BM_JUST_DIRTIED is not set, we clear the
- * buffer's BM_DIRTY flag.  This is appropriate when terminating a
- * successful write.  The check on BM_JUST_DIRTIED is necessary to avoid
- * marking the buffer clean if it was re-dirtied while we were writing.
+ * If clear_dirty is true, we clear the buffer's BM_DIRTY flag.  This is
+ * appropriate when terminating a successful write.
  *
  * set_flag_bits gets ORed into the buffer's flags.  It must include
  * BM_IO_ERROR in a failure case.  For successful completion it could
@@ -7161,7 +7151,7 @@ TerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint64 set_flag_bits,
 	/* Clear earlier errors, if this IO failed, it'll be marked again */
 	unset_flag_bits |= BM_IO_ERROR;
 
-	if (clear_dirty && !(buf_state & BM_JUST_DIRTIED))
+	if (clear_dirty)
 		unset_flag_bits |= BM_DIRTY | BM_CHECKPOINT_NEEDED;
 
 	if (release_aio)
