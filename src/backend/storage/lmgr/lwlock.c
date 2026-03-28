@@ -200,7 +200,7 @@ typedef struct LWLockTrancheShmemData
 
 static LWLockTrancheShmemData *LWLockTranches;
 
-/* backend-local copy of NamedLWLockTranches->num_user_defined */
+/* backend-local copy of LWLockTranches->num_user_defined */
 static int	LocalNumUserDefinedTranches;
 
 /*
@@ -460,7 +460,8 @@ LWLockShmemInit(void)
 }
 
 /*
- * Initialize LWLocks that are fixed and those belonging to named tranches.
+ * Initialize LWLocks for built-in tranches and those requested with
+ * RequestNamedLWLockTranche().
  */
 static void
 InitializeLWLocks(int numLocks)
@@ -487,8 +488,8 @@ InitializeLWLocks(int numLocks)
 		LWLockInitialize(&MainLWLockArray[pos++].lock, LWTRANCHE_PREDICATE_LOCK_MANAGER);
 
 	/*
-	 * Copy the info about any named tranches into shared memory (so that
-	 * other processes can see it), and initialize the requested LWLocks.
+	 * Copy the info about any user-defined tranches into shared memory (so
+	 * that other processes can see it), and initialize the requested LWLocks.
 	 */
 	Assert(pos == NUM_FIXED_LWLOCKS);
 	foreach_ptr(NamedLWLockTrancheRequest, request, NamedLWLockTrancheRequests)
@@ -536,8 +537,9 @@ GetNamedLWLockTranche(const char *tranche_name)
 
 	/*
 	 * Obtain the position of base address of LWLock belonging to requested
-	 * tranche_name in MainLWLockArray.  LWLocks for named tranches are placed
-	 * in MainLWLockArray after fixed locks.
+	 * tranche_name in MainLWLockArray.  LWLocks for user-defined tranches
+	 * requested with RequestNamedLWLockTranche() are placed in
+	 * MainLWLockArray after fixed locks.
 	 */
 	for (int i = 0; i < LocalNumUserDefinedTranches; i++)
 	{
@@ -628,6 +630,7 @@ void
 RequestNamedLWLockTranche(const char *tranche_name, int num_lwlocks)
 {
 	NamedLWLockTrancheRequest *request;
+	MemoryContext oldcontext;
 
 	if (!process_shmem_requests_in_progress)
 		elog(FATAL, "cannot request additional LWLocks outside shmem_request_hook");
@@ -650,10 +653,17 @@ RequestNamedLWLockTranche(const char *tranche_name, int num_lwlocks)
 				 errdetail("No more than %d tranches may be registered.",
 						   MAX_USER_DEFINED_TRANCHES)));
 
-	request = MemoryContextAllocZero(PostmasterContext, sizeof(NamedLWLockTrancheRequest));
+	if (IsPostmasterEnvironment)
+		oldcontext = MemoryContextSwitchTo(PostmasterContext);
+	else
+		oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+
+	request = palloc0(sizeof(NamedLWLockTrancheRequest));
 	strlcpy(request->tranche_name, tranche_name, NAMEDATALEN);
 	request->num_lwlocks = num_lwlocks;
 	NamedLWLockTrancheRequests = lappend(NamedLWLockTrancheRequests, request);
+
+	MemoryContextSwitchTo(oldcontext);
 }
 
 /*

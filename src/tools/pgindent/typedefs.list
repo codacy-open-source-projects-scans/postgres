@@ -187,6 +187,7 @@ AuthToken
 AutoPrewarmReadStreamData
 AutoPrewarmSharedState
 AutoVacOpts
+AutoVacuumScores
 AutoVacuumShmemStruct
 AutoVacuumWorkItem
 AutoVacuumWorkItemType
@@ -308,6 +309,7 @@ BlockSampler
 BlockSamplerData
 BlockedProcData
 BlockedProcsData
+BlocksReadStreamData
 BlocktableEntry
 BloomBuildState
 BloomFilter
@@ -2944,6 +2946,7 @@ SplitTextOutputData
 SplitVar
 StackElem
 StakindFlags
+StartBufferIOResult
 StartDataPtrType
 StartLOPtrType
 StartLOsPtrType
@@ -3099,6 +3102,7 @@ TableScanDesc
 TableScanDescData
 TableSpaceCacheEntry
 TableSpaceOpts
+TableToProcess
 TablespaceList
 TablespaceListCell
 TapeBlockTrailer
