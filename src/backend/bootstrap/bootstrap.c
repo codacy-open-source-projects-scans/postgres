@@ -39,6 +39,7 @@
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/proc.h"
+#include "storage/shmem_internal.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
@@ -362,6 +363,8 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
 	SetProcessingMode(BootstrapProcessing);
 	IgnoreSystemIndexes = true;
 
+	RegisterBuiltinShmemCallbacks();
+
 	InitializeMaxBackends();
 
 	/*
@@ -373,6 +376,7 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
 
 	InitializeFastPathLocks();
 
+	ShmemCallRequestCallbacks();
 	CreateSharedMemoryAndSemaphores();
 
 	/*
@@ -1184,7 +1188,7 @@ build_indices(void)
 		heap = table_open(ILHead->il_heap, NoLock);
 		ind = index_open(ILHead->il_ind, NoLock);
 
-		index_build(heap, ind, ILHead->il_info, false, false);
+		index_build(heap, ind, ILHead->il_info, false, false, false);
 
 		index_close(ind, NoLock);
 		table_close(heap, NoLock);
