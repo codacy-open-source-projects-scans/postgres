@@ -293,9 +293,9 @@ REPACK [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] USING
 
        <listitem>
         <para>
-         The <link linkend="guc-max-replication-slots"><varname>max_replication_slots</varname></link>
-         configuration parameter does not allow for creation of an additional
-         replication slot.
+         The <link linkend="guc-max-repack-replication-slots"><varname>max_repack_replication_slots</varname></link>
+         configuration parameter does not allow for the creation of an
+         additional replication slot.
         </para>
        </listitem>
       </itemizedlist>
@@ -390,10 +390,18 @@ REPACK employees;
 
   <para>
    Repack the table <literal>employees</literal> on the basis of its
-   index <literal>employees_ind</literal> (Since index is used here, this is
+   index <literal>employees_ind</literal> (since an index is specified, this is
    effectively clustering):
 <programlisting>
 REPACK employees USING INDEX employees_ind;
+</programlisting>
+  </para>
+
+  <para>
+   Repack the <literal>employees</literal> table following the same index
+   as was used before, in concurrent mode:
+<programlisting>
+REPACK (CONCURRENTLY) employees USING INDEX;
 </programlisting>
   </para>
 

@@ -1279,6 +1279,7 @@ IOContext
 IOFuncSelector
 IOObject
 IOOp
+IOStats
 IO_STATUS_BLOCK
 IPCompareMethod
 ITEM
@@ -2799,6 +2800,7 @@ SelfJoinCandidate
 SemTPadded
 SemiAntiJoinFactors
 SeqScan
+SeqScanInstrumentation
 SeqScanState
 SeqTable
 SeqTableData
@@ -2863,7 +2865,9 @@ SharedMemoizeInfo
 SharedRecordTableEntry
 SharedRecordTableKey
 SharedRecordTypmodRegistry
+SharedSeqScanInstrumentation
 SharedSortInfo
+SharedTidRangeScanInstrumentation
 SharedTuplestore
 SharedTuplestoreAccessor
 SharedTuplestoreChunk
@@ -3127,6 +3131,7 @@ TableLikeClause
 TableSampleClause
 TableScanDesc
 TableScanDescData
+TableScanInstrumentation
 TableSpaceCacheEntry
 TableSpaceOpts
 TableToProcess
@@ -3167,6 +3172,7 @@ TidOpExpr
 TidPath
 TidRangePath
 TidRangeScan
+TidRangeScanInstrumentation
 TidRangeScanState
 TidScan
 TidScanState
@@ -3185,6 +3191,7 @@ TimeoutId
 TimeoutType
 Timestamp
 TimestampTz
+TimingClockSourceType
 TmFromChar
 TmToChar
 ToastAttrInfo
@@ -4087,10 +4094,14 @@ pgpa_trove_slice
 pgpa_unrolled_join
 pgsa_entry
 pgsa_entry_key
+pgsa_saved_entry
+pgsa_saved_stash
+pgsa_saved_stash_table_hash
 pgsa_shared_state
 pgsa_stash
 pgsa_stash_count
 pgsa_stash_name
+pgsa_writer_context
 pgsocket
 pgsql_thing_t
 pgssEntry
