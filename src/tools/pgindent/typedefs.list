@@ -7,6 +7,7 @@ ASN1_OBJECT
 ASN1_OCTET_STRING
 ASN1_STRING
 ATAlterConstraint
+AttrResultArgMap
 AV
 A_ArrayExpr
 A_Const
@@ -2271,6 +2272,7 @@ PgAioUringCaps
 PgAioUringContext
 PgAioWaitRef
 PgAioWorkerControl
+PgAioWorkerSet
 PgAioWorkerSlot
 PgAioWorkerSubmissionQueue
 PgArchData
@@ -4183,8 +4185,6 @@ qc_hash_func
 qsort_arg_comparator
 qsort_comparator
 query_pathkeys_callback
-radius_attribute
-radius_packet
 RadixSortInfo
 rangeTableEntry_used_context
 rank_context
@@ -4217,9 +4217,11 @@ relopt_ternary
 relopt_type
 relopt_value
 relopts_validator
+RemoteAttributeMapping
 remoteConn
 remoteConnHashEnt
 remoteDep
+RemoteStatsResults
 remove_nulling_relids_context
 rendezvousHashEntry
 rep
