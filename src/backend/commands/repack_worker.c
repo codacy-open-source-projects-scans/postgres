@@ -44,6 +44,9 @@ static bool am_repack_worker = false;
 /* The WAL segment being decoded. */
 static XLogSegNo repack_current_segment = 0;
 
+/* Our DSM segment, for shutting down */
+static dsm_segment *worker_dsm_segment = NULL;
+
 /*
  * Keep track of the table we're processing, to skip logical decoding of data
  * from other relations.
@@ -78,9 +81,9 @@ RepackWorkerMain(Datum main_arg)
 		ereport(ERROR,
 				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				errmsg("could not map dynamic shared memory segment"));
+	worker_dsm_segment = seg;
 
 	shared = (DecodingWorkerShared *) dsm_segment_address(seg);
-	shared->dsm_seg = seg;
 
 	/* Arrange to signal the leader if we exit. */
 	before_shmem_exit(RepackWorkerShutdown, PointerGetDatum(shared));
@@ -176,7 +179,7 @@ RepackWorkerShutdown(int code, Datum arg)
 				   PROCSIG_REPACK_MESSAGE,
 				   shared->backend_proc_number);
 
-	dsm_detach(shared->dsm_seg);
+	dsm_detach(worker_dsm_segment);
 }
 
 bool
@@ -268,7 +271,7 @@ repack_setup_logical_decoding(Oid relid)
 	ctx->reader->routine.page_read = read_local_xlog_page_no_wait;
 
 	/* Some WAL records should have been read. */
-	Assert(ctx->reader->EndRecPtr != InvalidXLogRecPtr);
+	Assert(XLogRecPtrIsValid(ctx->reader->EndRecPtr));
 
 	/*
 	 * Initialize repack_current_segment so that we can notice WAL segment
