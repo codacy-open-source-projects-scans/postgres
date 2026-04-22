@@ -4598,7 +4598,7 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	 * When a strategy is not in use, the write can only be a "regular" write
 	 * of a dirty shared buffer (IOCONTEXT_NORMAL IOOP_WRITE).
 	 */
-	pgstat_count_io_op_time(IOOBJECT_RELATION, io_context,
+	pgstat_count_io_op_time(io_object, io_context,
 							IOOP_WRITE, io_start, 1, BLCKSZ);
 
 	pgBufferUsage.shared_blks_written++;
@@ -4629,7 +4629,7 @@ FlushUnlockedBuffer(BufferDesc *buf, SMgrRelation reln,
 	Buffer		buffer = BufferDescriptorGetBuffer(buf);
 
 	BufferLockAcquire(buffer, buf, BUFFER_LOCK_SHARE_EXCLUSIVE);
-	FlushBuffer(buf, reln, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+	FlushBuffer(buf, reln, io_object, io_context);
 	BufferLockUnlock(buffer, buf);
 }
 
@@ -5844,7 +5844,7 @@ MarkBufferDirtyHint(Buffer buffer, bool buffer_std)
  * Used to clean up after errors.
  *
  * Currently, we can expect that resource owner cleanup, via
- * ResOwnerReleaseBufferPin(), took care of releasing buffer content locks per
+ * ResOwnerReleaseBuffer(), took care of releasing buffer content locks per
  * se; the only thing we need to deal with here is clearing any PIN_COUNT
  * request that was in progress.
  */
@@ -5993,7 +5993,7 @@ BufferLockAcquire(Buffer buffer, BufferDesc *buf_hdr, BufferLockMode mode)
 
 		pgstat_report_wait_end();
 
-		/* Retrying, allow BufferLockRelease to release waiters again. */
+		/* Retrying, allow BufferLockReleaseSub to release waiters again. */
 		pg_atomic_fetch_and_u64(&buf_hdr->state, ~BM_LOCK_WAKE_IN_PROGRESS);
 	}
 
