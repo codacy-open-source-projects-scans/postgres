@@ -185,7 +185,7 @@ pg_GSS_write(PGconn *conn, const void *ptr, size_t len)
 		else
 			input.length = bytes_to_encrypt;
 
-		input.value = (char *) ptr + bytes_encrypted;
+		input.value = unconstify(char *, (const char *) ptr) + bytes_encrypted;
 
 		output.value = NULL;
 		output.length = 0;
@@ -469,6 +469,13 @@ gss_read(PGconn *conn, void *recv_buffer, size_t length, ssize_t *ret)
 	}
 
 	return PGRES_POLLING_OK;
+}
+
+ssize_t
+pg_GSS_bytes_pending(PGconn *conn)
+{
+	Assert(PqGSSResultLength >= PqGSSResultNext);
+	return (ssize_t) (PqGSSResultLength - PqGSSResultNext);
 }
 
 /*

@@ -36,12 +36,13 @@
 #ifndef FRONTEND
 #include "pgstat.h"
 #include "storage/bufmgr.h"
+#include "utils/memutils.h"
 #include "utils/wait_event.h"
 #else
 #include "common/logging.h"
 #endif
 
-static void report_invalid_record(XLogReaderState *state, const char *fmt,...)
+static void report_invalid_record(XLogReaderState *state, const char *fmt, ...)
 			pg_attribute_printf(2, 3);
 static void allocate_recordbuf(XLogReaderState *state, uint32 reclength);
 static int	ReadPageInternal(XLogReaderState *state, XLogRecPtr pageptr,
@@ -55,6 +56,12 @@ static bool ValidXLogRecord(XLogReaderState *state, XLogRecord *record,
 static void ResetDecoder(XLogReaderState *state);
 static void WALOpenSegmentInit(WALOpenSegment *seg, WALSegmentContext *segcxt,
 							   int segsize, const char *waldir);
+#ifndef FRONTEND
+static void xlogreader_memory_context_reset_cb(void *arg);
+#ifdef USE_ZSTD
+static void XLogReaderFreeZstdContext(void *arg);
+#endif
+#endif
 
 /* size of the buffer allocated for error message. */
 #define MAX_ERRORMSG_LEN 1000
@@ -70,7 +77,7 @@ static void WALOpenSegmentInit(WALOpenSegment *seg, WALSegmentContext *segcxt,
  * the current record being read.
  */
 static void
-report_invalid_record(XLogReaderState *state, const char *fmt,...)
+report_invalid_record(XLogReaderState *state, const char *fmt, ...)
 {
 	va_list		args;
 
@@ -162,7 +169,13 @@ XLogReaderAllocate(int wal_segment_size, const char *waldir,
 void
 XLogReaderFree(XLogReaderState *state)
 {
-	if (state->seg.ws_file != -1)
+#ifndef FRONTEND
+	if (state->reset_cb_registered)
+		MemoryContextUnregisterResetCallback(GetMemoryChunkContext(state),
+											 &state->reset_cb);
+#endif
+
+	if (state->seg.ws_file >= 0)
 		state->routine.segment_close(state);
 
 	if (state->decode_buffer && state->free_decode_buffer)
@@ -171,9 +184,66 @@ XLogReaderFree(XLogReaderState *state)
 	pfree(state->errormsg_buf);
 	if (state->readRecordBuf)
 		pfree(state->readRecordBuf);
+#ifdef USE_ZSTD
+	if (state->zstd_dctx != NULL)
+	{
+#ifndef FRONTEND
+		MemoryContextUnregisterResetCallback(GetMemoryChunkContext(state),
+											 &state->zstd_dctx_cb);
+#endif
+		ZSTD_freeDCtx(state->zstd_dctx);
+	}
+#endif
 	pfree(state->readBuf);
 	pfree(state);
 }
+
+#ifndef FRONTEND
+
+/*
+ * Memory context reset callback for an XLogReader.
+ */
+static void
+xlogreader_memory_context_reset_cb(void *arg)
+{
+	XLogReaderState *state = (XLogReaderState *) arg;
+
+	/* Close the WAL segment file that was left open */
+	if (state->seg.ws_file >= 0)
+		state->routine.segment_close(state);
+}
+
+/*
+ * Register a memory reset callback, closing a segment, if necessary.
+ *
+ * This is useful when opening a WAL segment file with BasicOpenFile(), which
+ * doesn't have the automatic file descriptor cleanup that OpenTransientFile()
+ * provides, to guarantee that the segment is closed before XLogReaderFree() is
+ * reached (on ERRORs, for example).
+ */
+void
+XLogReaderRegisterResetCallback(XLogReaderState *state)
+{
+	if (state->reset_cb_registered)
+		return;
+
+	state->reset_cb.func = xlogreader_memory_context_reset_cb;
+	state->reset_cb.arg = state;
+	MemoryContextRegisterResetCallback(GetMemoryChunkContext(state),
+									   &state->reset_cb);
+	state->reset_cb_registered = true;
+}
+
+#ifdef USE_ZSTD
+/* Release the zstd decomoression context. */
+static void
+XLogReaderFreeZstdContext(void *arg)
+{
+	ZSTD_freeDCtx(arg);
+}
+#endif
+
+#endif							/* FRONTEND */
 
 /*
  * Allocate readRecordBuf to fit a record of at least the given length.
@@ -185,15 +255,20 @@ XLogReaderFree(XLogReaderState *state)
  * with.  (That is enough for all "normal" records, but very large commit or
  * abort records might need more space.)
  *
+ * The caller must make sure that "reclength" is valid and within the
+ * XLogRecordMaxSize limit.
+ *
  * Note: This routine should *never* be called for xl_tot_len until the header
  * of the record has been fully validated.
  */
 static void
 allocate_recordbuf(XLogReaderState *state, uint32 reclength)
 {
-	uint32		newSize = reclength;
+	uint32		newSize;
 
-	newSize += XLOG_BLCKSZ - (newSize % XLOG_BLCKSZ);
+	Assert(reclength <= XLogRecordMaxSize);
+
+	newSize = TYPEALIGN(XLOG_BLCKSZ, reclength);
 	newSize = Max(newSize, 5 * Max(BLCKSZ, XLOG_BLCKSZ));
 
 	if (state->readRecordBuf)
@@ -673,6 +748,21 @@ restart:
 								  (uint32) SizeOfXLogRecord, total_len);
 			goto err;
 		}
+
+		/*
+		 * If the record length exceeds the maximum allowed size, don't try to
+		 * reconstruct it.  The backend enforces the same limit in
+		 * XLogRecordAssemble().
+		 */
+		if (total_len > XLogRecordMaxSize)
+		{
+			report_invalid_record(state,
+								  "invalid record length at %X/%08X: expected at most %u, got %u",
+								  LSN_FORMAT_ARGS(RecPtr),
+								  XLogRecordMaxSize, total_len);
+			goto err;
+		}
+
 		/* We'll validate the header once we have the next page. */
 		gotheader = false;
 	}
@@ -1148,6 +1238,15 @@ ValidXLogRecordHeader(XLogReaderState *state, XLogRecPtr RecPtr,
 							  (uint32) SizeOfXLogRecord, record->xl_tot_len);
 		return false;
 	}
+
+	if (record->xl_tot_len > XLogRecordMaxSize)
+	{
+		report_invalid_record(state,
+							  "invalid record length at %X/%08X: expected at most %u, got %u",
+							  LSN_FORMAT_ARGS(RecPtr),
+							  XLogRecordMaxSize, record->xl_tot_len);
+		return false;
+	}
 	if (!RmgrIdIsValid(record->xl_rmid))
 	{
 		report_invalid_record(state,
@@ -1548,8 +1647,8 @@ WALRead(XLogReaderState *state,
 	while (nbytes > 0)
 	{
 		uint32		startoff;
-		int			segbytes;
-		int			readbytes;
+		size_t		segbytes;
+		ssize_t		readbytes;
 
 		startoff = XLogSegmentOffset(recptr, state->segcxt.ws_segsize);
 
@@ -1597,9 +1696,6 @@ WALRead(XLogReaderState *state,
 
 #ifndef FRONTEND
 		pgstat_report_wait_end();
-
-		pgstat_count_io_op_time(IOOBJECT_WAL, IOCONTEXT_NORMAL, IOOP_READ,
-								io_start, 1, readbytes);
 #endif
 
 		if (readbytes <= 0)
@@ -1611,6 +1707,11 @@ WALRead(XLogReaderState *state,
 			errinfo->wre_seg = state->seg;
 			return false;
 		}
+
+#ifndef FRONTEND
+		pgstat_count_io_op_time(IOOBJECT_WAL, IOCONTEXT_NORMAL, IOOP_READ,
+								io_start, 1, readbytes);
+#endif
 
 		/* Update state for read */
 		recptr += readbytes;
@@ -1898,7 +1999,7 @@ DecodeXLogRecord(XLogReaderState *state,
 				{
 					report_invalid_record(state,
 										  "neither BKPIMAGE_HAS_HOLE nor BKPIMAGE_COMPRESSED set, but block image length is %d at %X/%08X",
-										  blk->data_len,
+										  blk->bimg_len,
 										  LSN_FORMAT_ARGS(state->ReadRecPtr));
 					goto err;
 				}
@@ -2146,9 +2247,31 @@ RestoreBlockImage(XLogReaderState *record, uint8 block_id, char *page)
 		else if ((bkpb->bimg_info & BKPIMAGE_COMPRESS_ZSTD) != 0)
 		{
 #ifdef USE_ZSTD
-			size_t		decomp_result = ZSTD_decompress(tmp.data,
-														BLCKSZ - bkpb->hole_length,
-														ptr, bkpb->bimg_len);
+			size_t		decomp_result;
+
+			if (record->zstd_dctx == NULL)
+			{
+				record->zstd_dctx = ZSTD_createDCtx();
+				if (record->zstd_dctx == NULL)
+				{
+					report_invalid_record(record, "out of memory while restoring image at %X/%08X, block %d",
+										  LSN_FORMAT_ARGS(record->ReadRecPtr),
+										  block_id);
+					return false;
+				}
+
+#ifndef FRONTEND
+				/* The reader may outlive the current memory context. */
+				record->zstd_dctx_cb.func = XLogReaderFreeZstdContext;
+				record->zstd_dctx_cb.arg = record->zstd_dctx;
+				MemoryContextRegisterResetCallback(GetMemoryChunkContext(record),
+												   &record->zstd_dctx_cb);
+#endif
+			}
+
+			decomp_result = ZSTD_decompressDCtx(record->zstd_dctx, tmp.data,
+												BLCKSZ - bkpb->hole_length,
+												ptr, bkpb->bimg_len);
 
 			if (ZSTD_isError(decomp_result))
 				decomp_success = false;

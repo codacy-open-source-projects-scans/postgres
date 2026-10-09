@@ -304,9 +304,10 @@ SyncRepWaitForLSN(XLogRecPtr lsn, bool commit)
 				ereport(WARNING,
 						(errcode(ERRCODE_ADMIN_SHUTDOWN),
 						 errmsg("canceling the wait for synchronous replication and terminating connection due to administrator command"),
-						 errdetail("The transaction has already committed locally, but might not have been replicated to the standby.  Signal sent by PID %d, UID %d.",
-								   (int) ProcDieSenderPid,
-								   (int) ProcDieSenderUid)));
+						 errdetail("The transaction has already committed locally, but might not have been replicated to the standby."),
+						 errdetail_log("The transaction has already committed locally, but might not have been replicated to the standby.  Signal sent by PID %d, UID %d.",
+									   (int) ProcDieSenderPid,
+									   (int) ProcDieSenderUid)));
 			else
 				ereport(WARNING,
 						(errcode(ERRCODE_ADMIN_SHUTDOWN),
@@ -482,7 +483,6 @@ SyncRepInitConfig(void)
 void
 SyncRepReleaseWaiters(void)
 {
-	volatile WalSndCtlData *walsndctl = WalSndCtl;
 	XLogRecPtr	writePtr;
 	XLogRecPtr	flushPtr;
 	XLogRecPtr	applyPtr;
@@ -557,19 +557,19 @@ SyncRepReleaseWaiters(void)
 	 * Set the lsn first so that when we wake backends they will release up to
 	 * this location.
 	 */
-	if (walsndctl->lsn[SYNC_REP_WAIT_WRITE] < writePtr)
+	if (WalSndCtl->lsn[SYNC_REP_WAIT_WRITE] < writePtr)
 	{
-		walsndctl->lsn[SYNC_REP_WAIT_WRITE] = writePtr;
+		WalSndCtl->lsn[SYNC_REP_WAIT_WRITE] = writePtr;
 		numwrite = SyncRepWakeQueue(false, SYNC_REP_WAIT_WRITE);
 	}
-	if (walsndctl->lsn[SYNC_REP_WAIT_FLUSH] < flushPtr)
+	if (WalSndCtl->lsn[SYNC_REP_WAIT_FLUSH] < flushPtr)
 	{
-		walsndctl->lsn[SYNC_REP_WAIT_FLUSH] = flushPtr;
+		WalSndCtl->lsn[SYNC_REP_WAIT_FLUSH] = flushPtr;
 		numflush = SyncRepWakeQueue(false, SYNC_REP_WAIT_FLUSH);
 	}
-	if (walsndctl->lsn[SYNC_REP_WAIT_APPLY] < applyPtr)
+	if (WalSndCtl->lsn[SYNC_REP_WAIT_APPLY] < applyPtr)
 	{
-		walsndctl->lsn[SYNC_REP_WAIT_APPLY] = applyPtr;
+		WalSndCtl->lsn[SYNC_REP_WAIT_APPLY] = applyPtr;
 		numapply = SyncRepWakeQueue(false, SYNC_REP_WAIT_APPLY);
 	}
 
@@ -776,8 +776,7 @@ SyncRepGetCandidateStandbys(SyncRepStandbyData **standbys)
 	n = 0;
 	for (i = 0; i < max_wal_senders; i++)
 	{
-		volatile WalSnd *walsnd;	/* Use volatile pointer to prevent code
-									 * rearrangement */
+		WalSnd	   *walsnd;
 		SyncRepStandbyData *stby;
 		WalSndState state;		/* not included in SyncRepStandbyData */
 
@@ -914,7 +913,6 @@ SyncRepGetStandbyPriority(void)
 static int
 SyncRepWakeQueue(bool all, int mode)
 {
-	volatile WalSndCtlData *walsndctl = WalSndCtl;
 	int			numprocs = 0;
 	dlist_mutable_iter iter;
 
@@ -929,7 +927,7 @@ SyncRepWakeQueue(bool all, int mode)
 		/*
 		 * Assume the queue is ordered by LSN
 		 */
-		if (!all && walsndctl->lsn[mode] < proc->waitLSN)
+		if (!all && WalSndCtl->lsn[mode] < proc->waitLSN)
 			return numprocs;
 
 		/*

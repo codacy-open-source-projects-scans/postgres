@@ -199,7 +199,7 @@ parse_hosts_line(TokenizedAuthLine *tok_line, int elevel)
 	ListCell   *field;
 	AuthToken  *token;
 
-	parsedline = palloc0(sizeof(HostsLine));
+	parsedline = palloc0_object(HostsLine);
 	parsedline->sourcefile = pstrdup(tok_line->file_name);
 	parsedline->linenumber = tok_line->line_num;
 	parsedline->rawline = pstrdup(tok_line->raw_line);
@@ -361,7 +361,7 @@ parse_hosts_line(TokenizedAuthLine *tok_line, int elevel)
  * the hosts configuration failed to load, the err_msg variable may have more
  * information in case it was passed as non-NULL.
  */
-int
+HostsFileLoadResult
 load_hosts(List **hosts, char **err_msg)
 {
 	FILE	   *file;

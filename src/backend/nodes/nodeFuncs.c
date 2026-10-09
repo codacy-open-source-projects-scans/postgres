@@ -284,9 +284,6 @@ exprType(const Node *expr)
 		case T_PlaceHolderVar:
 			type = exprType((Node *) ((const PlaceHolderVar *) expr)->phexpr);
 			break;
-		case T_GraphPropertyRef:
-			type = ((const GraphPropertyRef *) expr)->typeId;
-			break;
 		default:
 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(expr));
 			type = InvalidOid;	/* keep compiler quiet */
@@ -539,8 +536,6 @@ exprTypmod(const Node *expr)
 			return exprTypmod((Node *) ((const ReturningExpr *) expr)->retexpr);
 		case T_PlaceHolderVar:
 			return exprTypmod((Node *) ((const PlaceHolderVar *) expr)->phexpr);
-		case T_GraphPropertyRef:
-			return ((const GraphPropertyRef *) expr)->typmod;
 		default:
 			break;
 	}
@@ -1002,8 +997,16 @@ exprCollation(const Node *expr)
 			{
 				const JsonConstructorExpr *ctor = (const JsonConstructorExpr *) expr;
 
+				/*
+				 * Collation comes from coercion if present, otherwise from
+				 * func.  The func fallback is needed in cases where func
+				 * already produces the final output type and no coercion is
+				 * needed (cf. the JSCTOR_JSON_ARRAY_QUERY case).
+				 */
 				if (ctor->coercion)
 					coll = exprCollation((Node *) ctor->coercion);
+				else if (ctor->func)
+					coll = exprCollation((Node *) ctor->func);
 				else
 					coll = InvalidOid;
 			}
@@ -1062,9 +1065,6 @@ exprCollation(const Node *expr)
 			break;
 		case T_PlaceHolderVar:
 			coll = exprCollation((Node *) ((const PlaceHolderVar *) expr)->phexpr);
-			break;
-		case T_GraphPropertyRef:
-			coll = ((const GraphPropertyRef *) expr)->collation;
 			break;
 		default:
 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(expr));
@@ -1264,8 +1264,11 @@ exprSetCollation(Node *expr, Oid collation)
 			{
 				JsonConstructorExpr *ctor = (JsonConstructorExpr *) expr;
 
+				/* See comment in exprCollation() */
 				if (ctor->coercion)
 					exprSetCollation((Node *) ctor->coercion, collation);
+				else if (ctor->func)
+					exprSetCollation((Node *) ctor->func, collation);
 				else
 					Assert(!OidIsValid(collation)); /* result is always a
 													 * json[b] type */
@@ -2096,6 +2099,7 @@ check_functions_in_node(Node *node, check_function_callback checker,
  * uses, but may need to be revisited in future.
  */
 
+pg_attribute_no_sanitize_function()
 bool
 expression_tree_walker_impl(Node *node,
 							tree_walker_callback walker,
@@ -2135,7 +2139,6 @@ expression_tree_walker_impl(Node *node,
 		case T_RangeTblRef:
 		case T_SortGroupClause:
 		case T_CTESearchClause:
-		case T_GraphPropertyRef:
 		case T_MergeSupportFunc:
 			/* primitive node types with no expression subnodes */
 			break;
@@ -2579,24 +2582,6 @@ expression_tree_walker_impl(Node *node,
 					return true;
 			}
 			break;
-		case T_ForPortionOfExpr:
-			{
-				ForPortionOfExpr *forPortionOf = (ForPortionOfExpr *) node;
-
-				if (WALK(forPortionOf->rangeVar))
-					return true;
-				if (WALK(forPortionOf->targetFrom))
-					return true;
-				if (WALK(forPortionOf->targetTo))
-					return true;
-				if (WALK(forPortionOf->targetRange))
-					return true;
-				if (WALK(forPortionOf->overlapsExpr))
-					return true;
-				if (WALK(forPortionOf->rangeTargetList))
-					return true;
-			}
-			break;
 		case T_PartitionPruneStepOp:
 			{
 				PartitionPruneStepOp *opstep = (PartitionPruneStepOp *) node;
@@ -2694,26 +2679,6 @@ expression_tree_walker_impl(Node *node,
 					return true;
 			}
 			break;
-		case T_GraphElementPattern:
-			{
-				GraphElementPattern *gep = (GraphElementPattern *) node;
-
-				if (WALK(gep->subexpr))
-					return true;
-				if (WALK(gep->whereClause))
-					return true;
-			}
-			break;
-		case T_GraphPattern:
-			{
-				GraphPattern *gp = (GraphPattern *) node;
-
-				if (LIST_WALK(gp->path_pattern_list))
-					return true;
-				if (WALK(gp->whereClause))
-					return true;
-			}
-			break;
 		default:
 			elog(ERROR, "unrecognized node type: %d",
 				 (int) nodeTag(node));
@@ -2740,6 +2705,7 @@ expression_tree_walker_impl(Node *node,
  * which is the bitwise OR of flag values to add or suppress visitation of
  * indicated items.  (More flag bits may be added as needed.)
  */
+pg_attribute_no_sanitize_function()
 bool
 query_tree_walker_impl(Query *query,
 					   tree_walker_callback walker,
@@ -2764,8 +2730,6 @@ query_tree_walker_impl(Query *query,
 	if (WALK(query->mergeActionList))
 		return true;
 	if (WALK(query->mergeJoinCondition))
-		return true;
-	if (WALK(query->forPortionOf))
 		return true;
 	if (WALK(query->returningList))
 		return true;
@@ -2866,6 +2830,7 @@ range_table_walker_impl(List *rtable,
 /*
  * Some callers even want to scan the expressions in individual RTEs.
  */
+pg_attribute_no_sanitize_function()
 bool
 range_table_entry_walker_impl(RangeTblEntry *rte,
 							  tree_walker_callback walker,
@@ -2907,12 +2872,6 @@ range_table_entry_walker_impl(RangeTblEntry *rte,
 			break;
 		case RTE_VALUES:
 			if (WALK(rte->values_lists))
-				return true;
-			break;
-		case RTE_GRAPH_TABLE:
-			if (WALK(rte->graph_pattern))
-				return true;
-			if (WALK(rte->graph_table_columns))
 				return true;
 			break;
 		case RTE_CTE:
@@ -3000,6 +2959,7 @@ range_table_entry_walker_impl(RangeTblEntry *rte,
  * and doing the right thing.
  */
 
+pg_attribute_no_sanitize_function()
 Node *
 expression_tree_mutator_impl(Node *node,
 							 tree_mutator_callback mutator,
@@ -3667,22 +3627,6 @@ expression_tree_mutator_impl(Node *node,
 				return (Node *) newnode;
 			}
 			break;
-		case T_ForPortionOfExpr:
-			{
-				ForPortionOfExpr *fpo = (ForPortionOfExpr *) node;
-				ForPortionOfExpr *newnode;
-
-				FLATCOPY(newnode, fpo, ForPortionOfExpr);
-				MUTATE(newnode->rangeVar, fpo->rangeVar, Var *);
-				MUTATE(newnode->targetFrom, fpo->targetFrom, Node *);
-				MUTATE(newnode->targetTo, fpo->targetTo, Node *);
-				MUTATE(newnode->targetRange, fpo->targetRange, Node *);
-				MUTATE(newnode->overlapsExpr, fpo->overlapsExpr, Node *);
-				MUTATE(newnode->rangeTargetList, fpo->rangeTargetList, List *);
-
-				return (Node *) newnode;
-			}
-			break;
 		case T_PartitionPruneStepOp:
 			{
 				PartitionPruneStepOp *opstep = (PartitionPruneStepOp *) node;
@@ -3843,6 +3787,7 @@ expression_tree_mutator_impl(Node *node,
  * it to be modified in-place; they must pass QTW_DONT_COPY_QUERY in flags.
  * All modified substructure is safely copied in any case.
  */
+pg_attribute_no_sanitize_function()
 Query *
 query_tree_mutator_impl(Query *query,
 						tree_mutator_callback mutator,
@@ -3864,7 +3809,6 @@ query_tree_mutator_impl(Query *query,
 	MUTATE(query->onConflict, query->onConflict, OnConflictExpr *);
 	MUTATE(query->mergeActionList, query->mergeActionList, List *);
 	MUTATE(query->mergeJoinCondition, query->mergeJoinCondition, Node *);
-	MUTATE(query->forPortionOf, query->forPortionOf, ForPortionOfExpr *);
 	MUTATE(query->returningList, query->returningList, List *);
 	MUTATE(query->jointree, query->jointree, FromExpr *);
 	MUTATE(query->setOperations, query->setOperations, Node *);
@@ -3935,6 +3879,7 @@ query_tree_mutator_impl(Query *query,
  * a query's rangetable.  This is split out since it can be useful on
  * its own.
  */
+pg_attribute_no_sanitize_function()
 List *
 range_table_mutator_impl(List *rtable,
 						 tree_mutator_callback mutator,
@@ -3984,10 +3929,6 @@ range_table_mutator_impl(List *rtable,
 			case RTE_VALUES:
 				MUTATE(newrte->values_lists, rte->values_lists, List *);
 				break;
-			case RTE_GRAPH_TABLE:
-				MUTATE(newrte->graph_pattern, rte->graph_pattern, GraphPattern *);
-				MUTATE(newrte->graph_table_columns, rte->graph_table_columns, List *);
-				break;
 			case RTE_CTE:
 			case RTE_NAMEDTUPLESTORE:
 			case RTE_RESULT:
@@ -4017,6 +3958,7 @@ range_table_mutator_impl(List *rtable,
  * the recursion when the walker's normal change of state is not appropriate
  * for the outermost Query node.
  */
+pg_attribute_no_sanitize_function()
 bool
 query_or_expression_tree_walker_impl(Node *node,
 									 tree_walker_callback walker,
@@ -4040,6 +3982,7 @@ query_or_expression_tree_walker_impl(Node *node,
  * the recursion when the mutator's normal change of state is not appropriate
  * for the outermost Query node.
  */
+pg_attribute_no_sanitize_function()
 Node *
 query_or_expression_tree_mutator_impl(Node *node,
 									  tree_mutator_callback mutator,
@@ -4071,6 +4014,7 @@ query_or_expression_tree_mutator_impl(Node *node,
  * because this is used mainly during analysis of CTEs, and only DML
  * statements can appear in CTEs.
  */
+pg_attribute_no_sanitize_function()
 bool
 raw_expression_tree_walker_impl(Node *node,
 								tree_walker_callback walker,
@@ -4622,18 +4566,6 @@ raw_expression_tree_walker_impl(Node *node,
 					return true;
 			}
 			break;
-		case T_RangeGraphTable:
-			{
-				RangeGraphTable *rgt = (RangeGraphTable *) node;
-
-				if (WALK(rgt->graph_pattern))
-					return true;
-				if (WALK(rgt->columns))
-					return true;
-				if (WALK(rgt->alias))
-					return true;
-			}
-			break;
 		case T_TypeName:
 			{
 				TypeName   *tn = (TypeName *) node;
@@ -4792,26 +4724,6 @@ raw_expression_tree_walker_impl(Node *node,
 					return true;
 			}
 			break;
-		case T_GraphElementPattern:
-			{
-				GraphElementPattern *gep = (GraphElementPattern *) node;
-
-				if (WALK(gep->subexpr))
-					return true;
-				if (WALK(gep->whereClause))
-					return true;
-			}
-			break;
-		case T_GraphPattern:
-			{
-				GraphPattern *gp = (GraphPattern *) node;
-
-				if (WALK(gp->path_pattern_list))
-					return true;
-				if (WALK(gp->whereClause))
-					return true;
-			}
-			break;
 		default:
 			elog(ERROR, "unrecognized node type: %d",
 				 (int) nodeTag(node));
@@ -4826,6 +4738,7 @@ raw_expression_tree_walker_impl(Node *node,
  * The walker has already visited the current node, and so we need only
  * recurse into any sub-nodes it has.
  */
+pg_attribute_no_sanitize_function()
 bool
 planstate_tree_walker_impl(PlanState *planstate,
 						   planstate_tree_walker_callback walker,
@@ -4910,6 +4823,7 @@ planstate_tree_walker_impl(PlanState *planstate,
 /*
  * Walk a list of SubPlans (or initPlans, which also use SubPlan nodes).
  */
+pg_attribute_no_sanitize_function()
 static bool
 planstate_walk_subplans(List *plans,
 						planstate_tree_walker_callback walker,
@@ -4932,6 +4846,7 @@ planstate_walk_subplans(List *plans,
  * Walk the constituent plans of a ModifyTable, Append, MergeAppend,
  * BitmapAnd, or BitmapOr node.
  */
+pg_attribute_no_sanitize_function()
 static bool
 planstate_walk_members(PlanState **planstates, int nplans,
 					   planstate_tree_walker_callback walker,

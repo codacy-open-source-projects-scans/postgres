@@ -73,7 +73,7 @@ gin_metapage_info(PG_FUNCTION_ARGS)
 
 	values[0] = Int64GetDatum(metadata->head);
 	values[1] = Int64GetDatum(metadata->tail);
-	values[2] = UInt32GetDatum(metadata->tailFreeSize);
+	values[2] = Int32GetDatum(metadata->tailFreeSize);
 	values[3] = Int64GetDatum(metadata->nPendingPages);
 	values[4] = Int64GetDatum(metadata->nPendingHeapTuples);
 
@@ -258,11 +258,11 @@ gin_leafpage_items(PG_FUNCTION_ARGS)
 		memset(nulls, 0, sizeof(nulls));
 
 		values[0] = ItemPointerGetDatum(&cur->first);
-		values[1] = UInt16GetDatum(cur->nbytes);
+		values[1] = Int16GetDatum(cur->nbytes);
 
 		/* build an array of decoded item pointers */
 		tids = ginPostingListDecode(cur, &ndecoded);
-		tids_datum = (Datum *) palloc(ndecoded * sizeof(Datum));
+		tids_datum = palloc_array(Datum, ndecoded);
 		for (i = 0; i < ndecoded; i++)
 			tids_datum[i] = ItemPointerGetDatum(&tids[i]);
 		values[2] = PointerGetDatum(construct_array_builtin(tids_datum, ndecoded, TIDOID));

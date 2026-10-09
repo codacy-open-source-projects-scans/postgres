@@ -93,7 +93,7 @@ static const DestReceiver spi_printtupDR = {
  * It's ok to cast the constness away as any modification of the none receiver
  * would be a bug (which gets easier to catch this way).
  */
-DestReceiver *None_Receiver = (DestReceiver *) &donothingDR;
+DestReceiver *None_Receiver = unconstify_constexpr(DestReceiver *, &donothingDR);
 
 /* ----------------
  *		BeginCommand - initialize the destination at start of command
@@ -165,8 +165,10 @@ CreateDestReceiver(CommandDest dest)
  *		EndCommand - clean up the destination at end of command
  * ----------------
  */
+
 void
-EndCommand(const QueryCompletion *qc, CommandDest dest, bool force_undecorated_output)
+EndCommandExtended(const QueryCompletion *qc, CommandDest dest,
+				   bool force_undecorated_output, bool noblock)
 {
 	char		completionTag[COMPLETION_TAG_BUFSIZE];
 	Size		len;
@@ -179,7 +181,10 @@ EndCommand(const QueryCompletion *qc, CommandDest dest, bool force_undecorated_o
 
 			len = BuildQueryCompletionString(completionTag, qc,
 											 force_undecorated_output);
-			pq_putmessage(PqMsg_CommandComplete, completionTag, len + 1);
+			if (noblock)
+				pq_putmessage_noblock(PqMsg_CommandComplete, completionTag, len + 1);
+			else
+				pq_putmessage(PqMsg_CommandComplete, completionTag, len + 1);
 			break;
 
 		case DestNone:
@@ -194,6 +199,12 @@ EndCommand(const QueryCompletion *qc, CommandDest dest, bool force_undecorated_o
 		case DestExplainSerialize:
 			break;
 	}
+}
+
+void
+EndCommand(const QueryCompletion *qc, CommandDest dest, bool force_undecorated_output)
+{
+	EndCommandExtended(qc, dest, force_undecorated_output, false);
 }
 
 /* ----------------

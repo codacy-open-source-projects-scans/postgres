@@ -54,20 +54,12 @@ CREATE TABLE "S 1"."T 4" (
 	c3 text,
 	CONSTRAINT t4_pkey PRIMARY KEY (c1)
 );
-CREATE TABLE "S 1"."T 5" (
-	c1 int4range NOT NULL,
-	c2 int NOT NULL,
-	c3 text,
-	c4 daterange NOT NULL,
-	CONSTRAINT t5_pkey PRIMARY KEY (c1, c4 WITHOUT OVERLAPS)
-);
 
 -- Disable autovacuum for these tables to avoid unexpected effects of that
 ALTER TABLE "S 1"."T 1" SET (autovacuum_enabled = 'false');
 ALTER TABLE "S 1"."T 2" SET (autovacuum_enabled = 'false');
 ALTER TABLE "S 1"."T 3" SET (autovacuum_enabled = 'false');
 ALTER TABLE "S 1"."T 4" SET (autovacuum_enabled = 'false');
-ALTER TABLE "S 1"."T 5" SET (autovacuum_enabled = 'false');
 
 INSERT INTO "S 1"."T 1"
 	SELECT id,
@@ -95,18 +87,11 @@ INSERT INTO "S 1"."T 4"
 	       'AAA' || to_char(id, 'FM000')
 	FROM generate_series(1, 100) id;
 DELETE FROM "S 1"."T 4" WHERE c1 % 3 != 0;	-- delete for outer join tests
-INSERT INTO "S 1"."T 5"
-	SELECT int4range(id, id + 1),
-	       id + 1,
-	       'AAA' || to_char(id, 'FM000'),
-        '[2000-01-01,2020-01-01)'
-	FROM generate_series(1, 100) id;
 
 ANALYZE "S 1"."T 1";
 ANALYZE "S 1"."T 2";
 ANALYZE "S 1"."T 3";
 ANALYZE "S 1"."T 4";
-ANALYZE "S 1"."T 5";
 
 -- ===================================================================
 -- create foreign tables
@@ -160,14 +145,6 @@ CREATE FOREIGN TABLE ft7 (
 	c2 int NOT NULL,
 	c3 text
 ) SERVER loopback3 OPTIONS (schema_name 'S 1', table_name 'T 4');
-
-CREATE FOREIGN TABLE ft8 (
-	c1 int4range NOT NULL,
-	c2 int NOT NULL,
-	c3 text,
-	c4 daterange NOT NULL
-) SERVER loopback OPTIONS (schema_name 'S 1', table_name 'T 5');
-
 
 -- ===================================================================
 -- tests for validator
@@ -485,6 +462,41 @@ EXECUTE s(ARRAY['1','2']);
 DEALLOCATE s;
 RESET plan_cache_mode;
 
+-- An ArrayCoerceExpr is pushed down only when its per-element coercion is
+-- a plain relabeling.  An element cast function, an I/O conversion, or a
+-- domain coercion is instead evaluated locally.
+CREATE TABLE loct_acx (id int, ta text[], f8 float8[], txt text[], t text, ia int[], vc varchar[]);
+INSERT INTO loct_acx VALUES (1, '{12345}', '{0.30000000000000004}', '{0.3}', '5', '{5}', '{5}');
+CREATE FOREIGN TABLE ft_acx (id int, ta text[], f8 float8[], txt text[], t text, ia int[], vc varchar[])
+  SERVER loopback OPTIONS (table_name 'loct_acx');
+-- element coercion via a cast function: not shippable, stays local
+CREATE FUNCTION acx_text2int(text) RETURNS int
+  LANGUAGE plpgsql IMMUTABLE STRICT AS 'BEGIN RETURN length($1); END';
+CREATE CAST (text AS integer) WITH FUNCTION acx_text2int(text);
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT id FROM ft_acx WHERE ta::int[] = ARRAY[5];
+DROP CAST (text AS integer);
+DROP FUNCTION acx_text2int(text);
+-- implicit-format element coercion (a cast function): stays local, and the
+-- coercion is not silently dropped from an otherwise pushed-down qual
+CREATE CAST (integer AS text) WITH FUNCTION pg_catalog.to_hex(integer) AS IMPLICIT;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT id FROM ft_acx WHERE t = ANY (ia);
+DROP CAST (integer AS text);
+-- element coercion via a GUC-sensitive I/O conversion: stays local, so the
+-- result matches local evaluation despite the forced remote extra_float_digits
+SET extra_float_digits = 0;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT id FROM ft_acx WHERE f8::text[] = txt;
+SELECT id FROM ft_acx WHERE f8::text[] = txt;
+RESET extra_float_digits;
+-- a plain relabeling element coercion (varchar[] to text[]) is still pushed down
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT id FROM ft_acx WHERE t = ANY (vc);
+SELECT id FROM ft_acx WHERE t = ANY (vc);
+DROP FOREIGN TABLE ft_acx;
+DROP TABLE loct_acx;
+
 -- a regconfig constant referring to this text search configuration
 -- is initially unshippable
 CREATE TEXT SEARCH CONFIGURATION public.custom_search
@@ -789,6 +801,280 @@ EXPLAIN (VERBOSE, COSTS OFF)
 SELECT t1.c1, t2.c2 FROM v4 t1 LEFT JOIN ft5 t2 ON (t1.c1 = t2.c1) ORDER BY t1.c1, t2.c1 OFFSET 10 LIMIT 10;  -- can be pushed down
 SELECT t1.c1, t2.c2 FROM v4 t1 LEFT JOIN ft5 t2 ON (t1.c1 = t2.c1) ORDER BY t1.c1, t2.c1 OFFSET 10 LIMIT 10;
 ALTER VIEW v4 OWNER TO regress_view_owner;
+
+-- ===================================================================
+-- Foreign-join with FUNCTION RTE pushdown (IMMUTABLE functions only)
+-- ===================================================================
+-- IMMUTABLE function: unnest of constant array can be pushed down
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT t1.c1, t1.c3 FROM ft1 t1, unnest(ARRAY[1, 5, 10, 100]::int[]) AS u(id)
+WHERE t1.c1 = u.id ORDER BY t1.c1;
+SELECT t1.c1, t1.c3 FROM ft1 t1, unnest(ARRAY[1, 5, 10, 100]::int[]) AS u(id)
+WHERE t1.c1 = u.id ORDER BY t1.c1;
+
+-- IMMUTABLE function: generate_series with constant args
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT t1.c1 FROM ft1 t1, generate_series(1, 4) AS g(id)
+WHERE t1.c1 = g.id ORDER BY t1.c1;
+SELECT t1.c1 FROM ft1 t1, generate_series(1, 4) AS g(id)
+WHERE t1.c1 = g.id ORDER BY t1.c1;
+
+-- VOLATILE function (random) must NOT be pushed down
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT t1.c1 FROM ft1 t1, generate_series(1, 4 + (random() * 0)::int) AS g(id)
+WHERE t1.c1 = g.id;
+
+-- STABLE function must NOT be pushed down either: even though its result is
+-- constant within one query, evaluating it on the remote server could yield
+-- a different value than evaluating it locally.
+CREATE FUNCTION f_stable(int) RETURNS SETOF int LANGUAGE plpgsql STABLE AS
+$$ BEGIN RETURN QUERY SELECT generate_series(1, $1); END $$;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT t1.c1 FROM ft1 t1, f_stable(4) AS g(id) WHERE t1.c1 = g.id;
+DROP FUNCTION f_stable(int);
+
+-- WITH ORDINALITY must NOT be pushed down (limitation of this implementation)
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT t1.c1, u.ord
+FROM ft1 t1, unnest(ARRAY[1, 5, 10]::int[]) WITH ORDINALITY AS u(id, ord)
+WHERE t1.c1 = u.id;
+
+-- Same function RTE joined with two different foreign servers: planner picks
+-- one absorption + a local join with the second foreign server.  The fact
+-- that the function is IMMUTABLE makes this safe even if both sides chose to
+-- absorb it independently.
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT t1.c1, t2.c1
+FROM ft1 t1, ft6 t2, unnest(ARRAY[1, 5, 10, 100]::int[]) AS u(id)
+WHERE t1.c1 = u.id AND t2.c1 = u.id ORDER BY t1.c1;
+
+-- Cost-based selection between two foreign servers: ft1 ("S 1"."T 1") has
+-- 1000 rows, ft6 ("S 1"."T 4") has ~33 rows.  The same query shape gets a
+-- different push-down target depending on a predicate that changes the
+-- effective cardinality of one side -- the function "jumps" to whichever
+-- foreign scan benefits more from being pre-filtered.
+ANALYZE ft1;
+ANALYZE ft6;
+-- No extra predicate: ft1 is the bigger side, function absorbed there.
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT t1.c1, t2.c1
+FROM ft1 t1, ft6 t2, unnest(ARRAY[3, 6, 9, 12, 15, 18]::int[]) AS u(id)
+WHERE t1.c1 = u.id AND t2.c1 = u.id;
+-- Equality on ft1.c3 (not in the eqclass) restricts ft1 to a single remote row;
+-- now ft6 is effectively the bigger side and the function is absorbed into
+-- ft6 instead.
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT t1.c1, t2.c1
+FROM ft1 t1, ft6 t2, unnest(ARRAY[3, 6, 9, 12, 15, 18]::int[]) AS u(id)
+WHERE t1.c1 = u.id AND t2.c1 = u.id AND t1.c3 = '00009';
+
+-- The remaining scenarios reuse a dedicated foreign table to cover the
+-- corner cases of FUNCTION RTE push-down: function-first FROM, record
+-- return type rejection, whole-row reference, UPDATE...FROM..., and
+-- multi-function ROWS FROM.
+CREATE TABLE base_tbl_fn (a int, b int);
+INSERT INTO base_tbl_fn
+  SELECT g, g + 100 FROM generate_series(1, 30) g;
+CREATE FOREIGN TABLE remote_tbl (a int, b int)
+  SERVER loopback OPTIONS (table_name 'base_tbl_fn');
+
+-- The function RTE appears first in FROM; the foreign relation must be
+-- found by scanning fs_base_relids for an RTE_RELATION rather than
+-- using scan->fs_relid blindly.
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT * FROM unnest(array[2, 3, 4]) n, remote_tbl r WHERE r.a = n;
+SELECT * FROM unnest(array[2, 3, 4]) n, remote_tbl r
+WHERE r.a = n ORDER BY r.a;
+
+-- Function RTE is restricted, shippable conditions
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT * FROM unnest(array[2, 3, 4]) n, remote_tbl r WHERE r.a = n and n > 3;
+SELECT * FROM unnest(array[2, 3, 4]) n, remote_tbl r
+WHERE r.a = n and n > 3 ORDER BY r.a;
+
+-- Function RTE is restricted, nonshippable conditions
+CREATE FUNCTION f_local(int) RETURNS int AS $$
+BEGIN
+RETURN $1;
+END
+$$ LANGUAGE plpgsql;
+
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT * FROM unnest(array[2, 3, 4]) n, remote_tbl r WHERE r.a = n and n > f_local(3);
+SELECT * FROM unnest(array[2, 3, 4]) n, remote_tbl r
+WHERE r.a = n and n > f_local(3) ORDER BY r.a;
+
+DROP FUNCTION f_local(int);
+
+-- Check that a qual on the function RTE using a function from a shippable
+-- extension is pushed down.  plpgsql (not inlined) with the column as
+-- argument (not const-folded) keeps the function call in the qual.
+CREATE FUNCTION f_ext(int) RETURNS int AS $$
+BEGIN RETURN $1; END
+$$ LANGUAGE plpgsql IMMUTABLE;
+ALTER EXTENSION postgres_fdw ADD FUNCTION f_ext(int);
+-- Force pushdown so the fixed-code plan is deterministically a Foreign
+-- Scan; on the unfixed code the qual is classified local, the join is
+-- refused, and the plan falls back to a local join instead.
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_nestloop = off;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT * FROM unnest(array[2, 3, 4]) n, remote_tbl r WHERE r.a = n and f_ext(n) > 3;
+SELECT * FROM unnest(array[2, 3, 4]) n, remote_tbl r
+WHERE r.a = n and f_ext(n) > 3 ORDER BY r.a;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_nestloop;
+ALTER EXTENSION postgres_fdw DROP FUNCTION f_ext(int);
+DROP FUNCTION f_ext(int);
+
+-- A function returning record (composite) is forbidden; pushing it
+-- would yield a remote "column definition list is required" error.
+-- function_rte_pushdown_ok() rejects it via TYPEFUNC_SCALAR.
+CREATE OR REPLACE FUNCTION f_ret_record() RETURNS record AS $$
+  SELECT (1, 2)::record
+$$ LANGUAGE SQL IMMUTABLE;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT s FROM remote_tbl rt, f_ret_record() AS s(a int, b int)
+WHERE s.a = rt.a;
+DROP FUNCTION f_ret_record();
+
+-- UPDATE ... FROM unnest() with a complex element type; area(box)
+-- yields the value to match.  The locking machinery for the
+-- non-relation RTE generates a whole-row Var that deparseColumnRef
+-- emits as ROW(f<rti>.c1, ...).
+UPDATE remote_tbl r SET b = 999
+FROM unnest(array[box '((2,3),(-2,-3))']) AS t(bx)
+WHERE r.a = area(t.bx);
+SELECT * FROM remote_tbl WHERE a IN (23, 24, 25) ORDER BY a;
+
+-- The same shape with CASE and RETURNING; exercises the DirectModify
+-- path and the executor's tuple-desc reconstruction.
+UPDATE remote_tbl r
+   SET b = CASE WHEN random() >= 0 THEN 5 ELSE 0 END
+  FROM unnest(array[box '((2,3),(-2,-3))']) AS t(bx)
+ WHERE r.a = area(t.bx) RETURNING a, b;
+
+-- RETURNING a whole-row reference to the function RTE.  Without the
+-- per-RTE function metadata being preserved on the DirectModify path
+-- (FdwDirectModifyPrivateFunctions / FdwDirectModifyPrivateMinRTIndex),
+-- this would fail with "input of anonymous composite types is not
+-- implemented".
+UPDATE remote_tbl r SET b = 7
+  FROM unnest(array[box '((2,3),(-2,-3))'],
+              array[int '1']) AS t(bx, i)
+ WHERE r.a = area(t.bx) RETURNING a, b, t;
+
+-- ROWS FROM (...) with several functions.  Force pushdown because the
+-- cost model otherwise picks a local plan.
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_nestloop = off;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT r.a, t.n, t.s
+  FROM remote_tbl r, ROWS FROM (unnest(array[3, 6, 9]),
+                                generate_series(11, 13)) AS t(n, s)
+ WHERE r.a = t.n ORDER BY r.a;
+SELECT r.a, t.n, t.s
+  FROM remote_tbl r, ROWS FROM (unnest(array[3, 6, 9]),
+                                generate_series(11, 13)) AS t(n, s)
+ WHERE r.a = t.n ORDER BY r.a;
+
+-- Whole-row Var on the absorbed function side (e.g. via a cast to
+-- text).  Exercises both deparseColumnRef whole-row branch and the
+-- get_tupdesc_for_join_scan_tuples() RTE_FUNCTION metadata path.
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT t::text, r.a
+  FROM remote_tbl r, ROWS FROM (unnest(array[3, 6, 9]),
+                                generate_series(11, 13)) AS t(n, s)
+ WHERE r.a = t.n ORDER BY r.a;
+SELECT t::text, r.a
+  FROM remote_tbl r, ROWS FROM (unnest(array[3, 6, 9]),
+                                generate_series(11, 13)) AS t(n, s)
+ WHERE r.a = t.n ORDER BY r.a;
+
+-- Check whole-row Var represented by function on the nullable
+-- left join side
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT u, ft5.c1, ft5.c2, ft4.c1, ft4.c2 FROM ft5 LEFT JOIN
+(ft4 JOIN unnest(array[1,2], array[3,4]) as u (u1, u2) ON ft4.c1=u1)
+ON ft5.c1 = ft4.c1 WHERE ft5.c1 < 10 ORDER BY ft5.c1;
+SELECT u, ft5.c1, ft5.c2, ft4.c1, ft4.c2 FROM ft5 LEFT JOIN
+(ft4 JOIN unnest(array[1,2], array[3,4]) as u (u1, u2) ON ft4.c1=u1)
+ON ft5.c1 = ft4.c1 WHERE ft5.c1 < 10 ORDER BY ft5.c1;
+
+-- Same nullable-side whole-row Var, but with outer rows that both match
+-- and miss the (foreign x function) inner join.  A multi-column function
+-- RTE is used so that the reference is a genuine whole-row Var (a single
+-- scalar-returning function would collapse to its lone column).  This
+-- exercises the THEN ROW(...) side of deparseColumnRef()'s whole-row CASE
+-- (matched rows reconstruct the composite) as well as the NULL side
+-- (missed rows), confirming the executor rebuilds the anonymous composite
+-- correctly.
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT l.a, t FROM remote_tbl l
+  LEFT JOIN (remote_tbl r JOIN unnest(array[2, 4], array[20, 40]) AS t(x, y)
+             ON r.a = t.x)
+  ON l.a = r.a
+ WHERE l.a < 6 ORDER BY l.a;
+SELECT l.a, t FROM remote_tbl l
+  LEFT JOIN (remote_tbl r JOIN unnest(array[2, 4], array[20, 40]) AS t(x, y)
+             ON r.a = t.x)
+  ON l.a = r.a
+ WHERE l.a < 6 ORDER BY l.a;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_nestloop;
+
+-- Check foreign join with parameterized function
+CREATE OR REPLACE FUNCTION f(int) RETURNS SETOF int LANGUAGE plpgsql ROWS 10 AS 'BEGIN RETURN QUERY SELECT generate_series(1,$1) ; END' IMMUTABLE;
+ALTER EXTENSION postgres_fdw ADD FUNCTION f(INTEGER);
+
+-- The correlated subquery keeps r1 in an enclosing query level, so the
+-- function argument reaches the remote side as a query parameter.  The
+-- restriction on the function's own column is pushed down as well.
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT r1.a FROM remote_tbl r1
+WHERE EXISTS (SELECT 1 FROM remote_tbl r2, f(r1.a) g
+               WHERE r2.a = g AND g > 20);
+SELECT r1.a FROM remote_tbl r1
+WHERE EXISTS (SELECT 1 FROM remote_tbl r2, f(r1.a) g
+               WHERE r2.a = g AND g > 20)
+ORDER BY r1.a;
+
+ALTER EXTENSION postgres_fdw DROP FUNCTION f(INTEGER);
+DROP FUNCTION f(INTEGER);
+
+-- Volatile function in ROWS FROM disqualifies the whole RTE.
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT r.a FROM remote_tbl r,
+                ROWS FROM (unnest(array[3, 6, 9]),
+                           generate_series(1, 4 + (random() * 0)::int)) AS t(n, s)
+ WHERE r.a = t.n;
+
+-- LATERAL function referencing a foreign Var: postgres_fdw's
+-- foreign-join pushdown rejects this via the joinrel->lateral_relids
+-- check; the plan is therefore a local NestLoop + FunctionScan.
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT r.a, t.x FROM remote_tbl r, LATERAL unnest(array[r.a]) AS t(x)
+WHERE r.a <= 3 ORDER BY r.a;
+
+-- Outer joins with the function RTE are not pushed down (only INNER
+-- joins are supported by function_rte_pushdown_ok()).
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT r.a, t.n FROM remote_tbl r
+     LEFT JOIN unnest(array[1, 2, 3]) AS t(n) ON r.a = t.n
+ WHERE r.a <= 5 ORDER BY r.a;
+
+-- SEMI join (EXISTS) with a function RTE is also not pushed down.
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT r.a FROM remote_tbl r
+ WHERE EXISTS (SELECT 1 FROM unnest(array[3, 6, 9]) AS t(n) WHERE t.n = r.a)
+ ORDER BY r.a;
+
+DROP FOREIGN TABLE remote_tbl;
+DROP TABLE base_tbl_fn;
 
 -- ====================================================================
 -- Check that userid to use when querying the remote table is correctly
@@ -1153,6 +1439,11 @@ ORDER BY ref_0."C 1";
 explain (verbose, costs off)
 select sum(q.a), count(q.b) from ft4 left join (select 13, avg(ft1.c1), sum(ft2.c1) from ft1 right join ft2 on (ft1.c1 = ft2.c1)) q(a, b, c) on (ft4.c1 <= q.b);
 select sum(q.a), count(q.b) from ft4 left join (select 13, avg(ft1.c1), sum(ft2.c1) from ft1 right join ft2 on (ft1.c1 = ft2.c1)) q(a, b, c) on (ft4.c1 <= q.b);
+
+-- Eager aggregation: a partially grouped rel must not be joined remotely
+explain (verbose, costs off)
+select t1.c2, sum(t2.c1) from ft1 t1 inner join ft2 t2 on (t1.c2 = t2.c2) where t1.c1 < 20 group by t1.c2 order by 1;
+select t1.c2, sum(t2.c1) from ft1 t1 inner join ft2 t2 on (t1.c2 = t2.c2) where t1.c1 < 20 group by t1.c2 order by 1;
 
 
 -- Not supported cases
@@ -1576,17 +1867,6 @@ EXPLAIN (verbose, costs off)
 DELETE FROM ft2 WHERE c1 = 1200 RETURNING tableoid::regclass;                       -- can be pushed down
 DELETE FROM ft2 WHERE c1 = 1200 RETURNING tableoid::regclass;
 
--- Test UPDATE FOR PORTION OF
-UPDATE ft8 FOR PORTION OF c4 FROM '2005-01-01' TO '2006-01-01'
-SET c2 = c2 + 1
-WHERE c1 = '[1,2)';
-SELECT * FROM ft8 WHERE c1 = '[1,2)' ORDER BY c1, c4;
-
--- Test DELETE FOR PORTION OF
-DELETE FROM ft8 FOR PORTION OF c4 FROM '2005-01-01' TO '2006-01-01'
-WHERE c1 = '[2,3)';
-SELECT * FROM ft8 WHERE c1 = '[2,3)' ORDER BY c1, c4;
-
 -- Test UPDATE/DELETE with RETURNING on a three-table join
 INSERT INTO ft2 (c1,c2,c3)
   SELECT id, id - 1200, to_char(id, 'FM00000') FROM generate_series(1201, 1300) id;
@@ -1777,6 +2057,40 @@ RESET enable_material;
 DROP FOREIGN TABLE remt2;
 DROP TABLE loct1;
 DROP TABLE loct2;
+
+-- Test that direct modify and foreign modify work with runtime pruning of
+-- result relations (bug #19484)
+create table fdw_part_update (a int not null, b int) partition by list (a);
+create table fdw_part_update_p1 partition of fdw_part_update for values in (1);
+create table fdw_part_update_remote (a int not null, b int);
+create foreign table fdw_part_update_p2 partition of fdw_part_update
+    for values in (2)
+    server loopback options (table_name 'fdw_part_update_remote');
+insert into fdw_part_update_p1 values (1, 10);
+insert into fdw_part_update_remote values (2, 20);
+set plan_cache_mode = force_generic_plan;
+
+-- Check DirectModify case
+prepare fdw_part_upd(int) as
+    update fdw_part_update set b = b + 1 where a = $1
+    returning tableoid::regclass, a, b;
+explain (verbose, costs off)
+    execute fdw_part_upd(2);
+execute fdw_part_upd(2);
+deallocate fdw_part_upd;
+
+-- Check ForeignModify case
+prepare fdw_part_upd2(int) as
+    update fdw_part_update set b = b + random()::int * 0 + 1 where a = $1
+    returning tableoid::regclass, a, b;
+explain (verbose, costs off)
+    execute fdw_part_upd2(2);
+execute fdw_part_upd2(2);
+deallocate fdw_part_upd2;
+
+reset plan_cache_mode;
+drop table fdw_part_update;
+drop table fdw_part_update_remote;
 
 -- ===================================================================
 -- test check constraints
@@ -3997,6 +4311,16 @@ INSERT INTO result_tbl SELECT * FROM async_pt WHERE b === 505;
 SELECT * FROM result_tbl ORDER BY a;
 DELETE FROM result_tbl;
 
+-- Test ExecAppendAsyncReset code path that drains outstanding async requests
+-- (case where subplans are re-scanned with parameter changes)
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT o.x FROM (VALUES (2505), (3505)) o(x), LATERAL (SELECT a FROM async_pt WHERE a = o.x OR a = 1505 LIMIT 1) s ORDER BY o.x;
+SELECT o.x FROM (VALUES (2505), (3505)) o(x), LATERAL (SELECT a FROM async_pt WHERE a = o.x OR a = 1505 LIMIT 1) s ORDER BY o.x;
+
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT o.x FROM (VALUES (2505), (3505)) o(x), LATERAL (SELECT a FROM async_pt WHERE a = o.x OR (a = 1505 AND o.x = 2505) LIMIT 1) s ORDER BY o.x;
+SELECT o.x FROM (VALUES (2505), (3505)) o(x), LATERAL (SELECT a FROM async_pt WHERE a = o.x OR (a = 1505 AND o.x = 2505) LIMIT 1) s ORDER BY o.x;
+
 -- Test COPY TO when foreign table is partition
 COPY async_pt TO stdout; --error
 
@@ -4236,8 +4560,8 @@ DROP TABLE base_tbl2;
 DROP TABLE result_tbl;
 DROP TABLE join_tbl;
 
--- Test that an asynchronous fetch is processed before restarting the scan in
--- ReScanForeignScan
+-- Test ExecAppendAsyncReset code path that drains outstanding async requests
+-- (case where subplans are re-scanned without parameter changes)
 CREATE TABLE base_tbl (a int, b int);
 INSERT INTO base_tbl VALUES (1, 11), (2, 22), (3, 33);
 CREATE FOREIGN TABLE foreign_tbl (b int)
@@ -4332,6 +4656,8 @@ DROP VIEW my_application_name;
 -- test read-only and/or deferrable transactions
 -- ===================================================================
 CREATE TABLE loct (f1 int, f2 text);
+INSERT INTO loct VALUES (1, 'foo'), (2, 'bar');
+
 CREATE FUNCTION locf() RETURNS SETOF loct LANGUAGE SQL AS
   'UPDATE public.loct SET f2 = f2 || f2 RETURNING *';
 CREATE VIEW locv AS SELECT t.* FROM locf() t;
@@ -4339,7 +4665,6 @@ CREATE FOREIGN TABLE remt (f1 int, f2 text)
   SERVER loopback OPTIONS (table_name 'locv');
 CREATE FOREIGN TABLE remt2 (f1 int, f2 text)
   SERVER loopback2 OPTIONS (table_name 'locv');
-INSERT INTO loct VALUES (1, 'foo'), (2, 'bar');
 
 START TRANSACTION READ ONLY;
 SAVEPOINT s;
@@ -4385,9 +4710,31 @@ SET transaction_read_only = on;
 SELECT * FROM remt2;  -- should fail
 ROLLBACK;
 
+-- Clean up
 DROP FOREIGN TABLE remt;
+DROP FOREIGN TABLE remt2;
+DROP VIEW locv;
+DROP FUNCTION locf();
+
 CREATE FOREIGN TABLE remt (f1 int, f2 text)
   SERVER loopback OPTIONS (table_name 'loct');
+
+CREATE FUNCTION defer_trig_func() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.f2 IS NOT NULL THEN
+    UPDATE public.loct SET f2 = f2 || f2 WHERE f1 = NEW.f1;
+  END IF;
+  RETURN NULL;
+END;
+$$;
+CREATE CONSTRAINT TRIGGER defer_trig AFTER INSERT ON loct
+  DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE PROCEDURE defer_trig_func();
+
+START TRANSACTION;
+INSERT INTO remt VALUES (3, 'baz');
+SET TRANSACTION READ ONLY;
+COMMIT;
 
 START TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY;
 SELECT * FROM remt;
@@ -4403,9 +4750,8 @@ COMMIT;
 
 -- Clean up
 DROP FOREIGN TABLE remt;
-DROP FOREIGN TABLE remt2;
-DROP VIEW locv;
-DROP FUNCTION locf();
+DROP TRIGGER defer_trig ON loct;
+DROP FUNCTION defer_trig_func;
 DROP TABLE loct;
 
 -- ===================================================================
@@ -4523,13 +4869,18 @@ CREATE TABLE simport_table (c1 int, c2 text);
 CREATE FOREIGN TABLE simport_ftable (c1 int, c2 text, cx int)
        SERVER loopback OPTIONS (table_name 'simport_table');
 ALTER FOREIGN TABLE simport_ftable ALTER COLUMN cx OPTIONS (ADD column_name 'c1');
-ALTER FOREIGN TABLE simport_ftable OPTIONS (ADD restore_stats 'true');
+ALTER FOREIGN TABLE simport_ftable OPTIONS (ADD import_stats 'true');
 
 ANALYZE simport_ftable;                   -- should fail
 
 ANALYZE simport_table;
 
+SELECT pg_stat_reset_single_table_counters('public.simport_ftable'::regclass);
 ANALYZE VERBOSE simport_ftable;           -- should work
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_get_live_tuples('public.simport_ftable'::regclass),
+       pg_stat_get_dead_tuples('public.simport_ftable'::regclass),
+       pg_stat_get_analyze_count('public.simport_ftable'::regclass);
 
 ALTER TABLE simport_table ALTER COLUMN c1 SET STATISTICS 0;
 ALTER TABLE simport_table ALTER COLUMN c2 SET STATISTICS 0;
@@ -4546,7 +4897,12 @@ ANALYZE simport_ftable;                   -- should fail
 ALTER TABLE simport_table ALTER COLUMN c2 SET STATISTICS DEFAULT;
 ANALYZE simport_table;
 
+SELECT pg_stat_reset_single_table_counters('public.simport_ftable'::regclass);
 ANALYZE VERBOSE simport_ftable;           -- should work
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_get_live_tuples('public.simport_ftable'::regclass),
+       pg_stat_get_dead_tuples('public.simport_ftable'::regclass),
+       pg_stat_get_analyze_count('public.simport_ftable'::regclass);
 
 ANALYZE VERBOSE simport_ftable (c1);      -- should work
 
@@ -4569,15 +4925,73 @@ ANALYZE simport_ftable (c1, c1);          -- should fail
 CREATE VIEW simport_view AS SELECT * FROM simport_table;
 CREATE FOREIGN TABLE simport_fview (c1 int, c2 text)
        SERVER loopback OPTIONS (table_name 'simport_view');
-ALTER FOREIGN TABLE simport_fview OPTIONS (ADD restore_stats 'true');
+ALTER FOREIGN TABLE simport_fview OPTIONS (ADD import_stats 'true');
 
 ANALYZE simport_fview;                    -- should fail
+
+CREATE TABLE simport_pt (c1 int not null, c2 text) PARTITION BY LIST (c1);
+CREATE TABLE simport_p1 PARTITION OF simport_pt FOR VALUES IN (1);
+CREATE TABLE simport_p2 PARTITION OF simport_pt FOR VALUES IN (2);
+CREATE FOREIGN TABLE simport_fpt (c1 int not null, c2 text)
+       SERVER loopback OPTIONS (table_name 'simport_pt');
+INSERT INTO simport_pt VALUES (1, 'foo'), (1, 'foo'), (2, 'bar'), (2, 'bar');
+
+-- Check that we have relpages = 0 for simport_fpt regardless of the method
+ANALYZE simport_fpt;
+SELECT relpages FROM pg_class WHERE oid = 'public.simport_fpt'::regclass;
+ALTER FOREIGN TABLE simport_fpt OPTIONS (ADD import_stats 'true');
+ANALYZE simport_pt;
+ANALYZE VERBOSE simport_fpt;              -- should work
+SELECT relpages FROM pg_class WHERE oid = 'public.simport_fpt'::regclass;
+
+-- This tests build_remattrmap()'s deparsing of column names that include
+-- single quotes or backslashes
+CREATE TABLE dtest_table ("col'quote" int, "col\backslash" int);
+CREATE FOREIGN TABLE dtest_ftable ("col'quote" int, "col\backslash" int)
+       SERVER loopback OPTIONS (table_name 'dtest_table', import_stats 'true');
+
+INSERT INTO dtest_table SELECT g, g FROM generate_series(1, 10) g;
+ANALYZE dtest_table;
+
+ANALYZE VERBOSE dtest_ftable;             -- should work
+
+-- dtest_ftable's stats should now exactly match dtest_table's
+-- compare values, should match
+SELECT relpages, reltuples FROM pg_class
+WHERE oid = 'public.dtest_table'::regclass
+EXCEPT
+SELECT relpages, reltuples FROM pg_class
+WHERE oid = 'public.dtest_ftable'::regclass;
+
+-- compare the rowcounts, should get 0 rows back
+SELECT COUNT(*) FROM pg_stats
+WHERE schemaname = 'public' AND tablename = 'dtest_table'
+EXCEPT
+SELECT COUNT(*) FROM pg_stats
+WHERE schemaname = 'public' AND tablename = 'dtest_ftable';
+
+-- test only a few stats columns common to integer types
+SELECT attname, inherited, null_frac, avg_width, n_distinct,
+  most_common_vals::text as mcv, most_common_freqs,
+  histogram_bounds::text as hb, correlation
+FROM pg_stats
+WHERE schemaname = 'public' AND tablename = 'dtest_table'
+EXCEPT
+SELECT attname, inherited, null_frac, avg_width, n_distinct,
+  most_common_vals::text as mcv, most_common_freqs,
+  histogram_bounds::text as hb, correlation
+FROM pg_stats
+WHERE schemaname = 'public' AND tablename = 'dtest_ftable';
 
 -- cleanup
 DROP FOREIGN TABLE simport_ftable;
 DROP FOREIGN TABLE simport_fview;
 DROP VIEW simport_view;
 DROP TABLE simport_table;
+DROP FOREIGN TABLE simport_fpt;
+DROP TABLE simport_pt;
+DROP FOREIGN TABLE dtest_ftable;
+DROP TABLE dtest_table;
 
 -- ===================================================================
 -- test for postgres_fdw_get_connections function with check_conn = true
@@ -4604,19 +5018,100 @@ SELECT server_name,
   WHERE application_name = 'fdw_conn_check') AS remote_backend_pid
   FROM postgres_fdw_get_connections(true);
 
--- After terminating the remote backend, since the connection is closed,
--- "closed" should be TRUE, or NULL if the connection status check
--- is not available. Despite the termination, remote_backend_pid should
--- still show the non-zero PID of the terminated remote backend.
+-- After terminating the remote backend, if the connection entry is still in
+-- the cache, "closed" should be TRUE, or NULL if the connection status check
+-- is not available, and remote_backend_pid should still show the non-zero PID
+-- of the terminated remote backend. Concurrent invalidation can remove the
+-- idle cached connection before the next statement, in which case
+-- postgres_fdw_get_connections(true) can legitimately return no rows.
 DO $$ BEGIN
 PERFORM pg_terminate_backend(pid, 180000) FROM pg_stat_activity
   WHERE application_name = 'fdw_conn_check';
 END $$;
-SELECT server_name,
+WITH terminated_conn AS (
+  SELECT server_name,
+    CASE WHEN closed IS NOT false THEN true ELSE false END AS closed,
+    remote_backend_pid <> 0 AS remote_backend_pid
+    FROM postgres_fdw_get_connections(true)
+)
+SELECT CASE
+  WHEN count(*) = 0 THEN true
+  WHEN count(*) = 1 THEN bool_and(server_name = 'loopback'
+                                  AND closed
+                                  AND remote_backend_pid)
+  ELSE false
+END AS ok
+FROM terminated_conn;
+
+-- In an explicit transaction, concurrent invalidation may mark the
+-- connection invalid but cannot discard it before transaction end, so the
+-- terminated connection should remain visible in the cache.
+SELECT 1 FROM postgres_fdw_disconnect_all();
+SET client_min_messages = 'ERROR';
+BEGIN;
+SELECT 1 FROM ft1 LIMIT 1;
+DO $$ BEGIN
+PERFORM pg_terminate_backend(pid, 180000) FROM pg_stat_activity
+  WHERE application_name = 'fdw_conn_check';
+END $$;
+SELECT server_name, used_in_xact,
   CASE WHEN closed IS NOT false THEN true ELSE false END AS closed,
   remote_backend_pid <> 0 AS remote_backend_pid
   FROM postgres_fdw_get_connections(true);
+ABORT;
+RESET client_min_messages;
 
 -- Clean up
 \set VERBOSITY default
 RESET debug_discard_caches;
+
+-- ===================================================================
+-- test cleanup of failed connections on abort
+-- ===================================================================
+
+CREATE VIEW my_backend_pid (pid) AS SELECT pg_backend_pid();
+CREATE FOREIGN TABLE remote_backend_pid (pid int)
+  SERVER loopback OPTIONS (table_name 'my_backend_pid');
+CREATE FUNCTION wait_for_backend_termination(int) RETURNS void AS $$
+  BEGIN
+    WHILE (SELECT count(*) FROM pg_stat_activity WHERE pid = $1) > 0
+    LOOP
+      PERFORM pg_stat_clear_snapshot();
+    END LOOP;
+  END
+$$ LANGUAGE plpgsql;
+
+SET client_min_messages = 'ERROR';
+
+BEGIN;
+DECLARE c CURSOR FOR SELECT * FROM ft1 ORDER BY c1;
+SAVEPOINT s;
+SELECT pid AS remote_pid FROM remote_backend_pid \gset
+SELECT pg_terminate_backend(:remote_pid);
+SELECT wait_for_backend_termination(:remote_pid);
+ROLLBACK TO SAVEPOINT s;
+SELECT pid FROM remote_backend_pid;
+ROLLBACK TO SAVEPOINT s;
+RELEASE SAVEPOINT s;
+FETCH c;
+ABORT;
+
+BEGIN;
+DECLARE c CURSOR FOR SELECT * FROM ft1 ORDER BY c1;
+FETCH c;
+SAVEPOINT s;
+SELECT pid AS remote_pid FROM remote_backend_pid \gset
+SELECT pg_terminate_backend(:remote_pid);
+SELECT wait_for_backend_termination(:remote_pid);
+ROLLBACK TO SAVEPOINT s;
+SELECT pid FROM remote_backend_pid;
+ROLLBACK TO SAVEPOINT s;
+RELEASE SAVEPOINT s;
+CLOSE c;
+ABORT;
+
+RESET client_min_messages;
+
+DROP FUNCTION wait_for_backend_termination(int);
+DROP FOREIGN TABLE remote_backend_pid;
+DROP VIEW my_backend_pid;

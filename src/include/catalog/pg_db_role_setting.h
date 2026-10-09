@@ -42,13 +42,13 @@ CATALOG(pg_db_role_setting,2964,DbRoleSettingRelationId) BKI_SHARED_RELATION
 	Oid			setrole BKI_LOOKUP_OPT(pg_authid);
 
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
-	text		setconfig[1];	/* GUC settings to apply at login */
+	text		setconfig[];	/* GUC settings to apply at login */
 #endif
 } FormData_pg_db_role_setting;
 
 END_CATALOG_STRUCT
 
-typedef FormData_pg_db_role_setting * Form_pg_db_role_setting;
+typedef FormData_pg_db_role_setting *Form_pg_db_role_setting;
 
 DECLARE_TOAST_WITH_MACRO(pg_db_role_setting, 2966, 2967, PgDbRoleSettingToastTable, PgDbRoleSettingToastIndex);
 

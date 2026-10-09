@@ -585,8 +585,6 @@ Buffer
 _bt_gettrueroot(Relation rel)
 {
 	Buffer		metabuf;
-	Page		metapg;
-	BTPageOpaque metaopaque;
 	Buffer		rootbuf;
 	Page		rootpage;
 	BTPageOpaque rootopaque;
@@ -605,25 +603,7 @@ _bt_gettrueroot(Relation rel)
 	rel->rd_amcache = NULL;
 
 	metabuf = _bt_getbuf(rel, BTREE_METAPAGE, BT_READ);
-	metapg = BufferGetPage(metabuf);
-	metaopaque = BTPageGetOpaque(metapg);
-	metad = BTPageGetMeta(metapg);
-
-	if (!P_ISMETA(metaopaque) ||
-		metad->btm_magic != BTREE_MAGIC)
-		ereport(ERROR,
-				(errcode(ERRCODE_INDEX_CORRUPTED),
-				 errmsg("index \"%s\" is not a btree",
-						RelationGetRelationName(rel))));
-
-	if (metad->btm_version < BTREE_MIN_VERSION ||
-		metad->btm_version > BTREE_VERSION)
-		ereport(ERROR,
-				(errcode(ERRCODE_INDEX_CORRUPTED),
-				 errmsg("version mismatch in index \"%s\": file version %d, "
-						"current version %d, minimal supported version %d",
-						RelationGetRelationName(rel),
-						metad->btm_version, BTREE_VERSION, BTREE_MIN_VERSION)));
+	metad = _bt_getmeta(rel, metabuf);
 
 	/* if no root page initialized yet, fail */
 	if (metad->btm_root == P_NONE)
@@ -1917,11 +1897,11 @@ _bt_pagedel(Relation rel, Buffer leafbuf, BTVacState *vstate)
 		 * left half of an incomplete split, but ensuring that it's not the
 		 * right half is more complicated.  For that, we have to check that
 		 * the left sibling doesn't have its INCOMPLETE_SPLIT flag set using
-		 * _bt_leftsib_splitflag().  On the first iteration, we temporarily
-		 * release the lock on scanblkno/leafbuf, check the left sibling, and
-		 * construct a search stack to scanblkno.  On subsequent iterations,
-		 * we know we stepped right from a page that passed these tests, so
-		 * it's OK.
+		 * _bt_leftsib_splitflag().  The first time we reach a page that isn't
+		 * already half-dead (usually the scanblkno page), we temporarily
+		 * release the lock on leafbuf, check the left sibling, and construct
+		 * a search stack to leafbuf.  On subsequent iterations, we know we
+		 * stepped right from a page that passed these tests, so it's OK.
 		 */
 		if (P_RIGHTMOST(opaque) || P_ISROOT(opaque) ||
 			P_FIRSTDATAKEY(opaque) <= PageGetMaxOffsetNumber(page) ||
@@ -1976,7 +1956,6 @@ _bt_pagedel(Relation rel, Buffer leafbuf, BTVacState *vstate)
 				 * Check that the left sibling of leafbuf (if any) is not
 				 * marked with INCOMPLETE_SPLIT flag before proceeding
 				 */
-				Assert(leafblkno == scanblkno);
 				if (_bt_leftsib_splitflag(rel, leftsib, leafblkno))
 				{
 					ReleaseBuffer(leafbuf);
@@ -3069,7 +3048,7 @@ _bt_pendingfsm_finalize(Relation rel, BTVacState *vstate)
 	 */
 	GetOldestNonRemovableTransactionId(heaprel);
 
-	for (int i = 0; i < vstate->npendingpages; i++)
+	for (unsigned int i = 0; i < vstate->npendingpages; i++)
 	{
 		BlockNumber target = vstate->pendingpages[i].target;
 		FullTransactionId safexid = vstate->pendingpages[i].safexid;
@@ -3140,9 +3119,8 @@ _bt_pendingfsm_add(BTVacState *vstate,
 			newbufsize = vstate->maxbufsize;
 
 		vstate->bufsize = newbufsize;
-		vstate->pendingpages =
-			repalloc(vstate->pendingpages,
-					 sizeof(BTPendingFSM) * vstate->bufsize);
+		vstate->pendingpages = repalloc_array(vstate->pendingpages,
+											  BTPendingFSM, vstate->bufsize);
 	}
 
 	/* Save metadata for newly deleted page */

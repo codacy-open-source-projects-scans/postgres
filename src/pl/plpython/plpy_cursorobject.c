@@ -39,7 +39,7 @@ static PyType_Slot PLyCursor_slots[] =
 		Py_tp_dealloc, PLy_cursor_dealloc
 	},
 	{
-		Py_tp_doc, (char *) PLy_cursor_doc
+		Py_tp_doc, unconstify_constexpr(char *, PLy_cursor_doc)
 	},
 	{
 		Py_tp_iter, PyObject_SelfIter
@@ -243,8 +243,8 @@ PLy_cursor_plan(PyObject *ob, PyObject *args)
 
 		if (nargs > 0)
 		{
-			values = (Datum *) palloc(nargs * sizeof(Datum));
-			nulls = (char *) palloc(nargs * sizeof(char));
+			values = palloc_array(Datum, nargs);
+			nulls = palloc_array(char, nargs);
 		}
 		else
 		{
@@ -258,6 +258,11 @@ PLy_cursor_plan(PyObject *ob, PyObject *args)
 			PyObject   *elem;
 
 			elem = PySequence_GetItem(args, j);
+
+			/* PySequence_GetItem() can return NULL, with an exception set */
+			if (elem == NULL)
+				PLy_elog(ERROR, "could not get element %d from sequence", j);
+
 			PG_TRY(2);
 			{
 				bool		isnull;

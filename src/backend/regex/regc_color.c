@@ -218,6 +218,7 @@ newcolor(struct colormap *cm)
 		n = cm->ncds * 2;
 		if (n > MAX_COLOR + 1)
 			n = MAX_COLOR + 1;
+		/* the MAX_COLOR+1 limit ensures these alloc sizes can't overflow: */
 		if (cm->cd == cm->cdspace)
 		{
 			newCd = (struct colordesc *) MALLOC(n * sizeof(struct colordesc));
@@ -434,9 +435,8 @@ newhicolorrow(struct colormap *cm,
 			CERR(REG_ESPACE);
 			return 0;
 		}
-		newarray = (color *) REALLOC(cm->hicolormap,
-									 cm->maxarrayrows * 2 *
-									 cm->hiarraycols * sizeof(color));
+		newarray = REALLOC_ARRAY(cm->hicolormap, color,
+								 cm->maxarrayrows * 2 * cm->hiarraycols);
 		if (newarray == NULL)
 		{
 			CERR(REG_ESPACE);
@@ -477,9 +477,8 @@ newhicolorcols(struct colormap *cm)
 		CERR(REG_ESPACE);
 		return;
 	}
-	newarray = (color *) REALLOC(cm->hicolormap,
-								 cm->maxarrayrows *
-								 cm->hiarraycols * 2 * sizeof(color));
+	newarray = REALLOC_ARRAY(cm->hicolormap, color,
+							 cm->maxarrayrows * cm->hiarraycols * 2);
 	if (newarray == NULL)
 	{
 		CERR(REG_ESPACE);
@@ -652,8 +651,7 @@ subcoloronechr(struct vars *v,
 	 * Potentially, we could need two more colormapranges than we have now, if
 	 * the given chr is in the middle of some existing range.
 	 */
-	newranges = (colormaprange *)
-		MALLOC((cm->numcmranges + 2) * sizeof(colormaprange));
+	newranges = MALLOC_ARRAY(colormaprange, cm->numcmranges + 2);
 	if (newranges == NULL)
 	{
 		CERR(REG_ESPACE);
@@ -766,8 +764,7 @@ subcoloronerange(struct vars *v,
 	 * Potentially, if we have N non-adjacent ranges, we could need as many as
 	 * 2N+1 result ranges (consider case where new range spans 'em all).
 	 */
-	newranges = (colormaprange *)
-		MALLOC((cm->numcmranges * 2 + 1) * sizeof(colormaprange));
+	newranges = MALLOC_ARRAY(colormaprange, cm->numcmranges * 2 + 1);
 	if (newranges == NULL)
 	{
 		CERR(REG_ESPACE);
@@ -1130,7 +1127,6 @@ dumpcolors(struct colormap *cm,
 	struct colordesc *cd;
 	struct colordesc *end;
 	color		co;
-	chr			c;
 
 	fprintf(f, "max %ld\n", (long) cm->max);
 	end = CDEND(cm);
@@ -1147,7 +1143,7 @@ dumpcolors(struct colormap *cm,
 			/*
 			 * Unfortunately, it's hard to do this next bit more efficiently.
 			 */
-			for (c = CHR_MIN; c <= MAX_SIMPLE_CHR; c++)
+			for (chr c = CHR_MIN; c <= MAX_SIMPLE_CHR; c++)
 				if (GETCOLOR(cm, c) == co)
 					dumpchr(c, f);
 			fprintf(f, "\n");
@@ -1156,24 +1152,22 @@ dumpcolors(struct colormap *cm,
 	/* dump the high colormap if it contains anything interesting */
 	if (cm->hiarrayrows > 1 || cm->hiarraycols > 1)
 	{
-		int			r,
-					c;
-		const color *rowptr;
-
 		fprintf(f, "other:\t");
-		for (c = 0; c < cm->hiarraycols; c++)
+		for (int c = 0; c < cm->hiarraycols; c++)
 		{
 			fprintf(f, "\t%ld", (long) cm->hicolormap[c]);
 		}
 		fprintf(f, "\n");
-		for (r = 0; r < cm->numcmranges; r++)
+		for (int r = 0; r < cm->numcmranges; r++)
 		{
+			const color *rowptr;
+
 			dumpchr(cm->cmranges[r].cmin, f);
 			fprintf(f, "..");
 			dumpchr(cm->cmranges[r].cmax, f);
 			fprintf(f, ":");
 			rowptr = &cm->hicolormap[cm->cmranges[r].rownum * cm->hiarraycols];
-			for (c = 0; c < cm->hiarraycols; c++)
+			for (int c = 0; c < cm->hiarraycols; c++)
 			{
 				fprintf(f, "\t%ld", (long) rowptr[c]);
 			}

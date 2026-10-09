@@ -12,8 +12,8 @@
  *
  *	  - a remote process is the destination when we are
  *		running a backend with a frontend and the frontend executes
- *		PQexec() or PQfn().  In this case, the results are sent
- *		to the frontend via the functions in backend/libpq.
+ *		PQexec().  In this case, the results are sent to the frontend via
+ *		the functions in backend/libpq.
  *
  *	  - DestNone is the destination when the system executes
  *		a query internally.  The results are discarded.
@@ -136,6 +136,8 @@ extern PGDLLIMPORT DestReceiver *None_Receiver; /* permanent receiver for
 
 extern void BeginCommand(CommandTag commandTag, CommandDest dest);
 extern DestReceiver *CreateDestReceiver(CommandDest dest);
+extern void EndCommandExtended(const QueryCompletion *qc, CommandDest dest,
+							   bool force_undecorated_output, bool noblock);
 extern void EndCommand(const QueryCompletion *qc, CommandDest dest,
 					   bool force_undecorated_output);
 extern void EndReplicationCommand(const char *commandTag);

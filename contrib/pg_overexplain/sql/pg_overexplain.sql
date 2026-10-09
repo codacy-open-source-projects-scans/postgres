@@ -31,6 +31,25 @@ INSERT INTO vegetables (name, genus)
 		   ('rutabaga', 'brassica'), ('turnip', 'brassica');
 VACUUM ANALYZE vegetables;
 
+-- Create a multi-level partitioned table.
+CREATE TABLE creatures (id serial, name text, class text, clade text)
+	PARTITION BY LIST (class);
+CREATE TABLE mammalia PARTITION OF creatures FOR VALUES IN ('mammalia')
+	PARTITION BY LIST (clade);
+CREATE TABLE carnivora PARTITION OF mammalia FOR VALUES IN ('carnivora');
+CREATE TABLE rodentia PARTITION OF mammalia FOR VALUES IN ('rodentia');
+CREATE TABLE aves PARTITION OF creatures FOR VALUES IN ('aves');
+INSERT INTO creatures (name, class, clade)
+	VALUES ('fossa', 'mammalia', 'carnivora'),
+		   ('meerkat', 'mammalia', 'carnivora'),
+		   ('binturong', 'mammalia', 'carnivora'),
+		   ('capybara', 'mammalia', 'rodentia'),
+		   ('chinchilla', 'mammalia', 'rodentia'),
+		   ('agouti', 'mammalia', 'rodentia'),
+		   ('kakapo', 'aves', NULL),
+		   ('hoatzin', 'aves', NULL);
+VACUUM ANALYZE creatures;
+
 -- We filter relation OIDs out of the test output in order to avoid
 -- test instability. This is currently only needed for EXPLAIN (DEBUG), not
 -- EXPLAIN (RANGE_TABLE). Also suppress actual row counts, which are not
@@ -92,18 +111,28 @@ INSERT INTO vegetables (name, genus)
 $$);
 
 -- Create an index, and then attempt to force a nested loop with inner index
--- scan so that we can see parameter-related information. Also, let's try
--- actually running the query, but try to suppress potentially variable output.
+-- scan so that we can see parameter-related information.
 CREATE INDEX ON vegetables (id);
 ANALYZE vegetables;
 SET enable_hashjoin = false;
 SET enable_material = false;
 SET enable_mergejoin = false;
 SET enable_seqscan = false;
+
+-- Let's try actually running the query, but try to suppress potentially
+-- variable output.
 SELECT explain_filter($$
 EXPLAIN (BUFFERS OFF, COSTS OFF, SUMMARY OFF, TIMING OFF, ANALYZE, DEBUG)
 SELECT * FROM vegetables v1, vegetables v2 WHERE v1.id = v2.id;
 $$);
+
+-- Test the RANGE_TABLE option with a case that involves an outer join.
+SELECT explain_filter($$
+EXPLAIN (RANGE_TABLE, COSTS OFF)
+SELECT * FROM daucus d LEFT JOIN brassica b ON d.id = b.id;
+$$);
+
+-- Restore default settings.
 RESET enable_hashjoin;
 RESET enable_material;
 RESET enable_mergejoin;
@@ -127,13 +156,6 @@ EXPLAIN (RANGE_TABLE, COSTS OFF)
 SELECT * FROM vegetables v,
        (SELECT * FROM vegetables WHERE genus = 'daucus' OFFSET 0);
 
--- Property graph test
-CREATE PROPERTY GRAPH vegetables_graph
-VERTEX TABLES
-(
-	daucus KEY(name) DEFAULT LABEL LABEL vegetables,
-	brassica KEY(name) DEFAULT LABEL LABEL vegetables
-);
-
+-- test display of child append RTIs
 EXPLAIN (RANGE_TABLE, COSTS OFF)
-SELECT * FROM GRAPH_TABLE (vegetables_graph MATCH (v1 IS vegetables) WHERE v1.genus = 'daucus' COLUMNS (v1.name));
+SELECT * FROM (SELECT * FROM creatures OFFSET 0) ss;

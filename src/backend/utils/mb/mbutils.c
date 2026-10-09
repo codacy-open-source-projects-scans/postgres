@@ -1178,7 +1178,8 @@ pg_mbstrlen(const char *mbstr)
 	return len;
 }
 
-/* returns the length (counted in wchars) of a multibyte string
+/*
+ * returns the length (counted in wchars) of a multibyte string
  * (stops at the first of "limit" or a NUL)
  */
 int
@@ -1944,7 +1945,7 @@ pgwin32_message_to_UTF16(const char *str, int len, int *utf16len)
 		 */
 		if (IsTransactionState())
 		{
-			utf8 = (char *) pg_do_encoding_conversion((unsigned char *) str,
+			utf8 = (char *) pg_do_encoding_conversion((unsigned char *) unconstify(char *, str),
 													  len,
 													  msgenc,
 													  PG_UTF8);
@@ -1952,7 +1953,7 @@ pgwin32_message_to_UTF16(const char *str, int len, int *utf16len)
 				len = strlen(utf8);
 		}
 		else
-			utf8 = (char *) str;
+			utf8 = unconstify(char *, str);
 
 		utf16 = palloc_array(WCHAR, len + 1);
 		dstlen = MultiByteToWideChar(CP_UTF8, 0, utf8, len, utf16, len);

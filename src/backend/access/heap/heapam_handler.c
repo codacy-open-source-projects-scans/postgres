@@ -12,7 +12,7 @@
  *
  *
  * NOTES
- *	  This files wires up the lower level heapam.c et al routines with the
+ *	  This file wires up the lower level heapam.c et al routines with the
  *	  tableam abstraction.
  *
  *-------------------------------------------------------------------------
@@ -192,17 +192,11 @@ static void
 heapam_tuple_complete_speculative(Relation relation, TupleTableSlot *slot,
 								  uint32 specToken, bool succeeded)
 {
-	bool		shouldFree = true;
-	HeapTuple	tuple = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
-
 	/* adjust the tuple's state accordingly */
 	if (succeeded)
 		heap_finish_speculative(relation, &slot->tts_tid);
 	else
 		heap_abort_speculative(relation, &slot->tts_tid);
-
-	if (shouldFree)
-		pfree(tuple);
 }
 
 static TM_Result
@@ -666,20 +660,12 @@ heapam_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 	 */
 	if (OldIndex != NULL && !use_sort)
 	{
-		const int	ci_index[] = {
-			PROGRESS_REPACK_PHASE,
-			PROGRESS_REPACK_INDEX_RELID
-		};
-		int64		ci_val[2];
-
-		/* Set phase and OIDOldIndex to columns */
-		ci_val[0] = PROGRESS_REPACK_PHASE_INDEX_SCAN_HEAP;
-		ci_val[1] = RelationGetRelid(OldIndex);
-		pgstat_progress_update_multi_param(2, ci_index, ci_val);
+		pgstat_progress_update_param(PROGRESS_REPACK_PHASE,
+									 PROGRESS_REPACK_PHASE_INDEX_SCAN_HEAP);
 
 		tableScan = NULL;
 		heapScan = NULL;
-		indexScan = index_beginscan(OldHeap, OldIndex,
+		indexScan = index_beginscan(OldHeap, OldIndex, false,
 									snapshot ? snapshot : SnapshotAny,
 									NULL, 0, 0,
 									SO_NONE);
@@ -722,7 +708,8 @@ heapam_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 
 		if (indexScan != NULL)
 		{
-			if (!index_getnext_slot(indexScan, ForwardScanDirection, slot))
+			if (!table_index_getnext_slot(indexScan, ForwardScanDirection,
+										  slot))
 				break;
 
 			/* Since we used no scan keys, should never need to recheck */
@@ -1971,7 +1958,7 @@ heapam_scan_get_blocks_done(HeapScanDesc hscan)
 	if (hscan->rs_base.rs_parallel != NULL)
 	{
 		bpscan = (ParallelBlockTableScanDesc) hscan->rs_base.rs_parallel;
-		startblock = bpscan->phs_startblock;
+		startblock = pg_atomic_read_u32(&bpscan->phs_startblock);
 	}
 	else
 		startblock = hscan->rs_startblock;
@@ -1980,7 +1967,7 @@ heapam_scan_get_blocks_done(HeapScanDesc hscan)
 	 * Might have wrapped around the end of the relation, if startblock was
 	 * not zero.
 	 */
-	if (hscan->rs_cblock > startblock)
+	if (hscan->rs_cblock >= startblock)
 		blocks_done = hscan->rs_cblock - startblock;
 	else
 	{
@@ -2396,10 +2383,10 @@ heap_insert_for_repack(HeapTuple tuple, Relation OldHeap, Relation NewHeap,
 /*
  * Subroutine for reform_and_rewrite_tuple and heap_insert_for_repack.
  *
- * Deform the given tuple, set values of dropped columns to NULL, form a new
- * tuple and return it.  If no attributes need to be changed in this way, a
- * copy of the original tuple is returned.  Caller is responsible for freeing
- * the returned tuple.
+ * Deform the given tuple, set values of dropped columns to NULL, and fill in
+ * any values from attmissingval; then form a new tuple and return it.  If no
+ * attributes need to be changed, a copy of the original tuple is returned.
+ * Caller is responsible for freeing the returned tuple.
  *
  * XXX this coding assumes that both relations have the same tupledesc.
  */
@@ -2411,13 +2398,33 @@ reform_tuple(HeapTuple tuple, Relation OldHeap, Relation NewHeap,
 	TupleDesc	newTupDesc = RelationGetDescr(NewHeap);
 	bool		needs_reform = false;
 
-	/* Skip work if the tuple doesn't need any attributes changed */
-	for (int i = 0; i < newTupDesc->natts; i++)
+	/*
+	 * A short tuple might require values from attmissing val, so activate the
+	 * coding unconditionally in that case.  The value might legitimally be
+	 * NULL otherwise, so this is slightly wasteful, but it probably beats
+	 * having to test each attribute for presence of attmissingval each time.
+	 */
+	if (HeapTupleHeaderGetNatts(tuple->t_data) < newTupDesc->natts)
+		needs_reform = true;
+
+	/*
+	 * If the column has been dropped but a value is still present, we can
+	 * optimize storage now by getting rid of it.
+	 */
+	if (!needs_reform)
 	{
-		if (TupleDescCompactAttr(newTupDesc, i)->attisdropped &&
-			!heap_attisnull(tuple, i + 1, newTupDesc))
-			needs_reform = true;
+		for (int i = 0; i < newTupDesc->natts; i++)
+		{
+			if (TupleDescCompactAttr(newTupDesc, i)->attisdropped &&
+				!heap_attisnull(tuple, i + 1, newTupDesc))
+			{
+				needs_reform = true;
+				break;
+			}
+		}
 	}
+
+	/* Skip work if no changes are needed */
 	if (!needs_reform)
 		return heap_copytuple(tuple);
 
@@ -2659,10 +2666,9 @@ static const TableAmRoutine heapam_methods = {
 	.parallelscan_initialize = table_block_parallelscan_initialize,
 	.parallelscan_reinitialize = table_block_parallelscan_reinitialize,
 
-	.index_fetch_begin = heapam_index_fetch_begin,
-	.index_fetch_reset = heapam_index_fetch_reset,
-	.index_fetch_end = heapam_index_fetch_end,
-	.index_fetch_tuple = heapam_index_fetch_tuple,
+	.index_scan_begin = heapam_index_scan_begin,
+	.index_scan_reset = heapam_index_scan_reset,
+	.index_scan_end = heapam_index_scan_end,
 
 	.tuple_insert = heapam_tuple_insert,
 	.tuple_insert_speculative = heapam_tuple_insert_speculative,
@@ -2672,6 +2678,7 @@ static const TableAmRoutine heapam_methods = {
 	.tuple_update = heapam_tuple_update,
 	.tuple_lock = heapam_tuple_lock,
 
+	.fetch_tid = heapam_fetch_tid,
 	.tuple_fetch_row_version = heapam_fetch_row_version,
 	.tuple_get_latest_tid = heap_get_latest_tid,
 	.tuple_tid_valid = heapam_tuple_tid_valid,

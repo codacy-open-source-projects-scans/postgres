@@ -376,8 +376,6 @@ typedef struct ModifyTable
 	List	   *onConflictCols;
 	/* WHERE for ON CONFLICT DO SELECT/UPDATE */
 	Node	   *onConflictWhere;
-	/* FOR PORTION OF clause for UPDATE/DELETE */
-	Node	   *forPortionOf;
 	/* RTI of the EXCLUDED pseudo relation */
 	Index		exclRelRTI;
 	/* tlist of the EXCLUDED pseudo relation */
@@ -966,6 +964,7 @@ typedef struct CustomScan
  * inner_unique each outer tuple can match to no more than one inner tuple
  * joinqual:	qual conditions that came from JOIN/ON or JOIN/USING
  *				(plan.qual contains conditions that came from WHERE)
+ * ojrelids:	outer joins completed at this level
  *
  * When jointype is INNER, joinqual and plan.qual are semantically
  * interchangeable.  For OUTER jointypes, the two are *not* interchangeable;
@@ -990,6 +989,7 @@ typedef struct Join
 	bool		inner_unique;
 	/* JOIN quals (in addition to plan.qual) */
 	List	   *joinqual;
+	Bitmapset  *ojrelids;
 } Join;
 
 /* ----------------
@@ -1169,6 +1169,8 @@ typedef struct IncrementalSort
 	Sort		sort;
 	/* number of presorted columns */
 	int			nPresortedCols;
+	/* estimated number of groups in input */
+	Cardinality numGroups;
 } IncrementalSort;
 
 /* ---------------
@@ -1864,6 +1866,9 @@ typedef struct SubPlanRTInfo
  *
  * plan_node_id is that of the surviving plan node, the sole child of the
  * one which was elided.
+ *
+ * For an elided Append or MergeAppend, child_append_relid_sets is the
+ * child_append_relid_sets value from the removed node; otherwise, it is NIL.
  */
 typedef struct ElidedNode
 {
@@ -1871,6 +1876,7 @@ typedef struct ElidedNode
 	int			plan_node_id;
 	NodeTag		elided_type;
 	Bitmapset  *relids;
+	List	   *child_append_relid_sets;
 } ElidedNode;
 
 #endif							/* PLANNODES_H */

@@ -850,6 +850,20 @@ SELECT 5432 AS fail UNION SELECT 5433 ORDER BY 1 \gset
 }
 	});
 
+# \gset stores a SQL NULL as the null value.
+$node->pgbench(
+	'-t 1', 0,
+	[ qr{type: .*/001_pgbench_gset_null}, qr{processed: 1/1} ],
+	[ qr{command=2.: null\b}, qr{command=3.: boolean true\b} ],
+	'pgbench gset command with NULL',
+	{
+		'001_pgbench_gset_null' => q{-- NULL is stored as the null value
+SELECT NULL AS nv \gset
+\set i debug(:nv)
+\set i debug(:nv IS NULL)
+}
+	});
+
 # working \aset
 # Valid cases.
 $node->pgbench(
@@ -1823,10 +1837,9 @@ update counter set i = i+1 returning i \gset
 
 # Test copy in pgbench
 $node->pgbench(
-	'-t 10',
-	2,
+	'-t 10', 2,
 	[],
-	[ qr{COPY is not supported in pgbench, aborting} ],
+	[qr{COPY is not supported in pgbench, aborting}],
 	'Test copy in script',
 	{
 		'001_copy' => q{ COPY pgbench_accounts FROM stdin }
@@ -1836,16 +1849,12 @@ $node->pgbench(
 $node->safe_psql('postgres', 'DROP TABLE counter;');
 
 # Test --continue-on-error
-$node->safe_psql('postgres',
-	'CREATE TABLE unique_table(i int unique);');
+$node->safe_psql('postgres', 'CREATE TABLE unique_table(i int unique);');
 
 $node->pgbench(
 	'-n -t 10 --continue-on-error --failures-detailed',
 	0,
-	[
-		qr{processed: 1/10\b},
-		qr{other failures: 9\b}
-	],
+	[ qr{processed: 1/10\b}, qr{other failures: 9\b} ],
 	[],
 	'test --continue-on-error',
 	{

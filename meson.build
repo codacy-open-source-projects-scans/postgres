@@ -8,7 +8,7 @@
 
 project('postgresql',
   ['c'],
-  version: '19devel',
+  version: '20devel',
   license: 'PostgreSQL',
 
   # We want < 0.62 for python 3.6 compatibility on old platforms.
@@ -955,14 +955,14 @@ endif
 
 icuopt = get_option('icu')
 if not icuopt.disabled()
-  icu = dependency('icu-uc', required: false)
+  icu = dependency('icu-uc', required: false, version: '>= 55')
   if icu.found()
     icu_i18n = dependency('icu-i18n', required: true)
   endif
 
   # Unfortunately the dependency is named differently with cmake
   if not icu.found() # combine with above once meson 0.60.0 is required
-    icu = dependency('ICU', required: icuopt,
+    icu = dependency('ICU', required: icuopt, version: '>= 55',
                      components: ['uc'], modules: ['ICU::uc'], method: 'cmake')
     if icu.found()
       icu_i18n = dependency('ICU', required: true,
@@ -2062,21 +2062,6 @@ foreach builtin : builtins
 endforeach
 
 
-# Check if the C compiler understands __builtin_types_compatible_p,
-# and define HAVE__BUILTIN_TYPES_COMPATIBLE_P if so.
-#
-# We check usage with __typeof__, though it's unlikely any compiler would
-# have the former and not the latter.
-if cc.compiles('''
-    static int x;
-    static int y[__builtin_types_compatible_p(__typeof__(x), int)];
-    ''',
-    name: '__builtin_types_compatible_p',
-    args: test_c_args)
-  cdata.set('HAVE__BUILTIN_TYPES_COMPATIBLE_P', 1)
-endif
-
-
 # Check if the C compiler understands __builtin_$op_overflow(),
 # and define HAVE__BUILTIN_OP_OVERFLOW if so.
 #
@@ -2200,6 +2185,12 @@ common_functional_flags = [
   # Disable optimizations that assume no overflow; needed for gcc 4.3+
   '-fwrapv',
   '-fexcess-precision=standard',
+  # Without -fpch-deps gcc emits dependencies that are insufficient for ccache
+  # to trigger a rebuild when the precompiled header changes. We could make
+  # this depend on using gcc and precompiled headers being enabled, but that's
+  # probably not worth it.  See also
+  # https://github.com/ccache/ccache/issues/1686
+  '-fpch-deps',
 ]
 
 cflags += cc.get_supported_arguments(common_functional_flags)
@@ -2218,7 +2209,6 @@ common_warning_flags = [
   '-Werror=unguarded-availability-new',
   '-Wmissing-format-attribute',
   '-Wcast-function-type',
-  '-Wshadow=compatible-local',
   # This was included in -Wall/-Wformat in older GCC versions
   '-Wformat-security',
 ]
@@ -2270,6 +2260,14 @@ cflags_no_missing_var_decls = []
 if cc.has_argument('-Wmissing-variable-declarations')
   cflags_warn += '-Wmissing-variable-declarations'
   cflags_no_missing_var_decls += '-Wno-missing-variable-declarations'
+endif
+
+# We need to be able to disable shadow warnings for the LLVM includes.
+cflags_warn += cc.get_supported_arguments('-Wshadow=local')
+cxxflags_no_shadow = []
+if have_cxx and cxx.has_argument('-Wshadow=local')
+  cxxflags_warn += '-Wshadow=local'
+  cxxflags_no_shadow += '-Wno-shadow=local'
 endif
 
 # The following tests want to suppress various unhelpful warnings by adding

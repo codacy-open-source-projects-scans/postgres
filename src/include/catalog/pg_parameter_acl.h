@@ -29,7 +29,7 @@
  */
 BEGIN_CATALOG_STRUCT
 
-CATALOG(pg_parameter_acl,6243,ParameterAclRelationId) BKI_SHARED_RELATION
+CATALOG(pg_parameter_acl,6243,ParameterAclRelationId) BKI_SHARED_RELATION BKI_ROWTYPE_OID(2173,ParameterAclRelation_Rowtype_Id) BKI_SCHEMA_MACRO
 {
 	Oid			oid;			/* oid */
 
@@ -38,7 +38,7 @@ CATALOG(pg_parameter_acl,6243,ParameterAclRelationId) BKI_SHARED_RELATION
 	text		parname BKI_FORCE_NOT_NULL;
 
 	/* access permissions */
-	aclitem		paracl[1] BKI_DEFAULT(_null_);
+	aclitem		paracl[] BKI_DEFAULT(_null_);
 #endif
 } FormData_pg_parameter_acl;
 

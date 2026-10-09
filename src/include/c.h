@@ -76,6 +76,9 @@
 #if defined(WIN32) || defined(__CYGWIN__)
 #include <fcntl.h>				/* ensure O_BINARY is available */
 #endif
+#ifdef _MSC_VER
+#include <sal.h>
+#endif
 #include <locale.h>
 #ifdef HAVE_XLOCALE_H
 #include <xlocale.h>
@@ -105,6 +108,65 @@ extern "C++"
  *				Section 1: compiler characteristics
  * ----------------------------------------------------------------
  */
+
+/*
+ * Not all compilers follow gcc's names of macros for particular target
+ * architectures.  Let's standardize on gcc's names (with trailing __),
+ * and cause those to become defined here if they are not already.
+ *
+ * Note: while this list is alphabetical, it's necessary to check _M_ARM64
+ * before _M_AMD64, because Microsoft's ARM64EC environment defines both.
+ */
+#if defined(__arm__) || defined(__arm)
+#ifndef __arm__
+#define __arm__ 1
+#endif
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#ifndef __aarch64__
+#define __aarch64__ 1
+#endif
+#elif defined(__loongarch64__) || defined(__loongarch64)
+#ifndef __loongarch64__
+#define __loongarch64__ 1
+#endif
+#elif defined(__mips__)
+/* no work */
+#elif defined(__mips64__)
+/* no work */
+#elif defined(__powerpc__) || defined(__ppc__)
+#ifndef __powerpc__
+#define __powerpc__ 1
+#endif
+#elif defined(__powerpc64__) || defined(__ppc64__)
+#ifndef __powerpc64__
+#define __powerpc64__ 1
+#endif
+#elif defined(__riscv)
+/* RISC-V doesn't follow the common naming pattern, so force it */
+#if SIZEOF_VOID_P == 8
+#define __riscv64__ 1
+#else
+#define __riscv__ 1
+#endif
+#elif defined(__s390__)
+/* no work */
+#elif defined(__s390x__)
+/* no work */
+#elif defined(__sparc__) || defined(__sparc)
+#ifndef __sparc__
+#define __sparc__ 1
+#endif
+#elif defined(__i386__) || defined (__i386) || defined(_M_IX86)
+#ifndef __i386__
+#define __i386__ 1
+#endif
+#elif defined(__x86_64__) || defined(__x86_64) || defined (__amd64) || defined(_M_AMD64)
+#ifndef __x86_64__
+#define __x86_64__ 1
+#endif
+#else
+#error "cannot identify target architecture"
+#endif
 
 /*
  * Disable "inline" if PG_FORCE_DISABLE_INLINE is defined.
@@ -216,6 +278,22 @@ extern "C++"
 #endif
 
 /*
+ * Place this macro before functions that intentionally call through a
+ * function pointer whose type does not exactly match the called function.
+ * The prime examples are the expression tree walkers and mutators, which are
+ * declared with their own concrete node and context types and cast to a
+ * generic signature.  That is, strictly speaking, undefined behavior, but it
+ * is a convenient convention that works in practice.  See also
+ * -Wno-cast-function-type-strict, which disables the corresponding
+ * compile-time warning.
+ */
+#ifdef __clang__
+#define pg_attribute_no_sanitize_function() __attribute__((no_sanitize("function")))
+#else
+#define pg_attribute_no_sanitize_function()
+#endif
+
+/*
  * pg_attribute_nonnull means the compiler should warn if the function is
  * called with the listed arguments set to NULL.  If no arguments are
  * listed, the compiler should warn if any pointer arguments are set to NULL.
@@ -236,6 +314,37 @@ extern "C++"
 #define pg_attribute_target(...) __attribute__((target(__VA_ARGS__)))
 #else
 #define pg_attribute_target(...)
+#endif
+
+/*
+ * pg_attribute_counted_by specifies that a flexible array member is "counted
+ * by" another struct member.  This allows the compiler to improve detection
+ * of object size information and to provide better results in compile-time
+ * diagnostics and run-time features, such as the array bounds sanitizer.
+ *
+ * Using this annotation comes with additional responsibilities:
+ *
+ * - The count must be assigned before the first reference to the array.
+ * - The array must have at least count elements available at all times,
+ *   including after either member is updated.
+ *
+ * The attribute is ignored in C++ due to lack of compiler support.
+ *
+ * MSVC has no counted_by attribute, but the equivalent SAL annotation
+ * _Field_size_() is understood by its static analyzer (/analyze); in ordinary
+ * builds it expands to nothing.  (C++ would be supported here, but we leave
+ * it off for consistency with the other compilers.)
+ */
+#ifndef __cplusplus
+#if __has_attribute (counted_by)
+#define pg_attribute_counted_by(count) __attribute__((counted_by(count)))
+#elif defined(_MSC_VER)
+#define pg_attribute_counted_by(count) _Field_size_(count)
+#else
+#define pg_attribute_counted_by(count)
+#endif
+#else
+#define pg_attribute_counted_by(count)
 #endif
 
 /*
@@ -289,20 +398,20 @@ extern "C++"
 #endif
 
 /*
- * Use "pg_attribute_always_inline" in place of "inline" for functions that
+ * Use "pg_always_inline" in place of "inline" for functions that
  * we wish to force inlining of, even when the compiler's heuristics would
  * choose not to.  But, if possible, don't force inlining in unoptimized
  * debug builds.
  */
 #if defined(__GNUC__) && defined(__OPTIMIZE__)
 /* GCC supports always_inline via __attribute__ */
-#define pg_attribute_always_inline __attribute__((always_inline)) inline
+#define pg_always_inline __attribute__((always_inline)) inline
 #elif defined(_MSC_VER)
 /* MSVC has a special keyword for this */
-#define pg_attribute_always_inline __forceinline
+#define pg_always_inline __forceinline
 #else
 /* Otherwise, the best we can do is to say "inline" */
-#define pg_attribute_always_inline inline
+#define pg_always_inline inline
 #endif
 
 /*
@@ -633,7 +742,6 @@ typedef uint64_t uint64;
 /* snprintf format strings to use for 64-bit integers */
 #define INT64_FORMAT "%" PRId64
 #define UINT64_FORMAT "%" PRIu64
-#define OID8_FORMAT "%" PRIu64
 
 /*
  * 128-bit signed and unsigned integers
@@ -1022,24 +1130,10 @@ pg_noreturn extern void ExceptionalCondition(const char *conditionName,
  * rationale for the precise behavior of this implementation.  See
  * <https://stackoverflow.com/questions/31311748> about the C++
  * implementation.
- *
- * For compilers that don't support this, we fall back on a kluge that assumes
- * the compiler will complain about a negative width for a struct bit-field.
- * This will not include a helpful error message, but it beats not getting an
- * error at all.
  */
 #ifndef __cplusplus
-#if !defined(_MSC_VER) || _MSC_VER >= 1933
 #define StaticAssertExpr(condition, errmessage) \
 	((void) sizeof(struct {static_assert(condition, errmessage); char a;}))
-#else							/* _MSC_VER < 1933 */
-/*
- * This compiler is buggy and fails to compile the previous variant; use a
- * fallback implementation.
- */
-#define StaticAssertExpr(condition, errmessage) \
-	((void) sizeof(struct { int static_assert_failure : (condition) ? 1 : -1; }))
-#endif							/* _MSC_VER < 1933 */
 #else							/* __cplusplus */
 #define StaticAssertExpr(condition, errmessage) \
 	([]{static_assert(condition, errmessage);})
@@ -1049,29 +1143,24 @@ pg_noreturn extern void ExceptionalCondition(const char *conditionName,
 /*
  * Compile-time checks that a variable (or expression) has the specified type.
  *
+ * The type must not have top-level qualifiers (const, volatile) and must not
+ * be an array (use pointer instead).  (This wouldn't work because _Generic
+ * does lvalue conversion on the controlling expression, which drops
+ * qualifiers and converts arrays to pointers.)  Qualifiers inside pointers
+ * are allowed.
+ *
  * StaticAssertVariableIsOfType() can be used as a declaration.
  * StaticAssertVariableIsOfTypeMacro() is intended for use in macros, eg
  *		#define foo(x) (StaticAssertVariableIsOfTypeMacro(x, int), bar(x))
  *
- * If we don't have __builtin_types_compatible_p, we can still assert that
- * the types have the same size.  This is far from ideal (especially on 32-bit
- * platforms) but it provides at least some coverage.
+ * Note that these do not work in C++.
  */
-#ifdef HAVE__BUILTIN_TYPES_COMPATIBLE_P
 #define StaticAssertVariableIsOfType(varname, typename) \
-	StaticAssertDecl(__builtin_types_compatible_p(typeof(varname), typename), \
+	StaticAssertDecl(_Generic((varname), typename: 1, default: 0), \
 	CppAsString(varname) " does not have type " CppAsString(typename))
 #define StaticAssertVariableIsOfTypeMacro(varname, typename) \
-	(StaticAssertExpr(__builtin_types_compatible_p(typeof(varname), typename), \
+	(StaticAssertExpr(_Generic((varname), typename: 1, default: 0), \
 	 CppAsString(varname) " does not have type " CppAsString(typename)))
-#else							/* !HAVE__BUILTIN_TYPES_COMPATIBLE_P */
-#define StaticAssertVariableIsOfType(varname, typename) \
-	StaticAssertDecl(sizeof(varname) == sizeof(typename), \
-	CppAsString(varname) " does not have type " CppAsString(typename))
-#define StaticAssertVariableIsOfTypeMacro(varname, typename) \
-	(StaticAssertExpr(sizeof(varname) == sizeof(typename), \
-	 CppAsString(varname) " does not have type " CppAsString(typename)))
-#endif							/* HAVE__BUILTIN_TYPES_COMPATIBLE_P */
 
 
 /* ----------------------------------------------------------------
@@ -1308,8 +1397,13 @@ typedef struct PGAlignedXLogBlock PGAlignedXLogBlock;
 
 /*
  * Macro that allows to cast constness and volatile away from an expression, but doesn't
- * allow changing the underlying type.  Enforcement of the latter
- * currently only works for gcc like compilers.
+ * allow changing the underlying type.
+ *
+ * This is only meant to work for qualifiers behind at least one level of
+ * pointer.  (In the C implementation, the StaticAssertVariableIsOfTypeMacro
+ * will drop top-level qualifiers, so with a non-pointer, the static assertion
+ * will fail.  In the C++ implementation, const_cast will error for
+ * non-pointers.)
  *
  * Please note IT IS NOT SAFE to cast constness away if the result will ever
  * be modified (it would be undefined behaviour). Doing so anyway can cause
@@ -1318,27 +1412,55 @@ typedef struct PGAlignedXLogBlock PGAlignedXLogBlock;
  * design or language restrictions prevent you from declaring that
  * (e.g. because a function returns both const and non-const variables).
  *
- * Note that this only works in function scope, not for global variables (it'd
- * be nice, but not trivial, to improve that).
+ * unconstify_constexpr is for contexts where a constant expression is
+ * required, such as for initializing global variables.  It provides the same
+ * level of checking as unconstify, but the checking only works on GCC,
+ * otherwise it lets anything through.  Also, if the check fails, it gives a
+ * less clear error message.  So it should only be used when necessary.
+ *
+ * (An unvolatize_constexpr doesn't seem necessary, but it could be added if
+ * required.)
  */
 #if defined(__cplusplus)
 #define unconstify(underlying_type, expr) const_cast<underlying_type>(expr)
+#define unconstify_constexpr(underlying_type, expr) const_cast<underlying_type>(expr)
 #define unvolatize(underlying_type, expr) const_cast<underlying_type>(expr)
-#else
+#else							/* !__cplusplus */
 #define unconstify(underlying_type, expr) \
 	(StaticAssertVariableIsOfTypeMacro(expr, const underlying_type), \
 	 (underlying_type) (expr))
 #define unvolatize(underlying_type, expr) \
 	(StaticAssertVariableIsOfTypeMacro(expr, volatile underlying_type), \
 	 (underlying_type) (expr))
-#endif
+#ifdef __GNUC__
+#define unconstify_constexpr(underlying_type, expr) \
+	__builtin_choose_expr( \
+		_Generic((expr), const underlying_type: 1, default: 0), \
+		(underlying_type) (expr), \
+		(void) 0)
+#else							/* !__GNUC_ */
+#define unconstify_constexpr(underlying_type, expr) \
+	((underlying_type) (expr))
+#endif							/* !__GNUC_ */
+#endif							/* !__cplusplus */
 
 /*
  * SSE2 instructions are part of the spec for the 64-bit x86 ISA. We assume
  * that compilers targeting this architecture understand SSE2 intrinsics.
  */
-#if (defined(__x86_64__) || defined(_M_AMD64))
+#if defined(__x86_64__)
 #define USE_SSE2
+
+#else							/* ! x86_64 */
+
+/*
+ * In "universal" macOS builds, it's possible for AVX-related symbols to
+ * get defined if the build host is x86_64, but we mustn't try to build
+ * that code when cross-compiling to aarch64.
+ */
+#undef USE_AVX2_WITH_RUNTIME_CHECK
+#undef USE_AVX512_CRC32C_WITH_RUNTIME_CHECK
+#undef USE_AVX512_POPCNT_WITH_RUNTIME_CHECK
 
 /*
  * We use the Neon instructions if the compiler provides access to them (as
@@ -1348,9 +1470,10 @@ typedef struct PGAlignedXLogBlock PGAlignedXLogBlock;
  * could not realistically use it there without a run-time check, which seems
  * not worth the trouble for now.
  */
-#elif defined(__aarch64__) && defined(__ARM_NEON)
+#if defined(__aarch64__) && defined(__ARM_NEON)
 #define USE_NEON
 #endif
+#endif							/* x86_64 */
 
 /* ----------------------------------------------------------------
  *				Section 9: system-specific hacks

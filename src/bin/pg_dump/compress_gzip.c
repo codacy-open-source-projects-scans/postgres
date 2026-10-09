@@ -205,7 +205,8 @@ ReadDataFromArchiveGzip(ArchiveHandle *AH, CompressorState *cs)
 
 			res = inflate(zp, 0);
 			if (res != Z_OK && res != Z_STREAM_END)
-				pg_fatal("could not uncompress data: %s", zp->msg);
+				pg_fatal("could not uncompress data: %s",
+						 zp->msg ? zp->msg : "unknown error");
 
 			out[DEFAULT_IO_BUFFER_SIZE - zp->avail_out] = '\0';
 			ahwrite(out, 1, DEFAULT_IO_BUFFER_SIZE - zp->avail_out, AH);
@@ -220,7 +221,8 @@ ReadDataFromArchiveGzip(ArchiveHandle *AH, CompressorState *cs)
 		zp->avail_out = DEFAULT_IO_BUFFER_SIZE;
 		res = inflate(zp, 0);
 		if (res != Z_OK && res != Z_STREAM_END)
-			pg_fatal("could not uncompress data: %s", zp->msg);
+			pg_fatal("could not uncompress data: %s",
+					 zp->msg ? zp->msg : "unknown error");
 
 		out[DEFAULT_IO_BUFFER_SIZE - zp->avail_out] = '\0';
 		ahwrite(out, 1, DEFAULT_IO_BUFFER_SIZE - zp->avail_out, AH);
@@ -229,9 +231,9 @@ ReadDataFromArchiveGzip(ArchiveHandle *AH, CompressorState *cs)
 	if (inflateEnd(zp) != Z_OK)
 		pg_fatal("could not close compression library: %s", zp->msg);
 
-	free(buf);
-	free(out);
-	free(zp);
+	pg_free(buf);
+	pg_free(out);
+	pg_free(zp);
 }
 
 /* Public routines that support gzip compressed data I/O */
@@ -421,7 +423,7 @@ Gzip_open_write(const char *path, const char *mode, CompressFileHandle *CFH)
 	ret = CFH->open_func(fname, -1, mode, CFH);
 
 	save_errno = errno;
-	pg_free(fname);
+	pfree(fname);
 	errno = save_errno;
 
 	return ret;

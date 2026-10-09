@@ -83,6 +83,8 @@ CREATE PUBLICATION testpub_forschema FOR TABLES IN SCHEMA pub_test;
 CREATE PUBLICATION testpub_for_tbl_schema FOR TABLES IN SCHEMA pub_test, TABLE pub_test.testpub_nopk;
 RESET client_min_messages;
 \dRp+ testpub_for_tbl_schema
+-- table also covered by a published schema should appear only once in \d output
+\d pub_test.testpub_nopk
 
 -- weird parser corner case
 CREATE PUBLICATION testpub_parsertst FOR TABLE pub_test.testpub_nopk, CURRENT_SCHEMA;
@@ -121,8 +123,45 @@ CREATE PUBLICATION testpub_foralltables_excepttable1 FOR ALL TABLES EXCEPT (TABL
 -- Check that the table description shows the publications where it is listed
 -- in the EXCEPT clause
 \d testpub_tbl1
+-- Check object address handling for an EXCEPT entry.
+\a\t
+SELECT (pg_identify_object('pg_publication_rel'::regclass, pr.oid, 0)).*
+FROM pg_publication_rel pr
+JOIN pg_publication p ON p.oid = pr.prpubid
+JOIN pg_class c ON c.oid = pr.prrelid
+WHERE p.pubname = 'testpub_foralltables_excepttable1'
+  AND c.relname = 'testpub_tbl1';
+-- testpub_describe publishes testpub_tbl1, testpub_foralltables_excepttable1
+-- excludes it; an entry of one kind must not be resolved as the other.
+CREATE PUBLICATION testpub_describe FOR TABLE testpub_tbl1;
+SELECT pg_get_object_address('publication excluded relation',
+                             '{public, testpub_tbl1}', '{testpub_describe}');
+SELECT pg_get_object_address('publication relation',
+                             '{public, testpub_tbl1}',
+                             '{testpub_foralltables_excepttable1}');
+-- No entry of either kind.  testpub_default publishes nothing.
+SELECT pg_get_object_address('publication excluded relation',
+                             '{public, testpub_tbl1}', '{testpub_default}');
+-- Check pg_describe_object output for both included and excluded entries
+SELECT p.pubname,
+       pg_describe_object('pg_publication_rel'::regclass, pr.oid, 0) AS description,
+       pr.prexcept
+FROM pg_publication_rel pr
+JOIN pg_publication p ON p.oid = pr.prpubid
+WHERE p.pubname IN ('testpub_describe', 'testpub_foralltables_excepttable1')
+ORDER BY p.pubname;
+DROP PUBLICATION testpub_describe;
+\a\t
 -- fail - first table in the EXCEPT list should use TABLE keyword
 CREATE PUBLICATION testpub_foralltables_excepttable2 FOR ALL TABLES EXCEPT (testpub_tbl1, testpub_tbl2);
+
+-- A table in an EXCEPT clause cannot be changed to UNLOGGED.
+CREATE TABLE testpub_exc_unlogged_tbl (a int);
+CREATE PUBLICATION testpub_exc_unlogged FOR ALL TABLES EXCEPT (TABLE testpub_exc_unlogged_tbl);
+-- fail - the table is referenced in a publication EXCEPT clause
+ALTER TABLE testpub_exc_unlogged_tbl SET UNLOGGED;
+DROP PUBLICATION testpub_exc_unlogged;
+DROP TABLE testpub_exc_unlogged_tbl;
 
 ---------------------------------------------
 -- SET ALL TABLES/SEQUENCES
@@ -210,6 +249,9 @@ CREATE PUBLICATION testpub8 FOR ALL TABLES EXCEPT (TABLE testpub_root);
 \d testpub_part1
 \d testpub_root
 CREATE PUBLICATION testpub9 FOR ALL TABLES EXCEPT (TABLE testpub_part1);
+-- A name that needs quoting must not be quoted twice in the message.
+CREATE TABLE "testpub Part2" PARTITION OF testpub_root FOR VALUES FROM (100) TO (200);
+CREATE PUBLICATION testpub9 FOR ALL TABLES EXCEPT (TABLE "testpub Part2");
 
 CREATE TABLE tab_main (a int) PARTITION BY RANGE(a);
 -- Attaching a partition is not allowed if the partitioned table appears in a
@@ -217,7 +259,7 @@ CREATE TABLE tab_main (a int) PARTITION BY RANGE(a);
 ALTER TABLE tab_main ATTACH PARTITION testpub_root FOR VALUES FROM (0) TO (200);
 
 RESET client_min_messages;
-DROP TABLE testpub_root, testpub_part1, tab_main;
+DROP TABLE testpub_root, testpub_part1, "testpub Part2", tab_main;
 DROP PUBLICATION testpub8;
 
 --- Tests for publications with SEQUENCES
@@ -406,6 +448,9 @@ CREATE PUBLICATION testpub6 FOR TABLES IN SCHEMA testpub_rf_schema2;
 ALTER PUBLICATION testpub6 SET TABLES IN SCHEMA testpub_rf_schema2, TABLE testpub_rf_schema2.testpub_rf_tbl6 WHERE (i < 99);
 RESET client_min_messages;
 \dRp+ testpub6
+-- table with a row-filter, also covered by a published schema, should appear
+-- only once in \d output and without the row filter
+\d testpub_rf_schema2.testpub_rf_tbl6
 -- fail - virtual generated column uses user-defined function
 -- (Actually, this already fails at CREATE TABLE rather than at CREATE
 -- PUBLICATION, but let's keep the test in case the former gets

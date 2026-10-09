@@ -34,7 +34,6 @@
 typedef enum
 {
 	NRM_EQUAL,					/* expect exact match of nullingrels */
-	NRM_SUBSET,					/* actual Var may have a subset of input */
 	NRM_SUPERSET,				/* actual Var may have a superset of input */
 } NullingRelsMatch;
 
@@ -79,7 +78,6 @@ typedef struct
 	indexed_tlist *subplan_itlist;
 	int			newvarno;
 	int			rtoffset;
-	NullingRelsMatch nrm_match;
 	double		num_exec;
 } fix_upper_expr_context;
 
@@ -157,6 +155,8 @@ static Plan *set_mergeappend_references(PlannerInfo *root,
 										int rtoffset);
 static void set_hash_references(PlannerInfo *root, Plan *plan, int rtoffset);
 static Relids offset_relid_set(Relids relids, int rtoffset);
+static List *offset_relid_set_list(List *relid_sets, int rtoffset);
+static Node *fix_dummy_setop_vars_mutator(Node *node, int *first_child_relid);
 static Node *fix_scan_expr(PlannerInfo *root, Node *node,
 						   int rtoffset, double num_exec);
 static Node *fix_scan_expr_mutator(Node *node, fix_scan_expr_context *context);
@@ -198,7 +198,6 @@ static Node *fix_upper_expr(PlannerInfo *root,
 							indexed_tlist *subplan_itlist,
 							int newvarno,
 							int rtoffset,
-							NullingRelsMatch nrm_match,
 							double num_exec);
 static Node *fix_upper_expr_mutator(Node *node,
 									fix_upper_expr_context *context);
@@ -212,7 +211,8 @@ static List *set_windowagg_runcondition_references(PlannerInfo *root,
 												   Plan *plan);
 
 static void record_elided_node(PlannerGlobal *glob, int plan_node_id,
-							   NodeTag elided_type, Bitmapset *relids);
+							   NodeTag elided_type, Bitmapset *relids,
+							   List *child_append_relid_sets);
 
 
 /*****************************************************************************
@@ -350,10 +350,8 @@ set_plan_references(PlannerInfo *root, Plan *plan)
 	/* If needed, create workspace for processing AlternativeSubPlans */
 	if (root->hasAlternativeSubPlans)
 	{
-		root->isAltSubplan = (bool *)
-			palloc0(list_length(glob->subplans) * sizeof(bool));
-		root->isUsedSubplan = (bool *)
-			palloc0(list_length(glob->subplans) * sizeof(bool));
+		root->isAltSubplan = palloc0_array(bool, list_length(glob->subplans));
+		root->isUsedSubplan = palloc0_array(bool, list_length(glob->subplans));
 	}
 
 	/* Now fix the Plan tree */
@@ -1046,6 +1044,8 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 					set_upper_references(root, plan, rtoffset);
 				else
 				{
+					int			first_child_relid;
+
 					/*
 					 * The tlist of a childless Result could contain
 					 * unresolved ROWID_VAR Vars, in case it's representing a
@@ -1059,33 +1059,35 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 					 * shouldn't be seen by fix_scan_expr.
 					 *
 					 * We also must handle the case where set operations have
-					 * been short-circuited resulting in a dummy Result node.
-					 * prepunion.c uses varno==0 for the set op targetlist.
-					 * See generate_setop_tlist() and generate_setop_tlist().
-					 * Here we rewrite these to use varno==1, which is the
-					 * varno of the first set-op child.  Without this, EXPLAIN
+					 * been proven empty, resulting in a dummy Result node.
+					 * Because prepunion.c uses varno 0 for setop targetlists,
+					 * that's what we'll find here.  Replace such Vars with
+					 * Vars pointing at the Result's lowest-numbered replaced
+					 * rel, which will be its leftmost set-op child.  While we
+					 * can assume that ROWID_VARs are at top level, varno 0
+					 * Vars might be buried in coercion expressions, so that
+					 * needs a recursive traversal.  Without this, EXPLAIN
 					 * will have trouble displaying targetlists of dummy set
 					 * operations.
+					 *
+					 * Note that some Results have empty relids, leading to
+					 * first_child_relid being negative.  We assume such
+					 * Results can't contain any varno 0 Vars.
 					 */
+					first_child_relid = bms_next_member(splan->relids, -1);
 					foreach(l, splan->plan.targetlist)
 					{
 						TargetEntry *tle = (TargetEntry *) lfirst(l);
 						Var		   *var = (Var *) tle->expr;
 
-						if (var && IsA(var, Var))
-						{
-							if (var->varno == ROWID_VAR)
-								tle->expr = (Expr *) makeNullConst(var->vartype,
-																   var->vartypmod,
-																   var->varcollid);
-							else if (var->varno == 0)
-								tle->expr = (Expr *) makeVar(1,
-															 var->varattno,
-															 var->vartype,
-															 var->vartypmod,
-															 var->varcollid,
-															 var->varlevelsup);
-						}
+						if (var && IsA(var, Var) && var->varno == ROWID_VAR)
+							tle->expr = (Expr *) makeNullConst(var->vartype,
+															   var->vartypmod,
+															   var->varcollid);
+						else if (first_child_relid > 0)
+							tle->expr = (Expr *)
+								fix_dummy_setop_vars_mutator((Node *) tle->expr,
+															 &first_child_relid);
 					}
 
 					splan->plan.targetlist =
@@ -1408,7 +1410,6 @@ set_indexonlyscan_references(PlannerInfo *root,
 					   index_itlist,
 					   INDEX_VAR,
 					   rtoffset,
-					   NRM_EQUAL,
 					   NUM_EXEC_TLIST((Plan *) plan));
 	plan->scan.plan.qual = (List *)
 		fix_upper_expr(root,
@@ -1416,7 +1417,6 @@ set_indexonlyscan_references(PlannerInfo *root,
 					   index_itlist,
 					   INDEX_VAR,
 					   rtoffset,
-					   NRM_EQUAL,
 					   NUM_EXEC_QUAL((Plan *) plan));
 	plan->recheckqual = (List *)
 		fix_upper_expr(root,
@@ -1424,7 +1424,6 @@ set_indexonlyscan_references(PlannerInfo *root,
 					   index_itlist,
 					   INDEX_VAR,
 					   rtoffset,
-					   NRM_EQUAL,
 					   NUM_EXEC_QUAL((Plan *) plan));
 	/* indexqual is already transformed to reference index columns */
 	plan->indexqual = fix_scan_list(root, plan->indexqual,
@@ -1474,7 +1473,8 @@ set_subqueryscan_references(PlannerInfo *root,
 		/* Remember that we removed a SubqueryScan */
 		scanrelid = plan->scan.scanrelid + rtoffset;
 		record_elided_node(root->glob, plan->subplan->plan_node_id,
-						   T_SubqueryScan, bms_make_singleton(scanrelid));
+						   T_SubqueryScan, bms_make_singleton(scanrelid),
+						   NIL);
 	}
 	else
 	{
@@ -1661,7 +1661,6 @@ set_foreignscan_references(PlannerInfo *root,
 						   itlist,
 						   INDEX_VAR,
 						   rtoffset,
-						   NRM_EQUAL,
 						   NUM_EXEC_TLIST((Plan *) fscan));
 		fscan->scan.plan.qual = (List *)
 			fix_upper_expr(root,
@@ -1669,7 +1668,6 @@ set_foreignscan_references(PlannerInfo *root,
 						   itlist,
 						   INDEX_VAR,
 						   rtoffset,
-						   NRM_EQUAL,
 						   NUM_EXEC_QUAL((Plan *) fscan));
 		fscan->fdw_exprs = (List *)
 			fix_upper_expr(root,
@@ -1677,7 +1675,6 @@ set_foreignscan_references(PlannerInfo *root,
 						   itlist,
 						   INDEX_VAR,
 						   rtoffset,
-						   NRM_EQUAL,
 						   NUM_EXEC_QUAL((Plan *) fscan));
 		fscan->fdw_recheck_quals = (List *)
 			fix_upper_expr(root,
@@ -1685,7 +1682,6 @@ set_foreignscan_references(PlannerInfo *root,
 						   itlist,
 						   INDEX_VAR,
 						   rtoffset,
-						   NRM_EQUAL,
 						   NUM_EXEC_QUAL((Plan *) fscan));
 		pfree(itlist);
 		/* fdw_scan_tlist itself just needs fix_scan_list() adjustments */
@@ -1747,7 +1743,6 @@ set_customscan_references(PlannerInfo *root,
 						   itlist,
 						   INDEX_VAR,
 						   rtoffset,
-						   NRM_EQUAL,
 						   NUM_EXEC_TLIST((Plan *) cscan));
 		cscan->scan.plan.qual = (List *)
 			fix_upper_expr(root,
@@ -1755,7 +1750,6 @@ set_customscan_references(PlannerInfo *root,
 						   itlist,
 						   INDEX_VAR,
 						   rtoffset,
-						   NRM_EQUAL,
 						   NUM_EXEC_QUAL((Plan *) cscan));
 		cscan->custom_exprs = (List *)
 			fix_upper_expr(root,
@@ -1763,7 +1757,6 @@ set_customscan_references(PlannerInfo *root,
 						   itlist,
 						   INDEX_VAR,
 						   rtoffset,
-						   NRM_EQUAL,
 						   NUM_EXEC_QUAL((Plan *) cscan));
 		pfree(itlist);
 		/* custom_scan_tlist itself just needs fix_scan_list() adjustments */
@@ -1909,7 +1902,9 @@ set_append_references(PlannerInfo *root,
 
 			/* Remember that we removed an Append */
 			record_elided_node(root->glob, p->plan_node_id, T_Append,
-							   offset_relid_set(aplan->apprelids, rtoffset));
+							   offset_relid_set(aplan->apprelids, rtoffset),
+							   offset_relid_set_list(aplan->child_append_relid_sets,
+													 rtoffset));
 
 			return result;
 		}
@@ -1923,6 +1918,8 @@ set_append_references(PlannerInfo *root,
 	set_dummy_tlist_references((Plan *) aplan, rtoffset);
 
 	aplan->apprelids = offset_relid_set(aplan->apprelids, rtoffset);
+	aplan->child_append_relid_sets =
+		offset_relid_set_list(aplan->child_append_relid_sets, rtoffset);
 
 	/*
 	 * Add PartitionPruneInfo, if any, to PlannerGlobal and update the index.
@@ -1987,7 +1984,9 @@ set_mergeappend_references(PlannerInfo *root,
 
 			/* Remember that we removed a MergeAppend */
 			record_elided_node(root->glob, p->plan_node_id, T_MergeAppend,
-							   offset_relid_set(mplan->apprelids, rtoffset));
+							   offset_relid_set(mplan->apprelids, rtoffset),
+							   offset_relid_set_list(mplan->child_append_relid_sets,
+													 rtoffset));
 
 			return result;
 		}
@@ -2001,6 +2000,8 @@ set_mergeappend_references(PlannerInfo *root,
 	set_dummy_tlist_references((Plan *) mplan, rtoffset);
 
 	mplan->apprelids = offset_relid_set(mplan->apprelids, rtoffset);
+	mplan->child_append_relid_sets =
+		offset_relid_set_list(mplan->child_append_relid_sets, rtoffset);
 
 	/*
 	 * Add PartitionPruneInfo, if any, to PlannerGlobal and update the index.
@@ -2040,7 +2041,6 @@ set_hash_references(PlannerInfo *root, Plan *plan, int rtoffset)
 					   outer_itlist,
 					   OUTER_VAR,
 					   rtoffset,
-					   NRM_EQUAL,
 					   NUM_EXEC_QUAL(plan));
 
 	/* Hash doesn't project */
@@ -2057,15 +2057,27 @@ set_hash_references(PlannerInfo *root, Plan *plan, int rtoffset)
 static Relids
 offset_relid_set(Relids relids, int rtoffset)
 {
-	Relids		result = NULL;
-	int			rtindex;
-
-	/* If there's no offset to apply, we needn't recompute the value */
+	/* If there's no offset to apply, we needn't make another set */
 	if (rtoffset == 0)
 		return relids;
-	rtindex = -1;
-	while ((rtindex = bms_next_member(relids, rtindex)) >= 0)
-		result = bms_add_member(result, rtindex + rtoffset);
+	return bms_offset_members(relids, rtoffset);
+}
+
+/*
+ * offset_relid_set_list
+ *		Apply rtoffset to the members of each Relid set in a List.
+ */
+static List *
+offset_relid_set_list(List *relid_sets, int rtoffset)
+{
+	List	   *result = NIL;
+
+	if (rtoffset == 0)
+		return relid_sets;
+
+	foreach_ptr(Bitmapset, relids, relid_sets)
+		result = lappend(result, offset_relid_set(relids, rtoffset));
+
 	return result;
 }
 
@@ -2269,6 +2281,32 @@ fix_alternative_subplan(PlannerInfo *root, AlternativeSubPlan *asplan,
 }
 
 /*
+ * fix_dummy_setop_vars_mutator
+ *		Change the varno 0 Vars made by prepunion.c to varno *first_child_relid.
+ */
+static Node *
+fix_dummy_setop_vars_mutator(Node *node, int *first_child_relid)
+{
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, Var))
+	{
+		Var		   *var = (Var *) node;
+
+		if (var->varno == 0)
+			return (Node *) makeVar(*first_child_relid,
+									var->varattno,
+									var->vartype,
+									var->vartypmod,
+									var->varcollid,
+									var->varlevelsup);
+		return node;
+	}
+	return expression_tree_mutator(node, fix_dummy_setop_vars_mutator,
+								   first_child_relid);
+}
+
+/*
  * fix_scan_expr
  *		Do set_plan_references processing on a scan-level expression
  *
@@ -2444,22 +2482,18 @@ set_join_references(PlannerInfo *root, Join *join, int rtoffset)
 			NestLoopParam *nlp = (NestLoopParam *) lfirst(lc);
 
 			/*
-			 * Because we don't reparameterize parameterized paths to match
-			 * the outer-join level at which they are used, Vars seen in the
-			 * NestLoopParam expression may have nullingrels that are just a
-			 * subset of those in the Vars actually available from the outer
-			 * side.  (Lateral references can also cause this, as explained in
-			 * the comments for identify_current_nestloop_params.)  Not
-			 * checking this exactly is a bit grotty, but the work needed to
-			 * make things match up perfectly seems well out of proportion to
-			 * the value.
+			 * identify_current_nestloop_params has already ensured that any
+			 * Vars or PHVs seen in the NestLoopParam expression have
+			 * nullingrels that include exactly the outer-join relids that
+			 * appear in the outer side's output and can null the respective
+			 * Var or PHV.  Therefore, fix_upper_expr will not complain when
+			 * performing the nullingrels matches here.
 			 */
 			nlp->paramval = (Var *) fix_upper_expr(root,
 												   (Node *) nlp->paramval,
 												   outer_itlist,
 												   OUTER_VAR,
 												   rtoffset,
-												   NRM_SUBSET,
 												   NUM_EXEC_TLIST(outer_plan));
 			/* Check we replaced any PlaceHolderVar with simple Var */
 			if (!(IsA(nlp->paramval, Var) &&
@@ -2502,19 +2536,18 @@ set_join_references(PlannerInfo *root, Join *join, int rtoffset)
 											   outer_itlist,
 											   OUTER_VAR,
 											   rtoffset,
-											   NRM_EQUAL,
 											   NUM_EXEC_QUAL((Plan *) join));
 	}
 
 	/*
 	 * Now we need to fix up the targetlist and qpqual, which are logically
-	 * above the join.  This means that, if it's not an inner join, any Vars
-	 * and PHVs appearing here should have nullingrels that include the
-	 * effects of the outer join, ie they will have nullingrels equal to the
-	 * input Vars' nullingrels plus the bit added by the outer join.  We don't
-	 * currently have enough info available here to identify what that should
-	 * be, so we just tell fix_join_expr to accept superset nullingrels
-	 * matches instead of exact ones.
+	 * above the join.  This means that, if it's an outer join with non-empty
+	 * ojrelids, any Vars and PHVs appearing here should have nullingrels that
+	 * include the effects of the outer join, ie they will have nullingrels
+	 * equal to the input Vars' nullingrels plus the bit added by the outer
+	 * join.  We don't currently have enough info available here to identify
+	 * what that should be, so we just tell fix_join_expr to accept superset
+	 * nullingrels matches instead of exact ones.
 	 */
 	join->plan.targetlist = fix_join_expr(root,
 										  join->plan.targetlist,
@@ -2522,7 +2555,7 @@ set_join_references(PlannerInfo *root, Join *join, int rtoffset)
 										  inner_itlist,
 										  (Index) 0,
 										  rtoffset,
-										  (join->jointype == JOIN_INNER ? NRM_EQUAL : NRM_SUPERSET),
+										  (bms_is_empty(join->ojrelids) ? NRM_EQUAL : NRM_SUPERSET),
 										  NUM_EXEC_TLIST((Plan *) join));
 	join->plan.qual = fix_join_expr(root,
 									join->plan.qual,
@@ -2530,7 +2563,7 @@ set_join_references(PlannerInfo *root, Join *join, int rtoffset)
 									inner_itlist,
 									(Index) 0,
 									rtoffset,
-									(join->jointype == JOIN_INNER ? NRM_EQUAL : NRM_SUPERSET),
+									(bms_is_empty(join->ojrelids) ? NRM_EQUAL : NRM_SUPERSET),
 									NUM_EXEC_QUAL((Plan *) join));
 
 	pfree(outer_itlist);
@@ -2607,7 +2640,6 @@ set_upper_references(PlannerInfo *root, Plan *plan, int rtoffset)
 										 subplan_itlist,
 										 OUTER_VAR,
 										 rtoffset,
-										 NRM_EQUAL,
 										 NUM_EXEC_TLIST(plan));
 		}
 		else
@@ -2616,7 +2648,6 @@ set_upper_references(PlannerInfo *root, Plan *plan, int rtoffset)
 									 subplan_itlist,
 									 OUTER_VAR,
 									 rtoffset,
-									 NRM_EQUAL,
 									 NUM_EXEC_TLIST(plan));
 		tle = flatCopyTargetEntry(tle);
 		tle->expr = (Expr *) newexpr;
@@ -2630,7 +2661,6 @@ set_upper_references(PlannerInfo *root, Plan *plan, int rtoffset)
 					   subplan_itlist,
 					   OUTER_VAR,
 					   rtoffset,
-					   NRM_EQUAL,
 					   NUM_EXEC_QUAL(plan));
 
 	pfree(subplan_itlist);
@@ -2939,8 +2969,7 @@ build_tlist_index_other_vars(List *tlist, int ignore_rel)
  * We cross-check the varnullingrels of the subplan output Var based on
  * nrm_match.  Most call sites should pass NRM_EQUAL indicating we expect
  * an exact match.  However, there are places where we haven't cleaned
- * things up completely, and we have to settle for allowing subset or
- * superset matches.
+ * things up completely, and we have to settle for allowing superset matches.
  */
 static Var *
 search_indexed_tlist_for_var(Var *var, indexed_tlist *itlist,
@@ -2976,9 +3005,7 @@ search_indexed_tlist_for_var(Var *var, indexed_tlist *itlist,
 			 * would affect only system columns.)
 			 */
 			if (!(varattno <= 0 ||
-				  (nrm_match == NRM_SUBSET ?
-				   bms_is_subset(var->varnullingrels, vinfo->varnullingrels) :
-				   nrm_match == NRM_SUPERSET ?
+				  (nrm_match == NRM_SUPERSET ?
 				   bms_is_subset(vinfo->varnullingrels, var->varnullingrels) :
 				   bms_equal(vinfo->varnullingrels, var->varnullingrels))))
 				elog(ERROR, "wrong varnullingrels %s (expected %s) for Var %d/%d",
@@ -3032,9 +3059,7 @@ search_indexed_tlist_for_phv(PlaceHolderVar *phv,
 				continue;
 
 			/* Verify that we kept all the nullingrels machinations straight */
-			if (!(nrm_match == NRM_SUBSET ?
-				  bms_is_subset(phv->phnullingrels, subphv->phnullingrels) :
-				  nrm_match == NRM_SUPERSET ?
+			if (!(nrm_match == NRM_SUPERSET ?
 				  bms_is_subset(subphv->phnullingrels, phv->phnullingrels) :
 				  bms_equal(subphv->phnullingrels, phv->phnullingrels)))
 				elog(ERROR, "wrong phnullingrels %s (expected %s) for PlaceHolderVar %d",
@@ -3341,11 +3366,13 @@ fix_join_expr_mutator(Node *node, fix_join_expr_context *context)
  * expensive, so we don't want to try it in the common case where the
  * subplan tlist is just a flattened list of Vars.)
  *
+ * When cross-checking the nullingrels of the subplan output Vars/PHVs, we
+ * always expect exact matches.
+ *
  * 'node': the tree to be fixed (a target item or qual)
  * 'subplan_itlist': indexed target list for subplan (or index)
  * 'newvarno': varno to use for Vars referencing tlist elements
  * 'rtoffset': how much to increment varnos by
- * 'nrm_match': as for search_indexed_tlist_for_var()
  * 'num_exec': estimated number of executions of expression
  *
  * The resulting tree is a copy of the original in which all Var nodes have
@@ -3358,7 +3385,6 @@ fix_upper_expr(PlannerInfo *root,
 			   indexed_tlist *subplan_itlist,
 			   int newvarno,
 			   int rtoffset,
-			   NullingRelsMatch nrm_match,
 			   double num_exec)
 {
 	fix_upper_expr_context context;
@@ -3367,7 +3393,6 @@ fix_upper_expr(PlannerInfo *root,
 	context.subplan_itlist = subplan_itlist;
 	context.newvarno = newvarno;
 	context.rtoffset = rtoffset;
-	context.nrm_match = nrm_match;
 	context.num_exec = num_exec;
 	return fix_upper_expr_mutator(node, &context);
 }
@@ -3387,7 +3412,7 @@ fix_upper_expr_mutator(Node *node, fix_upper_expr_context *context)
 											  context->subplan_itlist,
 											  context->newvarno,
 											  context->rtoffset,
-											  context->nrm_match);
+											  NRM_EQUAL);
 		if (!newvar)
 			elog(ERROR, "variable not found in subplan target list");
 		return (Node *) newvar;
@@ -3402,7 +3427,7 @@ fix_upper_expr_mutator(Node *node, fix_upper_expr_context *context)
 			newvar = search_indexed_tlist_for_phv(phv,
 												  context->subplan_itlist,
 												  context->newvarno,
-												  context->nrm_match);
+												  NRM_EQUAL);
 			if (newvar)
 				return (Node *) newvar;
 		}
@@ -3819,13 +3844,15 @@ extract_query_dependencies_walker(Node *node, PlannerInfo *context)
  */
 static void
 record_elided_node(PlannerGlobal *glob, int plan_node_id,
-				   NodeTag elided_type, Bitmapset *relids)
+				   NodeTag elided_type, Bitmapset *relids,
+				   List *child_append_relid_sets)
 {
 	ElidedNode *n = makeNode(ElidedNode);
 
 	n->plan_node_id = plan_node_id;
 	n->elided_type = elided_type;
 	n->relids = relids;
+	n->child_append_relid_sets = child_append_relid_sets;
 
 	glob->elidedNodes = lappend(glob->elidedNodes, n);
 }
